@@ -254,6 +254,173 @@ AICORE PTO_INLINE void SyncAllAiv()
     wait_flag_dev(kSyncAivOnlyFlag);
 }
 
+constexpr int32_t kCompiledNumCacheSlots = 1024;
+constexpr int32_t kHeadDim = 128;
+constexpr int32_t kConvStateLen = 3;
+constexpr int32_t kSsmHeadElements = kHeadDim * kHeadDim;
+constexpr int32_t kMaxNumKHeads = 16;
+constexpr int32_t kMaxNumVHeads = 64;
+constexpr int32_t kMaxBatchSize = 32;
+constexpr int32_t kMaxConvDim =
+    (2 * kMaxNumKHeads + kMaxNumVHeads) * kHeadDim;
+constexpr int32_t kMaxConvWeightElements = 4 * kMaxConvDim;
+constexpr int32_t kMaxConvStateElements =
+    kCompiledNumCacheSlots * kConvStateLen * kMaxConvDim;
+constexpr int32_t kMaxSsmStateElements =
+    kCompiledNumCacheSlots * kMaxNumVHeads * kSsmHeadElements;
+
+constexpr int32_t kConvBuffer0 = 3072;
+constexpr int32_t kConvBuffer1 = 8704;
+constexpr int32_t kConvHistHalf0 = 0;
+constexpr int32_t kConvHistHalf1 = 256;
+constexpr int32_t kConvHistHalf2 = 512;
+constexpr int32_t kConvInputHalf = 768;
+constexpr int32_t kConvHist0 = 1024;
+constexpr int32_t kConvHist1 = 1536;
+constexpr int32_t kConvHist2 = 2048;
+constexpr int32_t kConvInput = 2560;
+constexpr int32_t kConvAcc = 3072;
+constexpr int32_t kConvTmp = 3584;
+constexpr int32_t kConvOutput = 4096;
+constexpr int32_t kConvOutputHalf = 4608;
+constexpr int32_t kConvSaveHalf0 = 4864;
+constexpr int32_t kConvSaveHalf1 = 5120;
+constexpr int32_t kConvSaveHalf2 = 5376;
+constexpr int32_t kConvVectorScratch = 155936;
+
+template <int32_t BufferBase, int32_t LoadEvent, int32_t ReuseEvent>
+AICORE PTO_INLINE void PrefetchConvBatch(
+    __gm__ bfloat16_t *qkv_handle,
+    __gm__ bfloat16_t *conv_state_handle,
+    int32_t batch_idx, int32_t state_idx, int32_t conv_dim,
+    int32_t conv_state_stride, int32_t channel_offset)
+{
+    wait_flag(PIPE_MTE3, PIPE_MTE2, ReuseEvent);
+    CopyGmToUb<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
+            conv_state_handle + state_idx * conv_state_stride + channel_offset,
+            BufferBase + kConvHistHalf0, 0, 1, 128);
+    CopyGmToUb<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
+            conv_state_handle + state_idx * conv_state_stride +
+                channel_offset + conv_dim,
+            BufferBase + kConvHistHalf1, 0, 1, 128);
+    CopyGmToUb<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
+            conv_state_handle + state_idx * conv_state_stride +
+                channel_offset + 2 * conv_dim,
+            BufferBase + kConvHistHalf2, 0, 1, 128);
+    CopyGmToUb<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxBatchSize * kMaxConvDim, 1, 1, 128, pto::PadValue::Zero>(
+            qkv_handle + batch_idx * conv_dim + channel_offset,
+            BufferBase + kConvInputHalf, 0, 1, 128);
+    set_flag(PIPE_MTE2, PIPE_V, LoadEvent);
+}
+
+template <int32_t BufferBase, int32_t LoadEvent, int32_t StoreEvent,
+          int32_t ReuseEvent>
+AICORE PTO_INLINE void ComputeAndStoreConvBatch(
+    __gm__ bfloat16_t *conv_out_handle,
+    __gm__ bfloat16_t *conv_state_out_handle,
+    TileUbDataND<float, 1, 128, 1, 128> &w0,
+    TileUbDataND<float, 1, 128, 1, 128> &w1,
+    TileUbDataND<float, 1, 128, 1, 128> &w2,
+    TileUbDataND<float, 1, 128, 1, 128> &w3,
+    int32_t batch_idx, int32_t state_idx, int32_t conv_dim,
+    int32_t conv_state_stride, int32_t channel_offset)
+{
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> hist_half0;
+    TASSIGN(hist_half0, BufferBase + kConvHistHalf0);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> hist_half1;
+    TASSIGN(hist_half1, BufferBase + kConvHistHalf1);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> hist_half2;
+    TASSIGN(hist_half2, BufferBase + kConvHistHalf2);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> x_half;
+    TASSIGN(x_half, BufferBase + kConvInputHalf);
+    TileUbDataND<float, 1, 128, 1, 128> hist0;
+    TASSIGN(hist0, BufferBase + kConvHist0);
+    TileUbDataND<float, 1, 128, 1, 128> hist1;
+    TASSIGN(hist1, BufferBase + kConvHist1);
+    TileUbDataND<float, 1, 128, 1, 128> hist2;
+    TASSIGN(hist2, BufferBase + kConvHist2);
+    TileUbDataND<float, 1, 128, 1, 128> x_fp32;
+    TASSIGN(x_fp32, BufferBase + kConvInput);
+    TileUbDataND<float, 1, 128, 1, 128> conv_acc;
+    TASSIGN(conv_acc, BufferBase + kConvAcc);
+    TileUbDataND<float, 1, 128, 1, 128> conv_tmp;
+    TASSIGN(conv_tmp, BufferBase + kConvTmp);
+    TileUbDataND<float, 1, 128, 1, 128> conv_y;
+    TASSIGN(conv_y, BufferBase + kConvOutput);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> y_half;
+    TASSIGN(y_half, BufferBase + kConvOutputHalf);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> save_half0;
+    TASSIGN(save_half0, BufferBase + kConvSaveHalf0);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> save_half1;
+    TASSIGN(save_half1, BufferBase + kConvSaveHalf1);
+    TileUbDataND<bfloat16_t, 1, 128, 1, 128> save_half2;
+    TASSIGN(save_half2, BufferBase + kConvSaveHalf2);
+
+    wait_flag(PIPE_MTE2, PIPE_V, LoadEvent);
+    TCVT(hist0, hist_half0, RoundMode::CAST_NONE);
+    TCVT(hist1, hist_half1, RoundMode::CAST_NONE);
+    TCVT(hist2, hist_half2, RoundMode::CAST_NONE);
+    TCVT(x_fp32, x_half, RoundMode::CAST_NONE);
+    pipe_barrier(PIPE_V);
+    TMUL(conv_acc, w0, hist0);
+    TMUL(conv_tmp, w1, hist1);
+    pipe_barrier(PIPE_V);
+    TADD(conv_acc, conv_acc, conv_tmp);
+    pipe_barrier(PIPE_V);
+    TMUL(conv_tmp, w2, hist2);
+    pipe_barrier(PIPE_V);
+    TADD(conv_acc, conv_acc, conv_tmp);
+    pipe_barrier(PIPE_V);
+    TileUbDataND<float, 1, 128> muladd_tmp;
+    TASSIGN(muladd_tmp, kConvVectorScratch);
+    MulAddDst<float, 1, 128>(conv_acc, x_fp32, w3, muladd_tmp);
+    pipe_barrier(PIPE_V);
+    TileUbDataND<float, 1, 128> silu_tmp;
+    TASSIGN(silu_tmp, kConvVectorScratch);
+    Silu<float, 1, 128>(conv_y, conv_acc, silu_tmp);
+    pipe_barrier(PIPE_V);
+    TCVT(y_half, conv_y, RoundMode::CAST_RINT);
+    TCVT(save_half0, hist1, RoundMode::CAST_RINT);
+    TCVT(save_half1, hist2, RoundMode::CAST_RINT);
+    TCVT(save_half2, x_fp32, RoundMode::CAST_RINT);
+    set_flag(PIPE_V, PIPE_MTE3, StoreEvent);
+    wait_flag(PIPE_V, PIPE_MTE3, StoreEvent);
+    CopyUbToGm<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxBatchSize * kMaxConvDim, 1, 1, 128>(
+            conv_out_handle + batch_idx * conv_dim + channel_offset,
+            BufferBase + kConvOutputHalf, 0, 1, 128);
+    CopyUbToGm<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128>(
+            conv_state_out_handle + state_idx * conv_state_stride +
+                channel_offset,
+            BufferBase + kConvSaveHalf0, 0, 1, 128);
+    pipe_barrier(PIPE_MTE3);
+    CopyUbToGm<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128>(
+            conv_state_out_handle + state_idx * conv_state_stride +
+                channel_offset + conv_dim,
+            BufferBase + kConvSaveHalf1, 0, 1, 128);
+    pipe_barrier(PIPE_MTE3);
+    CopyUbToGm<
+        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+        kMaxConvStateElements, 1, 1, 128>(
+            conv_state_out_handle + state_idx * conv_state_stride +
+                channel_offset + 2 * conv_dim,
+            BufferBase + kConvSaveHalf2, 0, 1, 128);
+    set_flag(PIPE_MTE3, PIPE_MTE2, ReuseEvent);
+}
+
 // The generated PTO kernel body follows. The tile shape stays fixed while
 // model-dependent tensor strides and loop bounds come from host tiling data.
 
@@ -270,20 +437,6 @@ AICORE PTO_INLINE void Run(
     __gm__ float *ssm_state_out_handle, __gm__ bfloat16_t *out_handle,
     int32_t num_k_heads, int32_t num_v_heads, int32_t runtime_batch_size)
 {
-  constexpr int32_t kCompiledNumCacheSlots = 1024;
-  constexpr int32_t kHeadDim = 128;
-  constexpr int32_t kConvStateLen = 3;
-  constexpr int32_t kSsmHeadElements = kHeadDim * kHeadDim;
-  constexpr int32_t kMaxNumKHeads = 16;
-  constexpr int32_t kMaxNumVHeads = 64;
-  constexpr int32_t kMaxBatchSize = 32;
-  constexpr int32_t kMaxConvDim =
-      (2 * kMaxNumKHeads + kMaxNumVHeads) * kHeadDim;
-  constexpr int32_t kMaxConvWeightElements = 4 * kMaxConvDim;
-  constexpr int32_t kMaxConvStateElements =
-      kCompiledNumCacheSlots * kConvStateLen * kMaxConvDim;
-  constexpr int32_t kMaxSsmStateElements =
-      kCompiledNumCacheSlots * kMaxNumVHeads * kSsmHeadElements;
   // Static UB layout. Regions with multiple names are intentionally reused
   // after the previous value's last consumer.
   constexpr int32_t kUbConvWeightHalf0 = 0;
@@ -522,6 +675,60 @@ AICORE PTO_INLINE void Run(
     TCVT(w2, w_half2, RoundMode::CAST_NONE);
     TCVT(w3, w_half3, RoundMode::CAST_NONE);
 
+    if constexpr (!IsBatchOne) {
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+      int32_t buffer0_state_idx = *state_indices_handle;
+      qwen35_decode_pto::PrefetchConvBatch<
+          kConvBuffer0, EVENT_ID2, EVENT_ID0>(
+              qkv_handle, conv_state_handle, 0, buffer0_state_idx, conv_dim,
+              conv_state_stride, channel_offset);
+
+      for (int32_t batch_pair = 0; batch_pair < batch_size;
+           batch_pair += 2) {
+        const int32_t buffer1_batch_idx = batch_pair + 1;
+        int32_t buffer1_state_idx = 0;
+        if (buffer1_batch_idx < batch_size) {
+          buffer1_state_idx =
+              *(state_indices_handle + buffer1_batch_idx);
+          qwen35_decode_pto::PrefetchConvBatch<
+              kConvBuffer1, EVENT_ID3, EVENT_ID1>(
+                  qkv_handle, conv_state_handle, buffer1_batch_idx,
+                  buffer1_state_idx, conv_dim, conv_state_stride,
+                  channel_offset);
+        }
+
+        qwen35_decode_pto::ComputeAndStoreConvBatch<
+            kConvBuffer0, EVENT_ID2, EVENT_ID4, EVENT_ID0>(
+                conv_out_handle, conv_state_out_handle, w0, w1, w2, w3,
+                batch_pair, buffer0_state_idx, conv_dim, conv_state_stride,
+                channel_offset);
+
+        const int32_t next_buffer0_batch_idx = batch_pair + 2;
+        int32_t next_buffer0_state_idx = 0;
+        if (next_buffer0_batch_idx < batch_size) {
+          next_buffer0_state_idx =
+              *(state_indices_handle + next_buffer0_batch_idx);
+          qwen35_decode_pto::PrefetchConvBatch<
+              kConvBuffer0, EVENT_ID2, EVENT_ID0>(
+                  qkv_handle, conv_state_handle, next_buffer0_batch_idx,
+                  next_buffer0_state_idx, conv_dim, conv_state_stride,
+                  channel_offset);
+        }
+
+        if (buffer1_batch_idx < batch_size) {
+          qwen35_decode_pto::ComputeAndStoreConvBatch<
+              kConvBuffer1, EVENT_ID3, EVENT_ID5, EVENT_ID1>(
+                  conv_out_handle, conv_state_out_handle, w0, w1, w2, w3,
+                  buffer1_batch_idx, buffer1_state_idx, conv_dim,
+                  conv_state_stride, channel_offset);
+        }
+        buffer0_state_idx = next_buffer0_state_idx;
+      }
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    } else {
     for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       if constexpr (!IsBatchOne) {
         pipe_barrier(PIPE_ALL);
@@ -616,6 +823,7 @@ AICORE PTO_INLINE void Run(
         pipe_barrier(PIPE_ALL);
         pipe_barrier(PIPE_ALL);
       }
+    }
     }
     if constexpr (IsBatchOne) {
       if (conv_tile + vector_core_count < conv_tile_count) {
