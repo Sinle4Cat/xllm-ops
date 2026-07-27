@@ -161,6 +161,20 @@ def replace_token_npu(forked_token_ids, last_step_output_token_ids):
                                         last_step_output_token_ids)
 
 
+def mtp_prepare_next_draft_npu(accepted_tokens, accepted_embeddings,
+                               embedding_placeholder, base_positions,
+                               base_kv_seq_lens, block_tables, block_size):
+    return custom_ops_lib.mtp_prepare_next_draft(
+        accepted_tokens,
+        accepted_embeddings,
+        embedding_placeholder,
+        base_positions,
+        base_kv_seq_lens,
+        block_tables,
+        block_size,
+    )
+
+
 # convert_kv_cache_format (in-place ND2NZ rewrite of k/v cache blocks)
 def convert_kv_cache_format_npu(k_cache_ptr, v_cache_ptr, kv_cache_offset,
                                 kv_seq_len, is_prefill, num_kv_heads,

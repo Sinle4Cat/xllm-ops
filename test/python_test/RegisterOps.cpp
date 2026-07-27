@@ -657,6 +657,52 @@ at::Tensor replace_token_impl_npu(const at::Tensor& forked_token_ids,
   return output;
 }
 
+std::tuple<at::Tensor,
+           at::Tensor,
+           at::Tensor,
+           at::Tensor,
+           at::Tensor>
+mtp_prepare_next_draft_impl_npu(
+    const at::Tensor& accepted_tokens,
+    const at::Tensor& accepted_embeddings,
+    const at::Tensor& embedding_placeholder,
+    const at::Tensor& base_positions,
+    const at::Tensor& base_kv_seq_lens,
+    const at::Tensor& block_tables,
+    int64_t block_size) {
+  const int64_t batch_size = accepted_tokens.size(0);
+  const int64_t hidden_size = accepted_embeddings.size(2);
+  at::Tensor draft_token_ids = at::empty(
+      {batch_size * 2}, accepted_tokens.options().dtype(at::kInt));
+  at::Tensor draft_embeddings = at::empty(
+      {batch_size * 2, hidden_size}, accepted_embeddings.options());
+  at::Tensor draft_positions =
+      at::empty({batch_size * 2}, base_positions.options());
+  at::Tensor draft_kv_seq_lens =
+      at::empty({batch_size}, base_kv_seq_lens.options());
+  at::Tensor draft_cache_slots =
+      at::empty({batch_size * 2}, base_positions.options());
+
+  EXEC_NPU_CMD(aclnnMtpPrepareNextDraft,
+               accepted_tokens,
+               accepted_embeddings,
+               embedding_placeholder,
+               base_positions,
+               base_kv_seq_lens,
+               block_tables,
+               block_size,
+               draft_token_ids,
+               draft_embeddings,
+               draft_positions,
+               draft_kv_seq_lens,
+               draft_cache_slots);
+  return std::make_tuple(draft_token_ids,
+                         draft_embeddings,
+                         draft_positions,
+                         draft_kv_seq_lens,
+                         draft_cache_slots);
+}
+
 std::tuple<at::Tensor&, at::Tensor&> convert_kv_cache_format_impl_npu(
     at::Tensor& k_cache_ptr,
     at::Tensor& v_cache_ptr,
@@ -1870,6 +1916,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_fused_add_topk", &moe_fused_add_topk_impl_npu, "moe_fused_add_topk");
   m.def("moe_fused_reducesum_div", &moe_fused_reducesum_div_impl_npu, "moe_fused_reducesum_div");
   m.def("replace_token", &replace_token_impl_npu, "replace_token");
+  m.def("mtp_prepare_next_draft",
+        &mtp_prepare_next_draft_impl_npu,
+        "mtp_prepare_next_draft");
   m.def("convert_kv_cache_format", &convert_kv_cache_format_impl_npu, "convert_kv_cache_format");
   m.def("scatter_nd_update_v2", &scatter_nd_update_v2_impl_npu, "scatter_nd_update_v2");
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
