@@ -75,12 +75,12 @@
 //   TMATMUL(C, A, B)        — C = A @ B (Cube engine, DTYPE_Q→FP32 accum)
 //   set_flag / wait_flag    — synchronize pipes within same AI core
 //   ffts_cross_core_sync    — signal across Cube↔Vec cores
-//   wait_flag_dev(flag)     — wait for cross-core signal
+//   gdn_sync::Wait(flag)     — wait for cross-core signal
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
+#include "gdn_sync.h"
 using namespace pto;
 
 // ── Compile-time configuration (overridable at build time via -D flags) ──
@@ -137,9 +137,9 @@ using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 
 #endif  // __CCE_AICORE__
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
 #define GDN_CHUNK_O_KERNEL chunk_o_kernel_aic
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
 #define GDN_CHUNK_O_KERNEL chunk_o_kernel_aiv
 #else
 #define GDN_CHUNK_O_KERNEL chunk_o_kernel
@@ -195,7 +195,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
   constexpr int32_t OUbAddr      = QKUbAddr;
 
   // Initialize the cross-core FFTS signaling base address for this AI core.
-  set_ffts_base_addr(ffts_addr);
+  gdn_sync::InitAddress(ffts_addr);
   // cid = which AI core am I? (0..block_num-1). Used to partition work items.
   auto cid = get_block_idx();
   // block_num = total number of AI cores running this kernel in parallel.
@@ -290,7 +290,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
 // performs the heavy matmuls, then writes results to GM workspace for
 // the Vec engine to apply gating and produce the final output.
 // =====================================================================
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   if (cu_seqlens == nullptr) {
     // ── Fixed-length sequence path ──────────────────────────────────────
     int64_t chunks_per_seq = (seq_len + ChunkSize - 1) / ChunkSize;
@@ -301,7 +301,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
          work_idx < total_work;
          work_idx += static_cast<int64_t>(block_num)) {
       // Wait for Vec to finish with previous chunk's workspace (flag 3)
-      if (!first_cube_iter) wait_flag_dev(3);
+      if (!first_cube_iter) gdn_sync::Wait<PIPE_FIX>(3);
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
@@ -400,7 +400,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TASSIGN(_l1, 65536);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = HiddenSize; _gs.shape[4] = HiddenSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(S_handle + s_offset, _gs);
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(S_handle + s_offset, _gs);
         TLOAD(_l1, _gm);
       }
 
@@ -427,7 +427,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TASSIGN(_l0, 0);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = ChunkSize; _gs.shape[4] = ChunkSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
             workspace_qk_handle +
                 static_cast<int64_t>(cid) * WsQKSize, _gs);
         TSTORE(_gm, _l0);
@@ -439,7 +439,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TASSIGN(_l0, 65536);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = ChunkSize; _gs.shape[4] = HiddenSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
             workspace_qs_qkv_handle +
                 static_cast<int64_t>(cid) * WsQSSize, _gs);
         TSTORE(_gm, _l0);
@@ -451,7 +451,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       // and coordinate via FFTS flags. Think of it as two processes communicating
       // through shared memory with semaphores.
       //
-      // ffts_cross_core_sync(PIPE_FIX, config):
+      // gdn_sync::Signal<PIPE_FIX>(config):
       //   config = 1 | (mode << 4) | (flag_id << 8)
       //   mode=2: broadcast signal to all cores in this block
       //   flag_id: identifies which signal (0, 1, 2, 3)
@@ -461,10 +461,10 @@ AICORE void GDN_CHUNK_O_KERNEL(
       //   flag 1: Vec→Cube "QK_gated is ready for GEMM 3"
       //   flag 2: Cube→Vec "QKV (GEMM 3 result) is ready"
       //   flag 3: Vec→Cube "I'm done with this chunk, you can reuse workspace"
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (0 << 8));
 
       // Wait for Vec to write QK_gated back (flag 1, Vec→Cube)
-      wait_flag_dev(1);
+      gdn_sync::Wait<PIPE_MTE2>(1);
 
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -475,7 +475,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TASSIGN(_l1, 98304);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = ChunkSize; _gs.shape[4] = ChunkSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
             workspace_qk_gated_handle +
                 static_cast<int64_t>(cid) * WsGatedSize, _gs);
         TLOAD(_l1, _gm);
@@ -522,14 +522,14 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TASSIGN(_l0, 0);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = ChunkSize; _gs.shape[4] = HiddenSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
             workspace_qs_qkv_handle +
                 static_cast<int64_t>(cid) * WsQSSize, _gs);
         TSTORE(_gm, _l0);
       }
 
       // Signal Vec: QKV is ready (flag 2, Cube→Vec)
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+      gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (2 << 8));
       first_cube_iter = false;
     }
   } else {
@@ -547,7 +547,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
-            if (!first_cube_iter_v) wait_flag_dev(3);
+            if (!first_cube_iter_v) gdn_sync::Wait<PIPE_FIX>(3);
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
@@ -615,7 +615,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TASSIGN(_l1, 65536);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = HiddenSize; _gs.shape[4] = HiddenSize;
-              GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(S_handle + s_offset, _gs);
+              GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(S_handle + s_offset, _gs);
               TLOAD(_l1, _gm);
             }
 
@@ -641,7 +641,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TASSIGN(_l0, 0);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = ChunkSize; _gs.shape[4] = ChunkSize;
-              GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+              GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
                   workspace_qk_handle +
                       static_cast<int64_t>(cid) * WsQKSize, _gs);
               TSTORE(_gm, _l0);
@@ -653,17 +653,17 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TASSIGN(_l0, 65536);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = ChunkSize; _gs.shape[4] = HiddenSize;
-              GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+              GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
                   workspace_qs_qkv_handle +
                       static_cast<int64_t>(cid) * WsQSSize, _gs);
               TSTORE(_gm, _l0);
             }
 
             // Cube→Vec: QK & QS ready (flag 0)
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+            gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (0 << 8));
 
             // Wait Vec→Cube: QK_gated ready (flag 1)
-            wait_flag_dev(1);
+            gdn_sync::Wait<PIPE_MTE2>(1);
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -674,7 +674,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TASSIGN(_l1, 98304);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = ChunkSize; _gs.shape[4] = ChunkSize;
-              GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+              GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
                   workspace_qk_gated_handle +
                       static_cast<int64_t>(cid) * WsGatedSize, _gs);
               TLOAD(_l1, _gm);
@@ -712,13 +712,13 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TASSIGN(_l0, 0);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = ChunkSize; _gs.shape[4] = HiddenSize;
-              GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+              GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
                   workspace_qs_qkv_handle +
                       static_cast<int64_t>(cid) * WsQSSize, _gs);
               TSTORE(_gm, _l0);
             }
 
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+            gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (2 << 8));
             first_cube_iter_v = false;
           }
           gi++;
@@ -738,7 +738,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
 //   3. Scales the Cube's QS result by exp(g)
 //   4. Combines QKV + scaled QS → final output O
 // =====================================================================
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   // Vec engine initialization: set_mask_norm selects "normal" masking mode,
   // and set_vector_mask(-1, -1) enables ALL SIMD lanes (no masking).
   set_mask_norm();
@@ -755,7 +755,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
   {
     Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
     _gs.shape[3] = HalfChunk; _gs.shape[4] = ChunkSize;
-    GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+    GlobalTensor<float, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
         Msk_handle +
             static_cast<int64_t>(vid) * HalfChunk * ChunkSize, _gs);
     UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero> _ld(HalfChunk, ChunkSize);
@@ -795,7 +795,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         {
           Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
           _gs.shape[3] = 1; _gs.shape[4] = valid_rows;
-          GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, 1, 1>> _gm(
+          GlobalTensor<float, decltype(_gs), pto::Stride<1, 1, 1, 1, 1>> _gm(
               G_handle + static_cast<int64_t>(head_idx) * total_tokens
                        + chunk_token_start, _gs);
           UbND<float, 1, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero> _ld(1, valid_rows);
@@ -838,22 +838,22 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TROWEXPAND(g_r_2d, g_v_col);       // g_r_2d[i,j] = g_row[i]
         TCOLEXPAND(coeff_ub, g_ub);        // coeff[i,j] = g_col[j]
         TSUB(coeff_ub, g_r_2d, coeff_ub);  // d = g_row - g_col
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TMINS(coeff_ub, coeff_ub, 0.0f);
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TEXP(coeff_ub, coeff_ub);
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TMUL(coeff_ub, coeff_ub, msk_ub);
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TEXP(g_v_ub, g_v_ub);              // exp(g_row) for QS scaling
       }
 
       // ── Wait for Cube→Vec flag 0: QK & QS ready ─────────────────────
-      wait_flag_dev(0);
+      gdn_sync::Wait<PIPE_MTE2>(0);
       if (local_rows == 0) {
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
-        wait_flag_dev(2);
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (1 << 8));
+        gdn_sync::Wait<PIPE_MTE2>(2);
+        gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
         continue;
       }
 
@@ -861,7 +861,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       {
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = local_rows; _gs.shape[4] = ChunkSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
             workspace_qk_handle +
                 static_cast<int64_t>(cid) * WsQKSize +
                 static_cast<int64_t>(vid) * HalfChunk * ChunkSize, _gs);
@@ -884,7 +884,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       {
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
             workspace_qs_qkv_handle +
                 static_cast<int64_t>(cid) * WsQSSize +
                 static_cast<int64_t>(vid) * HalfChunk * HiddenSize, _gs);
@@ -906,7 +906,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       {
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = local_rows; _gs.shape[4] = ChunkSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
             workspace_qk_gated_handle +
                 static_cast<int64_t>(cid) * WsGatedSize +
                 static_cast<int64_t>(vid) * HalfChunk * ChunkSize, _gs);
@@ -915,7 +915,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TSTORE(_gm, _st);
       }
       // Vec→Cube: QK_gated ready (flag 1)
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+      gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (1 << 8));
 
       // ── Scale QS by exp(g): QS_gated = QS * exp(g_row) ──────────────
       // ── Scale QS by exp(g): inter-chunk state contribution ────────────
@@ -931,17 +931,17 @@ AICORE void GDN_CHUNK_O_KERNEL(
       UbDN<float, HalfChunk, 1> g_v_col2;
       TASSIGN(g_v_col2, GvUbAddr);
       TROWEXPAND(g_exp_2d, g_v_col2);    // broadcast exp(g_row) across columns
-      pipe_barrier(PIPE_V);
+      gdn_sync::VectorBarrier();
       TMUL(qs_ub, qs_ub, g_exp_2d);      // QS_gated = QS * exp(g_row)
 
       // ── Wait for Cube→Vec flag 2: QKV ready ─────────────────────────
-      wait_flag_dev(2);
+      gdn_sync::Wait<PIPE_MTE2>(2);
 
       // ── Load QKV [C/2 × D] from workspace → UB ──────────────────────
       {
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
             workspace_qs_qkv_handle +
                 static_cast<int64_t>(cid) * WsQSSize +
                 static_cast<int64_t>(vid) * HalfChunk * HiddenSize, _gs);
@@ -987,7 +987,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       }
 
       // Vec→Cube: done with this chunk (flag 3)
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+      gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
     }
   } else {
     // ── Variable-length sequence path (cu_seqlens != nullptr) ──────────
@@ -1018,7 +1018,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = 1; _gs.shape[4] = valid_rows;
-                GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, 1, 1>> _gm(
+                GlobalTensor<float, decltype(_gs), pto::Stride<1, 1, 1, 1, 1>> _gm(
                     G_handle + static_cast<int64_t>(head_idx) * total_tokens
                              + chunk_token_start, _gs);
                 UbND<float, 1, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero> _ld(1, valid_rows);
@@ -1048,27 +1048,27 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TROWEXPAND(g_r_2d_v, g_v_col_v);
               TCOLEXPAND(coeff_ub, g_ub);
               TSUB(coeff_ub, g_r_2d_v, coeff_ub);  // d = g_row - g_col
-              pipe_barrier(PIPE_V);
+              gdn_sync::VectorBarrier();
               TMINS(coeff_ub, coeff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              gdn_sync::VectorBarrier();
               TEXP(coeff_ub, coeff_ub);
-              pipe_barrier(PIPE_V);
+              gdn_sync::VectorBarrier();
               TMUL(coeff_ub, coeff_ub, msk_ub);
-              pipe_barrier(PIPE_V);
+              gdn_sync::VectorBarrier();
               TEXP(g_v_ub, g_v_ub);
             }
 
-            wait_flag_dev(0);
+            gdn_sync::Wait<PIPE_MTE2>(0);
             if (local_rows == 0) {
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
-              wait_flag_dev(2);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+              gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (1 << 8));
+              gdn_sync::Wait<PIPE_MTE2>(2);
+              gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
             } else {
               // Load QK from workspace
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = local_rows; _gs.shape[4] = ChunkSize;
-                GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+                GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
                     workspace_qk_handle +
                         static_cast<int64_t>(cid) * WsQKSize +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize, _gs);
@@ -1091,7 +1091,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-                GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+                GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
                     workspace_qs_qkv_handle +
                         static_cast<int64_t>(cid) * WsQSSize +
                         static_cast<int64_t>(vid) * HalfChunk * HiddenSize, _gs);
@@ -1112,7 +1112,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = local_rows; _gs.shape[4] = ChunkSize;
-                GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+                GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
                     workspace_qk_gated_handle +
                         static_cast<int64_t>(cid) * WsGatedSize +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize, _gs);
@@ -1121,7 +1121,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
                 TSTORE(_gm, _st);
               }
               // Vec→Cube: QK_gated ready (flag 1)
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (1 << 8));
 
               // Scale QS by exp(g): QS_scaled = QS * exp(g_row)[:, None]
               // (same inter-chunk state scaling as fixed-length path)
@@ -1134,16 +1134,16 @@ AICORE void GDN_CHUNK_O_KERNEL(
               UbDN<float, HalfChunk, 1> g_v_col2_v;
               TASSIGN(g_v_col2_v, GvUbAddr);
               TROWEXPAND(g_exp_2d_v, g_v_col2_v);
-              pipe_barrier(PIPE_V);
+              gdn_sync::VectorBarrier();
               TMUL(qs_ub, qs_ub, g_exp_2d_v);
 
-              wait_flag_dev(2);
+              gdn_sync::Wait<PIPE_MTE2>(2);
 
               // Load QKV from workspace
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-                GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, HiddenSize, 1>> _gm(
+                GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, HiddenSize, 1>> _gm(
                     workspace_qs_qkv_handle +
                         static_cast<int64_t>(cid) * WsQSSize +
                         static_cast<int64_t>(vid) * HalfChunk * HiddenSize, _gs);
@@ -1185,7 +1185,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               }
 
               // Vec→Cube: done with this chunk (flag 3)
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+              gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
             }
           }
           gi++;
