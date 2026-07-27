@@ -62,15 +62,15 @@
 //   TCOLEXPAND(2d, row)     — Broadcast row → cols: 2d[i,j] = row[j]
 //   set_flag(P1, P2, EVT)   — Signal from pipe P1 to pipe P2 (like a semaphore post)
 //   wait_flag(P1, P2, EVT)  — Wait for signal from P1 (like a semaphore wait)
-//   pipe_barrier(PIPE_V)    — Local Vec barrier (ensure all Vec ops complete)
+//   gdn_sync::VectorBarrier()    — Local Vec barrier (ensure all Vec ops complete)
 //   pipe_barrier(PIPE_ALL)  — Barrier for all local pipes
-//   CrossCoreSetFlag()      — Cross-core signal (Cube↔Vec, different physical cores)
-//   CrossCoreWaitFlag()     — Wait for cross-core signal
+//   gdn_sync::Signal()  — Cross-core signal (Cube↔Vec, different physical cores)
+//   gdn_sync::Wait(flag)     — Wait for cross-core signal
 // ============================================================================
 
 #include <pto/pto-inst.hpp>   // PTO (Performance Tile Operator): NPU kernel API
-#include "kernel_operator.h"
 #include "acl/acl.h"          // ACL (Ascend Computing Language): runtime API
+#include "gdn_sync.h"
 using namespace pto;
 
 // ── Compile-time constants (set by the JIT compiler from Python) ──────
@@ -174,8 +174,10 @@ AICORE void kkt_kernel(
   // a_ub_half overlaps g_r_2d — safe because they're never live simultaneously
   constexpr int32_t AUbHalfAddr  = GR2dUbAddr;
 
-  // Configure the hardware synchronization base before cross-core signaling.
-  AscendC::SetSyncBaseAddr(ffts_addr);
+  // set_ffts_base_addr: Tell the hardware where the cross-core flag table lives.
+  // This is a one-time setup so ffts_cross_core_sync / wait_flag_dev know
+  // which memory region to read/write for inter-core signaling.
+  gdn_sync::InitAddress(ffts_addr);
   auto cid = get_block_idx();       // Which AI core am I? (like CUDA blockIdx.x)
   auto block_num = get_block_num();  // Total AI cores launched (like CUDA gridDim.x)
   // ── Vec sub-block parallelism ─────────────────────────────────────────
@@ -255,7 +257,7 @@ AICORE void kkt_kernel(
   // ========================================================================
   // __DAV_C220_CUBE__: This code only compiles for the Cube core.
   // On NPU, Cube and Vec are separate compilation targets (like two different GPUs).
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // Outer loop: iterate over all (sequence, head) work items assigned to this core
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -289,7 +291,7 @@ AICORE void kkt_kernel(
     for (int64_t ci = 0; ci < num_chunks; ++ci) {
       int32_t slot = static_cast<int32_t>(ci & 1);
       // Wait for Vec to finish reading the previous KK^T from this slot
-      AscendC::CrossCoreWaitFlag(2 + slot);
+      gdn_sync::Wait<PIPE_FIX>(2 + slot);
       pipe_barrier(PIPE_ALL);
 
       int64_t chunk_start = ci * ChunkSize;
@@ -365,7 +367,7 @@ AICORE void kkt_kernel(
         TASSIGN(_l0, 0);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = ChunkSize; _gs.shape[4] = ChunkSize;
-        GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+        GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
             workspace_handle +
                 (static_cast<int64_t>(cid) * 2 + slot) * ChunkSquare,
             _gs);
@@ -373,7 +375,7 @@ AICORE void kkt_kernel(
       }
 
       // ── Cross-core synchronization (Cube → Vec) ──────────────────────
-      // CrossCoreSetFlag<mode, pipe>(flag): Signal across physical cores.
+      // gdn_sync::Signal(pipe, config): Signal across physical cores.
       // Unlike set_flag/wait_flag (which sync pipes within ONE core), this syncs
       // between the Cube core and Vec core (they are separate hardware units).
       //
@@ -381,14 +383,14 @@ AICORE void kkt_kernel(
       //   mode=2: broadcast to all cores on same block
       //   flag_id: which flag to set (0,1,2,3...)
       //
-      // The receiving side calls CrossCoreWaitFlag(flag_id) for this signal.
+      // The receiving side calls gdn_sync::Wait(flag_id) to wait for this signal.
       //
       // In this kernel:
-      //   Cube sets flag 0/1 → Vec waits on CrossCoreWaitFlag(0/1) (KK^T ready)
-      //   Vec sets flag 2/3 → Cube waits on CrossCoreWaitFlag(2/3) (workspace free)
+      //   Cube sets flag 0/1 → Vec waits on gdn_sync::Wait(0/1) (KK^T ready)
+      //   Vec sets flag 2/3 → Cube waits on gdn_sync::Wait(2/3) (workspace free)
       //
       // Signal Vec that this slot's KK^T is ready
-      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(slot);
+      gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (slot << 8));
     }
   }
 #endif
@@ -416,7 +418,7 @@ AICORE void kkt_kernel(
   // A = KK_T[my_rows] * coeff * mask[my_rows]           # TMUL × 2
   // ========================================================================
   // __DAV_C220_VEC__: This code only compiles for the Vec core.
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   // set_mask_norm / set_vector_mask: configure the SIMD mask for Vec ops.
   // (-1, -1) means "all lanes active" — process every element.
   // (Like CUDA's __activemask() returning all 1s for a full warp.)
@@ -429,7 +431,7 @@ AICORE void kkt_kernel(
   {
     Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
     _gs.shape[3] = HalfChunk; _gs.shape[4] = ChunkSize;
-    GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+    GlobalTensor<float, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
         Msk_handle +
             static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
         _gs);
@@ -443,9 +445,9 @@ AICORE void kkt_kernel(
 
   // Initial cross-core sync: release both workspace slots so Cube can start.
   // Vec tells Cube "slots 0 and 1 are free" by setting flags 2 and 3.
-  // Without this, Cube would hang on CrossCoreWaitFlag(2/3) at the first iteration.
-  AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
-  AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
+  // Without this, Cube would hang on gdn_sync::Wait(2/3) at the first iteration.
+  gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (2 << 8));
+  gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
 
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -491,7 +493,7 @@ AICORE void kkt_kernel(
         {
           Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
           _gs.shape[3] = 1; _gs.shape[4] = valid_rows;
-          GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, 1, 1>> _gm(
+          GlobalTensor<float, decltype(_gs), pto::Stride<1, 1, 1, 1, 1>> _gm(
               G_handle + static_cast<int64_t>(head_idx) * total_tokens
                        + (bos + chunk_start),
               _gs);
@@ -509,7 +511,7 @@ AICORE void kkt_kernel(
         {
           Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
           _gs.shape[3] = 1; _gs.shape[4] = local_valid;
-          GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, 1, 1>> _gm(
+          GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, 1, 1>> _gm(
               Beta_handle + static_cast<int64_t>(head_idx) * total_tokens
                           + (bos + chunk_start + row_offset),
               _gs);
@@ -525,7 +527,7 @@ AICORE void kkt_kernel(
       }
 
       // Wait for Cube to finish writing KK^T for this slot
-      AscendC::CrossCoreWaitFlag(slot);
+      gdn_sync::Wait<PIPE_MTE2>(slot);
       pipe_barrier(PIPE_ALL);
 
       if (local_valid > 0) {
@@ -544,15 +546,15 @@ AICORE void kkt_kernel(
                 GUbAddr + row_offset *
                               static_cast<int32_t>(sizeof(float)));
         TMOV(g_v_ub, g_ub_temp);   // g_v = g[row_offset:row_offset+C/2]
-        pipe_barrier(PIPE_V);       // Wait for TMOV to complete
+        gdn_sync::VectorBarrier();       // Wait for TMOV to complete
 
         TLOG(beta_ub, beta_ub);     // beta_ub = log(beta) in-place
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TADD(g_v_ub, g_v_ub, beta_ub);  // g_v = g_sub + log(beta) — the combined gate
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TMOV(g_r_ub, g_v_ub);      // Copy to g_r for row-broadcast
         TMOV(g_c_ub, g_ub);        // Copy full g to g_c for col-broadcast
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
 
         // Broadcast g_v to rows, g to columns → 2D gating matrix
         // coeff[i,j] = exp(min(g_v[i] - g[j], 0))
@@ -564,11 +566,11 @@ AICORE void kkt_kernel(
         TASSIGN(g_r_ub_temp, GRUbAddr);
         TROWEXPAND(g_r_2d_ub, g_r_ub_temp);  // g_r_2d[i,j] = g_v[i] for all j
         TCOLEXPAND(g_c_2d_ub, g_c_ub);       // g_c_2d[i,j] = g[j] for all i
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TSUB(coeff_ub, g_r_2d_ub, g_c_2d_ub);  // coeff[i,j] = g_v[i] - g[j]
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TMINS(coeff_ub, coeff_ub, 0.0f);        // clamp to ≤ 0 (coeff will be ≤ 1 after exp)
-        pipe_barrier(PIPE_V);
+        gdn_sync::VectorBarrier();
         TEXP(coeff_ub, coeff_ub);                // coeff = exp(clamped_diff) ∈ (0, 1]
 
         // V→MTE2 sync: ensure gating computation is done before we start
@@ -583,7 +585,7 @@ AICORE void kkt_kernel(
         {
           Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
           _gs.shape[3] = HalfChunk; _gs.shape[4] = ChunkSize;
-          GlobalTensor<DTYPE_Q, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+          GlobalTensor<DTYPE_Q, decltype(_gs), pto::Stride<1, 1, 1, ChunkSize, 1>> _gm(
               workspace_handle +
                   (static_cast<int64_t>(cid) * 2 + slot) * ChunkSquare +
                   static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -633,8 +635,8 @@ AICORE void kkt_kernel(
       pipe_barrier(PIPE_ALL);
       // Signal Cube that this workspace slot is free for reuse.
       // Flag (2+slot): slot 0 → flag 2, slot 1 → flag 3.
-      // Cube waits on CrossCoreWaitFlag(2+slot) before writing the next chunk.
-      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2 + slot);
+      // Cube is waiting on gdn_sync::Wait(2+slot) before writing the next chunk.
+      gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | ((2 + slot) << 8));
     }
   }
 #endif

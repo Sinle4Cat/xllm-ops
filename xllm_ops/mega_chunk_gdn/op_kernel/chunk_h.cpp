@@ -68,8 +68,8 @@
 //   TRESHAPE(zn, nz)        — reinterpret layout NZ↔ZN (logical transpose, free)
 //   TMATMUL(C, A, B)        — C = A @ B (Cube GEMM, DTYPE_Q inputs → FP32 accum)
 //   set_flag/wait_flag      — pipe sync within same core
-//   CrossCoreSetFlag        — cross-core signal Cube↔Vec
-//   CrossCoreWaitFlag       — wait for cross-core signal
+//   ffts_cross_core_sync    — cross-core signal Cube↔Vec
+//   gdn_sync::Wait(flag)     — wait for cross-core signal
 //   GetValue(idx)           — read a single scalar from a UB tile (slow, use sparingly)
 //
 // ── Workspace memory layout (shared between Cube and Vec via GM) ──────
@@ -89,9 +89,9 @@
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
-#include "kernel_operator.h"
 #include <type_traits>
 #include "acl/acl.h"
+#include "gdn_sync.h"
 using namespace pto;
 
 #ifndef GDN_D
@@ -142,17 +142,11 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A = pto::TileLeft<T, Rows, Cols, RowValid, ColValid>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B = pto::TileRight<T, Rows, Cols, RowValid, ColValid>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols,
@@ -332,7 +326,7 @@ AICORE void chunk_h_kernel(
   //   Vec does the elementwise gating/decay and carries the running state.
   auto cid = get_block_idx();
   auto block_num = get_block_num();
-  AscendC::SetSyncBaseAddr(ffts_addr);
+  gdn_sync::InitAddress(ffts_addr);
 
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
@@ -411,7 +405,7 @@ AICORE void chunk_h_kernel(
   int64_t num_seqs = batch_size;
   int64_t total_work = num_seqs * H;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
@@ -444,7 +438,7 @@ AICORE void chunk_h_kernel(
     //   WS_KV : k_tilde^T @ v_i_new
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
-      AscendC::CrossCoreWaitFlag(3);
+      gdn_sync::Wait<PIPE_MTE2>(3);
 
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
@@ -490,9 +484,9 @@ AICORE void chunk_h_kernel(
         // Save ws_i so the Vec phase can do `v_new = U_i - ws_i`.
         TSTORE(ws_global, ws_store);
       }
-      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0);
+      gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (0 << 8));
 
-      AscendC::CrossCoreWaitFlag(1);
+      gdn_sync::Wait<PIPE_MTE2>(1);
 
       {
         GmShape2D k_shape(D, C);
@@ -534,11 +528,11 @@ AICORE void chunk_h_kernel(
         // Save kv = k_tilde^T @ v_i_new so Vec can finish the state update.
         TSTORE(kv_global, kv_store);
       }
-      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(2);
+      gdn_sync::Signal<PIPE_FIX>(1 | (2 << 4) | (2 << 8));
     }
   }
 #endif
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -615,7 +609,7 @@ AICORE void chunk_h_kernel(
       TASSIGN(s_out_store, S_UB_HALF);
       TSTORE(s_out_global, s_out_store);
     }
-    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
+    gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
 
     int64_t chunk_start_0 = bos;
     int64_t valid0 = slen;
@@ -710,9 +704,9 @@ AICORE void chunk_h_kernel(
       // Torch-like:
       //   coeff = exp(g_last - g_rows_owned_by_this_subblock)
       TADDS(coeff_ub, g_v_ub, -g_last);
-      pipe_barrier(PIPE_V);
+      gdn_sync::VectorBarrier();
       TSUB(coeff_ub, zero_ub, coeff_ub);
-      pipe_barrier(PIPE_V);
+      gdn_sync::VectorBarrier();
       TEXP(coeff_ub, coeff_ub);
 
       TEXP(g_ub, g_ub);
@@ -728,12 +722,12 @@ AICORE void chunk_h_kernel(
       // Broadcast one decay scalar per token row across the D feature columns:
       //   coeff_2d[row, :] = coeff[row]
       TROWEXPAND(coeff_2d_ub, coeff_col_ub);
-      pipe_barrier(PIPE_V);
+      gdn_sync::VectorBarrier();
       // `k_ub` now holds k_tilde = exp(g_last - g_i) * K_i.
       TMUL(k_ub, k_ub, coeff_2d_ub);
-      pipe_barrier(PIPE_V);
+      gdn_sync::VectorBarrier();
 
-      AscendC::CrossCoreWaitFlag(0);
+      gdn_sync::Wait<PIPE_MTE2>(0);
       {
         GmShape2D ws_shape(HalfC, D);
         GmStride2D ws_stride(D);
@@ -781,7 +775,7 @@ AICORE void chunk_h_kernel(
         TSTORE(k_global, k_store);
       }
 
-      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
+      gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (1 << 8));
 
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
@@ -836,7 +830,7 @@ AICORE void chunk_h_kernel(
         }
       }
 
-      AscendC::CrossCoreWaitFlag(2);
+      gdn_sync::Wait<PIPE_MTE2>(2);
       {
         GmShape2D kv_shape(HalfC, D);
         GmStride2D kv_stride(D);
@@ -886,7 +880,7 @@ AICORE void chunk_h_kernel(
           TASSIGN(s_out_store, S_UB_HALF);
           TSTORE(s_out_global, s_out_store);
         }
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
+        gdn_sync::Signal<PIPE_MTE3>(1 | (2 << 4) | (3 << 8));
       }
 
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
