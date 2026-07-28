@@ -64,13 +64,13 @@
 //   wait_flag(P1, P2, EVT)  — Wait for signal from P1 (like a semaphore wait)
 //   pipe_barrier(PIPE_V)    — Local Vec barrier (ensure all Vec ops complete)
 //   pipe_barrier(PIPE_ALL)  — Barrier for all local pipes
-//   ffts_cross_core_sync()  — Cross-core signal (Cube↔Vec, different physical cores)
-//   wait_flag_dev(flag)     — Wait for cross-core signal
+//   CrossCoreSetFlag()      — Cross-core signal (Cube↔Vec, different physical cores)
+//   CrossCoreWaitFlag()     — Wait for cross-core signal
 // ============================================================================
 
 #include <pto/pto-inst.hpp>   // PTO (Performance Tile Operator): NPU kernel API
+#include "kernel_operator.h"
 #include "acl/acl.h"          // ACL (Ascend Computing Language): runtime API
-#include <runtime/rt_ffts.h>  // FFTS: cross-core synchronization primitives
 using namespace pto;
 
 // ── Compile-time constants (set by the JIT compiler from Python) ──────
@@ -174,10 +174,8 @@ AICORE void kkt_kernel(
   // a_ub_half overlaps g_r_2d — safe because they're never live simultaneously
   constexpr int32_t AUbHalfAddr  = GR2dUbAddr;
 
-  // set_ffts_base_addr: Tell the hardware where the cross-core flag table lives.
-  // This is a one-time setup so ffts_cross_core_sync / wait_flag_dev know
-  // which memory region to read/write for inter-core signaling.
-  set_ffts_base_addr(ffts_addr);
+  // Configure the hardware synchronization base before cross-core signaling.
+  AscendC::SetSyncBaseAddr(ffts_addr);
   auto cid = get_block_idx();       // Which AI core am I? (like CUDA blockIdx.x)
   auto block_num = get_block_num();  // Total AI cores launched (like CUDA gridDim.x)
   // ── Vec sub-block parallelism ─────────────────────────────────────────
@@ -291,7 +289,7 @@ AICORE void kkt_kernel(
     for (int64_t ci = 0; ci < num_chunks; ++ci) {
       int32_t slot = static_cast<int32_t>(ci & 1);
       // Wait for Vec to finish reading the previous KK^T from this slot
-      wait_flag_dev(2 + slot);
+      AscendC::CrossCoreWaitFlag(2 + slot);
       pipe_barrier(PIPE_ALL);
 
       int64_t chunk_start = ci * ChunkSize;
@@ -375,7 +373,7 @@ AICORE void kkt_kernel(
       }
 
       // ── Cross-core synchronization (Cube → Vec) ──────────────────────
-      // ffts_cross_core_sync(pipe, config): Signal across physical cores.
+      // CrossCoreSetFlag<mode, pipe>(flag): Signal across physical cores.
       // Unlike set_flag/wait_flag (which sync pipes within ONE core), this syncs
       // between the Cube core and Vec core (they are separate hardware units).
       //
@@ -383,14 +381,14 @@ AICORE void kkt_kernel(
       //   mode=2: broadcast to all cores on same block
       //   flag_id: which flag to set (0,1,2,3...)
       //
-      // The receiving side calls wait_flag_dev(flag_id) to wait for this signal.
+      // The receiving side calls CrossCoreWaitFlag(flag_id) for this signal.
       //
       // In this kernel:
-      //   Cube sets flag 0/1 → Vec waits on wait_flag_dev(0/1) (KK^T ready)
-      //   Vec sets flag 2/3 → Cube waits on wait_flag_dev(2/3) (workspace free)
+      //   Cube sets flag 0/1 → Vec waits on CrossCoreWaitFlag(0/1) (KK^T ready)
+      //   Vec sets flag 2/3 → Cube waits on CrossCoreWaitFlag(2/3) (workspace free)
       //
       // Signal Vec that this slot's KK^T is ready
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (slot << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(slot);
     }
   }
 #endif
@@ -445,9 +443,9 @@ AICORE void kkt_kernel(
 
   // Initial cross-core sync: release both workspace slots so Cube can start.
   // Vec tells Cube "slots 0 and 1 are free" by setting flags 2 and 3.
-  // Without this, Cube would hang on wait_flag_dev(2/3) at the first iteration.
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+  // Without this, Cube would hang on CrossCoreWaitFlag(2/3) at the first iteration.
+  AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
+  AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
 
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -527,7 +525,7 @@ AICORE void kkt_kernel(
       }
 
       // Wait for Cube to finish writing KK^T for this slot
-      wait_flag_dev(slot);
+      AscendC::CrossCoreWaitFlag(slot);
       pipe_barrier(PIPE_ALL);
 
       if (local_valid > 0) {
@@ -635,8 +633,8 @@ AICORE void kkt_kernel(
       pipe_barrier(PIPE_ALL);
       // Signal Cube that this workspace slot is free for reuse.
       // Flag (2+slot): slot 0 → flag 2, slot 1 → flag 3.
-      // Cube is waiting on wait_flag_dev(2+slot) before writing the next chunk.
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((2 + slot) << 8));
+      // Cube waits on CrossCoreWaitFlag(2+slot) before writing the next chunk.
+      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2 + slot);
     }
   }
 #endif

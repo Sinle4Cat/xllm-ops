@@ -22,7 +22,6 @@ add_ops_compile_options(
             -I${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/include
             -I${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/pkg_inc
             -I${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/pkg_inc/profiling
-            -I${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/pkg_inc/runtime
 )
 
 if (NOT BUILD_OPS_RTY_KERNEL)

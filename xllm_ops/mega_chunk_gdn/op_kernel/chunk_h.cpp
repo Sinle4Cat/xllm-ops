@@ -68,8 +68,8 @@
 //   TRESHAPE(zn, nz)        — reinterpret layout NZ↔ZN (logical transpose, free)
 //   TMATMUL(C, A, B)        — C = A @ B (Cube GEMM, DTYPE_Q inputs → FP32 accum)
 //   set_flag/wait_flag      — pipe sync within same core
-//   ffts_cross_core_sync    — cross-core signal Cube↔Vec
-//   wait_flag_dev(flag)     — wait for cross-core signal
+//   CrossCoreSetFlag        — cross-core signal Cube↔Vec
+//   CrossCoreWaitFlag       — wait for cross-core signal
 //   GetValue(idx)           — read a single scalar from a UB tile (slow, use sparingly)
 //
 // ── Workspace memory layout (shared between Cube and Vec via GM) ──────
@@ -89,9 +89,9 @@
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
+#include "kernel_operator.h"
 #include <type_traits>
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
 using namespace pto;
 
 #ifndef GDN_D
@@ -332,7 +332,7 @@ AICORE void chunk_h_kernel(
   //   Vec does the elementwise gating/decay and carries the running state.
   auto cid = get_block_idx();
   auto block_num = get_block_num();
-  set_ffts_base_addr(ffts_addr);
+  AscendC::SetSyncBaseAddr(ffts_addr);
 
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
@@ -444,7 +444,7 @@ AICORE void chunk_h_kernel(
     //   WS_KV : k_tilde^T @ v_i_new
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
-      wait_flag_dev(3);
+      AscendC::CrossCoreWaitFlag(3);
 
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
@@ -490,9 +490,9 @@ AICORE void chunk_h_kernel(
         // Save ws_i so the Vec phase can do `v_new = U_i - ws_i`.
         TSTORE(ws_global, ws_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0);
 
-      wait_flag_dev(1);
+      AscendC::CrossCoreWaitFlag(1);
 
       {
         GmShape2D k_shape(D, C);
@@ -534,7 +534,7 @@ AICORE void chunk_h_kernel(
         // Save kv = k_tilde^T @ v_i_new so Vec can finish the state update.
         TSTORE(kv_global, kv_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(2);
     }
   }
 #endif
@@ -615,7 +615,7 @@ AICORE void chunk_h_kernel(
       TASSIGN(s_out_store, S_UB_HALF);
       TSTORE(s_out_global, s_out_store);
     }
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
 
     int64_t chunk_start_0 = bos;
     int64_t valid0 = slen;
@@ -733,7 +733,7 @@ AICORE void chunk_h_kernel(
       TMUL(k_ub, k_ub, coeff_2d_ub);
       pipe_barrier(PIPE_V);
 
-      wait_flag_dev(0);
+      AscendC::CrossCoreWaitFlag(0);
       {
         GmShape2D ws_shape(HalfC, D);
         GmStride2D ws_stride(D);
@@ -781,7 +781,7 @@ AICORE void chunk_h_kernel(
         TSTORE(k_global, k_store);
       }
 
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
 
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
@@ -836,7 +836,7 @@ AICORE void chunk_h_kernel(
         }
       }
 
-      wait_flag_dev(2);
+      AscendC::CrossCoreWaitFlag(2);
       {
         GmShape2D kv_shape(HalfC, D);
         GmStride2D kv_stride(D);
@@ -886,7 +886,7 @@ AICORE void chunk_h_kernel(
           TASSIGN(s_out_store, S_UB_HALF);
           TSTORE(s_out_global, s_out_store);
         }
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
       }
 
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {

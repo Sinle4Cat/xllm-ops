@@ -47,13 +47,13 @@
 //   TEXTRACT(l0, l1, r, c)  — L1 sub-block → L0A/L0B     (MTE1 for Cube GEMM)
 //   TMATMUL(C, A, B)        — C = A @ B in Cube engine (DTYPE_Q→FP32 accumulate)
 //   set_flag / wait_flag    — sync between pipes on SAME core
-//   ffts_cross_core_sync    — signal ACROSS Cube↔Vec cores
-//   wait_flag_dev(flag)     — wait for cross-core signal
+//   CrossCoreSetFlag        — signal ACROSS Cube↔Vec cores
+//   CrossCoreWaitFlag       — wait for cross-core signal
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
+#include "kernel_operator.h"
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
 #include <type_traits>
 using namespace pto;
 
@@ -327,7 +327,7 @@ AICORE void GDN_WY_FAST_KERNEL(
   constexpr int32_t WsA1Size = ChunkSize * ChunkSize;
   constexpr int32_t WsA2Size = ChunkSize * ChunkSize;
 
-  set_ffts_base_addr(ffts_addr);
+  AscendC::SetSyncBaseAddr(ffts_addr);
   auto cid = get_block_idx();
   auto block_num = get_block_num();
   auto vid = get_subblockid();
@@ -425,11 +425,11 @@ AICORE void GDN_WY_FAST_KERNEL(
             if (local_rows < 0) local_rows = 0;
             if (local_rows > HalfChunk) local_rows = HalfChunk;
             if (local_rows == 0) {
-              if (!first_iter) wait_flag_dev(3);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+              if (!first_iter) AscendC::CrossCoreWaitFlag(3);
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
 
-              if (!first_iter) wait_flag_dev(4);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              if (!first_iter) AscendC::CrossCoreWaitFlag(4);
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
               first_iter = false;
               gi++;
               continue;
@@ -499,7 +499,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a2_ub, a1_ub, beta_2d_ub);
             TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
 
-            if (!first_iter) wait_flag_dev(3);
+            if (!first_iter) AscendC::CrossCoreWaitFlag(3);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -513,7 +513,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
 
             // G is pre-transposed to [H, total_tokens] for contiguous loads.
             {
@@ -550,7 +550,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a1_ub, a1_ub, g_2d_ub);
             TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
 
-            if (!first_iter) wait_flag_dev(4);
+            if (!first_iter) AscendC::CrossCoreWaitFlag(4);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -564,7 +564,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TSTORE(workspace_a1_global, a1_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
             first_iter = false;
           }
           gi++;
@@ -599,11 +599,11 @@ AICORE void GDN_WY_FAST_KERNEL(
             if (local_rows > HalfChunk) local_rows = HalfChunk;
             int32_t head_idx = h;
             if (local_rows == 0) {
-              if (!first_iter_v) wait_flag_dev(3);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+              if (!first_iter_v) AscendC::CrossCoreWaitFlag(3);
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
 
-              if (!first_iter_v) wait_flag_dev(4);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              if (!first_iter_v) AscendC::CrossCoreWaitFlag(4);
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
               first_iter_v = false;
               gi++;
               continue;
@@ -668,7 +668,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a2_ub, a1_ub, beta_2d_ub);
             TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
 
-            if (!first_iter_v) wait_flag_dev(3);
+            if (!first_iter_v) AscendC::CrossCoreWaitFlag(3);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -682,7 +682,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
 
             // G is pre-transposed to [H, total_tokens] for contiguous loads.
             {
@@ -715,7 +715,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a1_ub, a1_ub, g_2d_ub);
             TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
 
-            if (!first_iter_v) wait_flag_dev(4);
+            if (!first_iter_v) AscendC::CrossCoreWaitFlag(4);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -729,7 +729,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TSTORE(workspace_a1_global, a1_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
             first_iter_v = false;
           }
           gi++;
@@ -794,7 +794,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               }
             }
 
-            wait_flag_dev(2);
+            AscendC::CrossCoreWaitFlag(2);
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -825,9 +825,9 @@ AICORE void GDN_WY_FAST_KERNEL(
               // physically ChunkSize x HiddenSize.
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (3 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
 
-            wait_flag_dev(1);
+            AscendC::CrossCoreWaitFlag(1);
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
@@ -856,7 +856,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(4);
           }
           gi++;
         }
@@ -918,7 +918,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               }
             }
 
-            wait_flag_dev(2);
+            AscendC::CrossCoreWaitFlag(2);
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -946,9 +946,9 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (3 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
 
-            wait_flag_dev(1);
+            AscendC::CrossCoreWaitFlag(1);
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
@@ -976,7 +976,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(4);
           }
           gi++;
         }

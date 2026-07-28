@@ -74,13 +74,13 @@
 //   TRESHAPE(zn, nz)        — reinterpret L1 fractal layout (transpose, free)
 //   TMATMUL(C, A, B)        — C = A @ B (Cube engine, DTYPE_Q→FP32 accum)
 //   set_flag / wait_flag    — synchronize pipes within same AI core
-//   ffts_cross_core_sync    — signal across Cube↔Vec cores
-//   wait_flag_dev(flag)     — wait for cross-core signal
+//   CrossCoreSetFlag        — signal across Cube↔Vec cores
+//   CrossCoreWaitFlag       — wait for cross-core signal
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
+#include "kernel_operator.h"
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
 using namespace pto;
 
 // ── Compile-time configuration (overridable at build time via -D flags) ──
@@ -195,7 +195,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
   constexpr int32_t OUbAddr      = QKUbAddr;
 
   // Initialize the cross-core FFTS signaling base address for this AI core.
-  set_ffts_base_addr(ffts_addr);
+  AscendC::SetSyncBaseAddr(ffts_addr);
   // cid = which AI core am I? (0..block_num-1). Used to partition work items.
   auto cid = get_block_idx();
   // block_num = total number of AI cores running this kernel in parallel.
@@ -301,7 +301,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
          work_idx < total_work;
          work_idx += static_cast<int64_t>(block_num)) {
       // Wait for Vec to finish with previous chunk's workspace (flag 3)
-      if (!first_cube_iter) wait_flag_dev(3);
+      if (!first_cube_iter) AscendC::CrossCoreWaitFlag(3);
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
@@ -451,7 +451,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       // and coordinate via FFTS flags. Think of it as two processes communicating
       // through shared memory with semaphores.
       //
-      // ffts_cross_core_sync(PIPE_FIX, config):
+      // CrossCoreSetFlag:
       //   config = 1 | (mode << 4) | (flag_id << 8)
       //   mode=2: broadcast signal to all cores in this block
       //   flag_id: identifies which signal (0, 1, 2, 3)
@@ -461,10 +461,10 @@ AICORE void GDN_CHUNK_O_KERNEL(
       //   flag 1: Vec→Cube "QK_gated is ready for GEMM 3"
       //   flag 2: Cube→Vec "QKV (GEMM 3 result) is ready"
       //   flag 3: Vec→Cube "I'm done with this chunk, you can reuse workspace"
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0);
 
       // Wait for Vec to write QK_gated back (flag 1, Vec→Cube)
-      wait_flag_dev(1);
+      AscendC::CrossCoreWaitFlag(1);
 
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -529,7 +529,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       }
 
       // Signal Vec: QKV is ready (flag 2, Cube→Vec)
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(2);
       first_cube_iter = false;
     }
   } else {
@@ -547,7 +547,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
-            if (!first_cube_iter_v) wait_flag_dev(3);
+            if (!first_cube_iter_v) AscendC::CrossCoreWaitFlag(3);
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
@@ -660,10 +660,10 @@ AICORE void GDN_CHUNK_O_KERNEL(
             }
 
             // Cube→Vec: QK & QS ready (flag 0)
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0);
 
             // Wait Vec→Cube: QK_gated ready (flag 1)
-            wait_flag_dev(1);
+            AscendC::CrossCoreWaitFlag(1);
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -718,7 +718,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TSTORE(_gm, _l0);
             }
 
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(2);
             first_cube_iter_v = false;
           }
           gi++;
@@ -849,11 +849,11 @@ AICORE void GDN_CHUNK_O_KERNEL(
       }
 
       // ── Wait for Cube→Vec flag 0: QK & QS ready ─────────────────────
-      wait_flag_dev(0);
+      AscendC::CrossCoreWaitFlag(0);
       if (local_rows == 0) {
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
-        wait_flag_dev(2);
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
+        AscendC::CrossCoreWaitFlag(2);
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
         continue;
       }
 
@@ -915,7 +915,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
         TSTORE(_gm, _st);
       }
       // Vec→Cube: QK_gated ready (flag 1)
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
 
       // ── Scale QS by exp(g): QS_gated = QS * exp(g_row) ──────────────
       // ── Scale QS by exp(g): inter-chunk state contribution ────────────
@@ -935,7 +935,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       TMUL(qs_ub, qs_ub, g_exp_2d);      // QS_gated = QS * exp(g_row)
 
       // ── Wait for Cube→Vec flag 2: QKV ready ─────────────────────────
-      wait_flag_dev(2);
+      AscendC::CrossCoreWaitFlag(2);
 
       // ── Load QKV [C/2 × D] from workspace → UB ──────────────────────
       {
@@ -987,7 +987,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
       }
 
       // Vec→Cube: done with this chunk (flag 3)
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+      AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
     }
   } else {
     // ── Variable-length sequence path (cu_seqlens != nullptr) ──────────
@@ -1058,11 +1058,11 @@ AICORE void GDN_CHUNK_O_KERNEL(
               TEXP(g_v_ub, g_v_ub);
             }
 
-            wait_flag_dev(0);
+            AscendC::CrossCoreWaitFlag(0);
             if (local_rows == 0) {
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
-              wait_flag_dev(2);
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
+              AscendC::CrossCoreWaitFlag(2);
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
             } else {
               // Load QK from workspace
               {
@@ -1121,7 +1121,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
                 TSTORE(_gm, _st);
               }
               // Vec→Cube: QK_gated ready (flag 1)
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
 
               // Scale QS by exp(g): QS_scaled = QS * exp(g_row)[:, None]
               // (same inter-chunk state scaling as fixed-length path)
@@ -1137,7 +1137,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               pipe_barrier(PIPE_V);
               TMUL(qs_ub, qs_ub, g_exp_2d_v);
 
-              wait_flag_dev(2);
+              AscendC::CrossCoreWaitFlag(2);
 
               // Load QKV from workspace
               {
@@ -1185,7 +1185,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
               }
 
               // Vec→Cube: done with this chunk (flag 3)
-              ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+              AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(3);
             }
           }
           gi++;

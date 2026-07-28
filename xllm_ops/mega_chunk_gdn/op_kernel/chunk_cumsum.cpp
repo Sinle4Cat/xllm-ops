@@ -49,8 +49,8 @@
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
+#include "kernel_operator.h"
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
 using namespace pto;
 
 // GDN_C: Compile-time chunk size injected by the build system.
@@ -142,10 +142,8 @@ AICORE void cumsum_kernel(
   auto cid = get_block_idx();
   auto block_num = get_block_num();
   auto vid = get_subblockid();
-  // set_ffts_base_addr(ffts_addr): Configure the base address for FFTS
-  // (Fast Fine-grained Task Synchronization) — the cross-core signaling mechanism.
-  // Required before any cross-core sync (ffts_cross_core_sync / wait_flag_dev).
-  set_ffts_base_addr(ffts_addr);
+  // Configure the hardware synchronization base before any cross-core operation.
+  AscendC::SetSyncBaseAddr(ffts_addr);
 
 // #if defined(__DAV_C220_VEC__): This block only compiles for the Vec core pass.
 // The bisheng compiler makes 3 passes over the same source file:

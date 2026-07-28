@@ -59,33 +59,23 @@ struct MegaChunkGdnKernelTilingData {
 // ===================================================================
 #ifdef __CCE_AICORE__
 
-// Sync flag ids are provided by PTO. Keep this kernel on the shared sync
-// contract so updates to the runtime synchronization framework stay aligned.
-constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
-constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
-
-AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
-{
-    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) + ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
-}
-
 template <bool isAIVOnly = true>
 AICORE inline void SyncAllImpl()
 {
     pipe_barrier(PIPE_ALL);
     if constexpr (isAIVOnly) {
-        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
-        wait_flag_dev(SYNC_AIV_ONLY_ALL);
+        AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(SYNC_AIV_ONLY_ALL);
+        AscendC::CrossCoreWaitFlag(SYNC_AIV_ONLY_ALL);
         return;
     }
 #if defined(__DAV_C220_CUBE__)
-    wait_flag_dev(SYNC_AIV_FLAG);
-    ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
-    wait_flag_dev(SYNC_AIC_FLAG);
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+    AscendC::CrossCoreWaitFlag(SYNC_AIV_FLAG);
+    AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(SYNC_AIC_FLAG);
+    AscendC::CrossCoreWaitFlag(SYNC_AIC_FLAG);
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIC_AIV_FLAG);
 #elif defined(__DAV_C220_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
-    wait_flag_dev(SYNC_AIC_AIV_FLAG);
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_FLAG);
+    AscendC::CrossCoreWaitFlag(SYNC_AIC_AIV_FLAG);
 #endif
 }
 
@@ -347,8 +337,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
 #if defined(__DAV_C220_CUBE__)
     pipe_barrier(PIPE_ALL);
-    wait_flag_dev(2);
-    wait_flag_dev(3);
+    AscendC::CrossCoreWaitFlag(2);
+    AscendC::CrossCoreWaitFlag(3);
 #endif
 
 #ifdef MEGA_STOP_AFTER_KKT
@@ -389,8 +379,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 #if defined(__DAV_C220_VEC__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
-        wait_flag_dev(3);
-        wait_flag_dev(4);
+        AscendC::CrossCoreWaitFlag(3);
+        AscendC::CrossCoreWaitFlag(4);
     }
 #endif
 
@@ -429,7 +419,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 #if defined(__DAV_C220_CUBE__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
-        wait_flag_dev(3);
+        AscendC::CrossCoreWaitFlag(3);
     }
 #endif
 }
