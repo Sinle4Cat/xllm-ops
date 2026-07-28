@@ -39,13 +39,13 @@
 // Key PTO APIs (with numpy/torch equivalents):
 //   TLOAD(ub_tile, gm)      — ub_tile = gm[...]          (DMA: GM→UB, async MTE2)
 //   TSTORE(gm, ub_tile)     — gm[...] = ub_tile          (DMA: UB→GM, async MTE3)
-//   TCVT(dst, src, mode)    — converts between float and DTYPE_Q
+//   TCVT(dst, src, mode)    — converts between float and ComputeT
 //   TMOV(dst, src)          — dst = src.clone()
 //   TMUL(d, a, b)           — d = a * b                   (element-wise)
 //   TEXP(d, s)              — d = torch.exp(s)
 //   TCOLEXPAND(2d, row)     — 2d[i,j] = row[j]  (broadcast row across all rows)
 //   TEXTRACT(l0, l1, r, c)  — L1 sub-block → L0A/L0B     (MTE1 for Cube GEMM)
-//   TMATMUL(C, A, B)        — C = A @ B in Cube engine (DTYPE_Q→FP32 accumulate)
+//   TMATMUL(C, A, B)        — C = A @ B in Cube engine (ComputeT→FP32 accumulate)
 //   set_flag / wait_flag    — sync between pipes on SAME core
 //   ffts_cross_core_sync    — signal ACROSS Cube↔Vec cores
 //   gdn_sync::Wait(flag)     — wait for cross-core signal
@@ -272,13 +272,13 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 #define GDN_WY_FAST_KERNEL wy_fast_kernel
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+template <typename ComputeT, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void GDN_WY_FAST_KERNEL(
-    __gm__ DTYPE_Q *K_handle, __gm__ DTYPE_Q *V_handle,
-    __gm__ DTYPE_Q *Beta_handle, __gm__ float *G_handle,
-    __gm__ DTYPE_Q *A_handle,
-    __gm__ DTYPE_Q *workspace_a1_handle, __gm__ DTYPE_Q *workspace_a2_handle,
-    __gm__ DTYPE_Q *W_handle, __gm__ DTYPE_Q *U_handle,
+    __gm__ ComputeT *K_handle, __gm__ ComputeT *V_handle,
+    __gm__ ComputeT *Beta_handle, __gm__ float *G_handle,
+    __gm__ ComputeT *A_handle,
+    __gm__ ComputeT *workspace_a1_handle, __gm__ ComputeT *workspace_a2_handle,
+    __gm__ ComputeT *W_handle, __gm__ ComputeT *U_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint32_t num_heads,
@@ -343,10 +343,10 @@ AICORE void GDN_WY_FAST_KERNEL(
 
   int64_t num_seqs = batch_size;
 
-  TileUbDataND<DTYPE_Q, 1, ChunkSize, 1, ChunkSize,
+  TileUbDataND<ComputeT, 1, ChunkSize, 1, ChunkSize,
                pto::PadValue::Zero> beta_ub_half;
   TASSIGN(beta_ub_half, BetaHalfUbAddr);
-  TileUbDataND<DTYPE_Q, HalfChunk, ChunkSize,
+  TileUbDataND<ComputeT, HalfChunk, ChunkSize,
                HalfChunk, ChunkSize, pto::PadValue::Zero> a1_ub_half;
   TASSIGN(a1_ub_half, A1HalfUbAddr);
   TileUbDataND<float, 1, ChunkSize, 1, ChunkSize> beta_ub;
@@ -364,7 +364,7 @@ AICORE void GDN_WY_FAST_KERNEL(
   TileUbDataND<float, HalfChunk, ChunkSize,
                HalfChunk, ChunkSize> a2_ub;
   TASSIGN(a2_ub, A2UbAddr);
-  TileUbDataND<DTYPE_Q, HalfChunk, ChunkSize,
+  TileUbDataND<ComputeT, HalfChunk, ChunkSize,
                HalfChunk, ChunkSize> a2_ub_half;
   TASSIGN(a2_ub_half, A2HalfUbAddr);
   TileUbDataND<float, 1, ChunkSize, 1, ChunkSize,
@@ -376,19 +376,19 @@ AICORE void GDN_WY_FAST_KERNEL(
                HalfChunk, ChunkSize> g_2d_ub;
   TASSIGN(g_2d_ub, G2dUbAddr);
 
-  TileMatL1<DTYPE_Q, ChunkSize, HiddenSize,
+  TileMatL1<ComputeT, ChunkSize, HiddenSize,
             ChunkSize, HiddenSize> k_l1;
   TASSIGN(k_l1, 0);
-  TileMatL1<DTYPE_Q, ChunkSize, HiddenSize,
+  TileMatL1<ComputeT, ChunkSize, HiddenSize,
             ChunkSize, HiddenSize> v_l1;
   TASSIGN(v_l1, 32768);
-  TileMatL1<DTYPE_Q, ChunkSize, ChunkSize,
+  TileMatL1<ComputeT, ChunkSize, ChunkSize,
             ChunkSize, ChunkSize> a2_l1;
   TASSIGN(a2_l1, 65536);
   TileAcc<float, ChunkSize, HiddenSize,
           ChunkSize, HiddenSize> u_l0;
   TASSIGN(u_l0, 0);
-  TileMatL1<DTYPE_Q, ChunkSize, ChunkSize,
+  TileMatL1<ComputeT, ChunkSize, ChunkSize,
             ChunkSize, ChunkSize> a1_l1;
   TASSIGN(a1_l1, 98304);
   TileAcc<float, ChunkSize, HiddenSize,
@@ -442,7 +442,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               {
                 GmShape2D a2_shape(HalfChunk, ChunkSize);
                 GmStride2D a2_stride(ChunkSize);
-                GmTensor2D<DTYPE_Q> workspace_a2_global(
+                GmTensor2D<ComputeT> workspace_a2_global(
                     workspace_a2_handle +
                         static_cast<int64_t>(cid) * WsA2Size +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -457,7 +457,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               {
                 GmShape2D a1_shape(HalfChunk, ChunkSize);
                 GmStride2D a1_stride(ChunkSize);
-                GmTensor2D<DTYPE_Q> workspace_a1_global(
+                GmTensor2D<ComputeT> workspace_a1_global(
                     workspace_a1_handle +
                         static_cast<int64_t>(cid) * WsA1Size +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -475,11 +475,11 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D beta_shape(1, valid_rows);
               GmStride2D beta_stride(1);
-              GmTensor2D<DTYPE_Q> beta_global(
+              GmTensor2D<ComputeT> beta_global(
                   Beta_handle + static_cast<int64_t>(head_idx) * total_tokens +
                       chunk_token_start,
                   beta_shape, beta_stride);
-              DynVecTile<DTYPE_Q, 1, ChunkSize, pto::PadValue::Zero> beta_load(
+              DynVecTile<ComputeT, 1, ChunkSize, pto::PadValue::Zero> beta_load(
                   1, valid_rows);
               TASSIGN(beta_load, BetaHalfUbAddr);
               TLOAD(beta_load, beta_global);
@@ -502,9 +502,9 @@ AICORE void GDN_WY_FAST_KERNEL(
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(H * ChunkSize);
-              GmTensor2D<DTYPE_Q> a_global(A_handle + a_gm_offset, a_shape,
+              GmTensor2D<ComputeT> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
-              DynVecTile<DTYPE_Q, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
+              DynVecTile<ComputeT, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
                   local_rows, ChunkSize);
               TASSIGN(a_load, A1HalfUbAddr);
               TLOAD(a_load, a_global);
@@ -548,7 +548,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a2_shape(HalfChunk, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a2_global(
+              GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle +
                       static_cast<int64_t>(cid) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -604,7 +604,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a1_shape(HalfChunk, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a1_global(
+              GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle +
                       static_cast<int64_t>(cid) * WsA1Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -658,7 +658,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               {
                 GmShape2D a2_shape(HalfChunk, ChunkSize);
                 GmStride2D a2_stride(ChunkSize);
-                GmTensor2D<DTYPE_Q> workspace_a2_global(
+                GmTensor2D<ComputeT> workspace_a2_global(
                     workspace_a2_handle +
                         static_cast<int64_t>(cid) * WsA2Size +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -675,7 +675,7 @@ AICORE void GDN_WY_FAST_KERNEL(
               {
                 GmShape2D a1_shape(HalfChunk, ChunkSize);
                 GmStride2D a1_stride(ChunkSize);
-                GmTensor2D<DTYPE_Q> workspace_a1_global(
+                GmTensor2D<ComputeT> workspace_a1_global(
                     workspace_a1_handle +
                         static_cast<int64_t>(cid) * WsA1Size +
                         static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -693,11 +693,11 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D beta_shape(1, valid_rows);
               GmStride2D beta_stride(1);
-              GmTensor2D<DTYPE_Q> beta_global(
+              GmTensor2D<ComputeT> beta_global(
                   Beta_handle + static_cast<int64_t>(head_idx) * total_tokens +
                       chunk_token_start,
                   beta_shape, beta_stride);
-              DynVecTile<DTYPE_Q, 1, ChunkSize, pto::PadValue::Zero> beta_load(
+              DynVecTile<ComputeT, 1, ChunkSize, pto::PadValue::Zero> beta_load(
                   1, valid_rows);
               TASSIGN(beta_load, BetaHalfUbAddr);
               TLOAD(beta_load, beta_global);
@@ -719,9 +719,9 @@ AICORE void GDN_WY_FAST_KERNEL(
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(H * ChunkSize);
-              GmTensor2D<DTYPE_Q> a_global(A_handle + a_gm_offset, a_shape,
+              GmTensor2D<ComputeT> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
-              DynVecTile<DTYPE_Q, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
+              DynVecTile<ComputeT, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
                   local_rows, ChunkSize);
               TASSIGN(a_load, A1HalfUbAddr);
               TLOAD(a_load, a_global);
@@ -763,7 +763,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a2_shape(HalfChunk, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a2_global(
+              GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle +
                       static_cast<int64_t>(cid) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -817,7 +817,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a1_shape(HalfChunk, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a1_global(
+              GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle +
                       static_cast<int64_t>(cid) * WsA1Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
@@ -869,8 +869,8 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D k_shape(valid_rows, HiddenSize);
               GmStride2D k_stride(BSND_QK_STRIDE);
-              GmTensor2D<DTYPE_Q> k_global(K_handle + k_off, k_shape, k_stride);
-              DynMatL1<DTYPE_Q, ChunkSize, HiddenSize> k_l1_load(valid_rows,
+              GmTensor2D<ComputeT> k_global(K_handle + k_off, k_shape, k_stride);
+              DynMatL1<ComputeT, ChunkSize, HiddenSize> k_l1_load(valid_rows,
                                                               HiddenSize);
               TASSIGN(k_l1_load, 0);
               TLOAD(k_l1_load, k_global);
@@ -881,8 +881,8 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D v_shape(valid_rows, HiddenSize);
               GmStride2D v_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> v_global(V_handle + v_off, v_shape, v_stride);
-              DynMatL1<DTYPE_Q, ChunkSize, HiddenSize> v_l1_load(valid_rows,
+              GmTensor2D<ComputeT> v_global(V_handle + v_off, v_shape, v_stride);
+              DynMatL1<ComputeT, ChunkSize, HiddenSize> v_l1_load(valid_rows,
                                                               HiddenSize);
               TASSIGN(v_l1_load, 32768);
               TLOAD(v_l1_load, v_global);
@@ -895,7 +895,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a2_global(
+              GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size,
                   a2_shape, a2_stride);
               TLOAD(a2_l1, workspace_a2_global);
@@ -904,7 +904,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // U = A2 * V keeps the beta-scaled path separate from the K-side update.
-            gemm_v0<DTYPE_Q, float,
+            gemm_v0<ComputeT, float,
                 ChunkSize, HiddenSize, ChunkSize,
                 ChunkSize, HiddenSize, ChunkSize,
                 KTail, false, false>(a2_l1, v_l1, u_l0, true);
@@ -912,7 +912,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
               GmStride2D u_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> u_global(U_handle + v_off, u_shape, u_stride);
+              GmTensor2D<ComputeT> u_global(U_handle + v_off, u_shape, u_stride);
               DynAccTile<float, ChunkSize, HiddenSize> u_store(valid_rows,
                                                                HiddenSize);
               TASSIGN(u_store, 0);
@@ -928,7 +928,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a1_global(
+              GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle + static_cast<int64_t>(cid) * WsA1Size,
                   a1_shape, a1_stride);
               // Load the Vec-prepared A1 tile:
@@ -939,7 +939,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // W = A1 * K uses the g-reweighted path for the complementary WY factor.
-            gemm_v0<DTYPE_Q, float,
+            gemm_v0<ComputeT, float,
                 ChunkSize, HiddenSize, ChunkSize,
                 ChunkSize, HiddenSize, ChunkSize,
                 KTail, false, false>(a1_l1, k_l1, w_l0, true);
@@ -947,7 +947,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
               GmStride2D w_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> w_global(W_handle + v_off, w_shape, w_stride);
+              GmTensor2D<ComputeT> w_global(W_handle + v_off, w_shape, w_stride);
               DynAccTile<float, ChunkSize, HiddenSize> w_store(valid_rows,
                                                                HiddenSize);
               TASSIGN(w_store, 65536);
@@ -992,9 +992,9 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D k_shape(valid_rows, HiddenSize);
               GmStride2D k_stride(BSND_QK_STRIDE);
-              GmTensor2D<DTYPE_Q> k_global(K_handle + k_off, k_shape,
+              GmTensor2D<ComputeT> k_global(K_handle + k_off, k_shape,
                                         k_stride);
-              DynMatL1<DTYPE_Q, ChunkSize, HiddenSize> k_l1_load(valid_rows,
+              DynMatL1<ComputeT, ChunkSize, HiddenSize> k_l1_load(valid_rows,
                                                               HiddenSize);
               TASSIGN(k_l1_load, 0);
               TLOAD(k_l1_load, k_global);
@@ -1005,9 +1005,9 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D v_shape(valid_rows, HiddenSize);
               GmStride2D v_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> v_global(V_handle + v_off, v_shape,
+              GmTensor2D<ComputeT> v_global(V_handle + v_off, v_shape,
                                         v_stride);
-              DynMatL1<DTYPE_Q, ChunkSize, HiddenSize> v_l1_load(valid_rows,
+              DynMatL1<ComputeT, ChunkSize, HiddenSize> v_l1_load(valid_rows,
                                                               HiddenSize);
               TASSIGN(v_l1_load, 32768);
               TLOAD(v_l1_load, v_global);
@@ -1020,7 +1020,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a2_global(
+              GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size,
                   a2_shape, a2_stride);
               TLOAD(a2_l1, workspace_a2_global);
@@ -1029,7 +1029,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // U = A2 * V keeps the beta-scaled path separate from the K-side update.
-            gemm_v0<DTYPE_Q, float,
+            gemm_v0<ComputeT, float,
                 ChunkSize, HiddenSize, ChunkSize,
                 ChunkSize, HiddenSize, ChunkSize,
                 KTail, false, false>(a2_l1, v_l1, u_l0, true);
@@ -1037,7 +1037,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
               GmStride2D u_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> u_global(U_handle + v_off, u_shape,
+              GmTensor2D<ComputeT> u_global(U_handle + v_off, u_shape,
                                         u_stride);
               DynAccTile<float, ChunkSize, HiddenSize> u_store(valid_rows,
                                                                HiddenSize);
@@ -1052,7 +1052,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
-              GmTensor2D<DTYPE_Q> workspace_a1_global(
+              GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle + static_cast<int64_t>(cid) * WsA1Size,
                   a1_shape, a1_stride);
               TLOAD(a1_l1, workspace_a1_global);
@@ -1061,7 +1061,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // W = A1 * K uses the g-reweighted path for the complementary WY factor.
-            gemm_v0<DTYPE_Q, float,
+            gemm_v0<ComputeT, float,
                 ChunkSize, HiddenSize, ChunkSize,
                 ChunkSize, HiddenSize, ChunkSize,
                 KTail, false, false>(a1_l1, k_l1, w_l0, true);
@@ -1069,7 +1069,7 @@ AICORE void GDN_WY_FAST_KERNEL(
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
               GmStride2D w_stride(BSND_V_STRIDE);
-              GmTensor2D<DTYPE_Q> w_global(W_handle + v_off, w_shape,
+              GmTensor2D<ComputeT> w_global(W_handle + v_off, w_shape,
                                         w_stride);
               DynAccTile<float, ChunkSize, HiddenSize> w_store(valid_rows,
                                                                HiddenSize);
