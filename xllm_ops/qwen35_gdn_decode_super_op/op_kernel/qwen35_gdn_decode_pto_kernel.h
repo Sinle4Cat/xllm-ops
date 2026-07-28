@@ -73,6 +73,48 @@ AICORE PTO_INLINE void CopyGmToUb(__gm__ T1 *handle, int32_t ubAddress,
     }
 }
 
+AICORE PTO_INLINE void CopyConvHistoryGmToUb(
+    __gm__ bfloat16_t *handle, int32_t ubAddress, int32_t convDim)
+{
+    using HistoryShape = pto::Shape<1, 1, 1, 3, 128>;
+    using HistoryStride = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+    HistoryShape shape;
+    HistoryStride stride(convDim);
+    pto::GlobalTensor<bfloat16_t, HistoryShape, HistoryStride> tensor(
+        handle, shape, stride);
+    TileUbDataND<bfloat16_t, 3, 128> tile;
+    pto::TASSIGN(tile, ubAddress);
+    pto::TLOAD(tile, tensor);
+}
+
+AICORE PTO_INLINE void CopyConvHistoryUbToGm(
+    __gm__ bfloat16_t *handle, int32_t ubAddress, int32_t convDim)
+{
+    using HistoryShape = pto::Shape<1, 1, 1, 3, 128>;
+    using HistoryStride = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+    HistoryShape shape;
+    HistoryStride stride(convDim);
+    pto::GlobalTensor<bfloat16_t, HistoryShape, HistoryStride> tensor(
+        handle, shape, stride);
+    TileUbDataND<bfloat16_t, 3, 128> tile;
+    pto::TASSIGN(tile, ubAddress);
+    pto::TSTORE(tensor, tile);
+}
+
+AICORE PTO_INLINE void CopyConvWeightsGmToUb(
+    __gm__ bfloat16_t *handle, int32_t ubAddress, int32_t convDim)
+{
+    using WeightShape = pto::Shape<1, 1, 1, 4, 128>;
+    using WeightStride = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+    WeightShape shape;
+    WeightStride stride(convDim);
+    pto::GlobalTensor<bfloat16_t, WeightShape, WeightStride> tensor(
+        handle, shape, stride);
+    TileUbDataND<bfloat16_t, 4, 128> tile;
+    pto::TASSIGN(tile, ubAddress);
+    pto::TLOAD(tile, tensor);
+}
+
 template <typename T1, typename T2, int32_t Shape1, int32_t Shape2,
           int32_t Shape3, int32_t Shape4, int32_t Shape5, int32_t Stride1,
           int32_t Stride2, int32_t Stride3, int32_t Stride4, int32_t Stride5,
@@ -318,23 +360,9 @@ AICORE PTO_INLINE void PrefetchConvBatch(
     int32_t conv_state_stride, int32_t channel_offset)
 {
     wait_flag(PIPE_MTE3, PIPE_MTE2, ReuseEvent);
-    CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_state_handle + state_idx * conv_state_stride + channel_offset,
-            BufferBase + kConvHistHalf0, 0, 1, 128);
-    CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_state_handle + state_idx * conv_state_stride +
-                channel_offset + conv_dim,
-            BufferBase + kConvHistHalf1, 0, 1, 128);
-    CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_state_handle + state_idx * conv_state_stride +
-                channel_offset + 2 * conv_dim,
-            BufferBase + kConvHistHalf2, 0, 1, 128);
+    CopyConvHistoryGmToUb(
+        conv_state_handle + state_idx * conv_state_stride + channel_offset,
+        BufferBase + kConvHistHalf0, conv_dim);
     CopyGmToUb<
         bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
         kMaxBatchSize * kMaxConvDim, 1, 1, 128, pto::PadValue::Zero>(
@@ -420,26 +448,10 @@ AICORE PTO_INLINE void ComputeAndStoreConvBatch(
         kMaxBatchSize * kMaxConvDim, 1, 1, 128>(
             conv_out_handle + batch_idx * conv_dim + channel_offset,
             BufferBase + kConvOutputHalf, 0, 1, 128);
-    CopyUbToGm<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128>(
-            conv_state_out_handle + state_idx * conv_state_stride +
-                channel_offset,
-            BufferBase + kConvSaveHalf0, 0, 1, 128);
-    pipe_barrier(PIPE_MTE3);
-    CopyUbToGm<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128>(
-            conv_state_out_handle + state_idx * conv_state_stride +
-                channel_offset + conv_dim,
-            BufferBase + kConvSaveHalf1, 0, 1, 128);
-    pipe_barrier(PIPE_MTE3);
-    CopyUbToGm<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvStateElements, 1, 1, 128>(
-            conv_state_out_handle + state_idx * conv_state_stride +
-                channel_offset + 2 * conv_dim,
-            BufferBase + kConvSaveHalf2, 0, 1, 128);
+    CopyConvHistoryUbToGm(
+        conv_state_out_handle + state_idx * conv_state_stride +
+            channel_offset,
+        BufferBase + kConvSaveHalf0, conv_dim);
     set_flag(PIPE_MTE3, PIPE_MTE2, ReuseEvent);
 }
 
@@ -675,26 +687,31 @@ AICORE PTO_INLINE void Run(
   for (int32_t conv_tile = vector_core_idx; conv_tile < conv_tile_count;
        conv_tile += vector_core_count) {
     const int32_t channel_offset = conv_tile * kHeadDim;
-    qwen35_decode_pto::CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_weight_handle + channel_offset, kUbConvWeightHalf0,
-            0, 1, 128);
-    qwen35_decode_pto::CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_weight_handle + channel_offset + conv_dim,
-            kUbConvWeightHalf1, 0, 1, 128);
-    qwen35_decode_pto::CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_weight_handle + channel_offset + 2 * conv_dim,
-            kUbConvWeightHalf2, 0, 1, 128);
-    qwen35_decode_pto::CopyGmToUb<
-        bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-        kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
-            conv_weight_handle + channel_offset + 3 * conv_dim,
-            kUbConvWeightHalf3, 0, 1, 128);
+    if constexpr (IsBatchOne) {
+      qwen35_decode_pto::CopyConvWeightsGmToUb(
+          conv_weight_handle + channel_offset, kUbConvWeightHalf0, conv_dim);
+    } else {
+      qwen35_decode_pto::CopyGmToUb<
+          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+          kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
+              conv_weight_handle + channel_offset, kUbConvWeightHalf0,
+              0, 1, 128);
+      qwen35_decode_pto::CopyGmToUb<
+          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+          kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
+              conv_weight_handle + channel_offset + conv_dim,
+              kUbConvWeightHalf1, 0, 1, 128);
+      qwen35_decode_pto::CopyGmToUb<
+          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+          kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
+              conv_weight_handle + channel_offset + 2 * conv_dim,
+              kUbConvWeightHalf2, 0, 1, 128);
+      qwen35_decode_pto::CopyGmToUb<
+          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+          kMaxConvWeightElements, 1, 1, 128, pto::PadValue::Zero>(
+              conv_weight_handle + channel_offset + 3 * conv_dim,
+              kUbConvWeightHalf3, 0, 1, 128);
+    }
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
     TCVT(w0, w_half0, RoundMode::CAST_NONE);
@@ -826,26 +843,10 @@ AICORE PTO_INLINE void Run(
           kMaxBatchSize * kMaxConvDim, 1, 1, 128>(
               conv_out_handle + batch_idx * conv_dim + channel_offset,
               kUbConvOutputHalf, 0, 1, 128);
-      qwen35_decode_pto::CopyUbToGm<
-          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-          kMaxConvStateElements, 1, 1, 128>(
-              conv_state_out_handle + state_idx * conv_state_stride +
-                  channel_offset,
-              kUbConvSaveHalf0, 0, 1, 128);
-      pipe_barrier(PIPE_MTE3);
-      qwen35_decode_pto::CopyUbToGm<
-          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-          kMaxConvStateElements, 1, 1, 128>(
-              conv_state_out_handle + state_idx * conv_state_stride +
-                  channel_offset + conv_dim,
-              kUbConvSaveHalf1, 0, 1, 128);
-      pipe_barrier(PIPE_MTE3);
-      qwen35_decode_pto::CopyUbToGm<
-          bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
-          kMaxConvStateElements, 1, 1, 128>(
-              conv_state_out_handle + state_idx * conv_state_stride +
-                  channel_offset + 2 * conv_dim,
-              kUbConvSaveHalf2, 0, 1, 128);
+      qwen35_decode_pto::CopyConvHistoryUbToGm(
+          conv_state_out_handle + state_idx * conv_state_stride +
+              channel_offset,
+          kUbConvSaveHalf0, conv_dim);
       if constexpr (!IsBatchOne) {
         pipe_barrier(PIPE_ALL);
         pipe_barrier(PIPE_ALL);
