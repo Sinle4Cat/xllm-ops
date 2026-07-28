@@ -20,6 +20,7 @@ SUPPORTED_HEAD_CONFIGS = [
     pytest.param(2, 1, id="H2-Hg1"),
     pytest.param(4, 2, id="H4-Hg2"),
     pytest.param(6, 2, id="H6-Hg2"),
+    pytest.param(12, 4, id="H12-Hg4"),
     pytest.param(16, 4, id="H16-Hg4"),
     pytest.param(16, 8, id="H16-Hg8"),
     pytest.param(16, 16, id="H16-Hg16"),
@@ -182,6 +183,7 @@ def _run_mega(q_cpu, k_cpu, v_cpu, g_cpu, beta_cpu, cu_list=None, initial_state_
         pytest.param(129, None, 16, 4, id="single-H16-Hg4"),
         pytest.param(256, [0, 96, 128, 256], 32, 8, id="varlen-H32-Hg8"),
         pytest.param(512, [0, 96, 128, 512], 48, 16, id="long-varlen-H48-Hg16"),
+        pytest.param(1401, None, 12, 4, id="qwen35-tp4-long-H12-Hg4"),
     ],
 )
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

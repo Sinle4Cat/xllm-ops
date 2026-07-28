@@ -104,15 +104,18 @@ static ge::graphStatus Qwen35GdnDecodeSuperOpTiling(gert::TilingContext* context
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aicCoreNum = platform.GetCoreNumAic();
     const uint32_t aivCoreNum = platform.GetCoreNumAiv();
+    const bool isAscend950 =
+        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     const uint32_t headCount =
         static_cast<uint32_t>(batchSize * numVHeads);
     const uint32_t convTaskCount = static_cast<uint32_t>(convTileCount);
-    const uint32_t taskCount = batchSize == 1
+    const uint32_t taskCount = batchSize == 1 && !isAscend950
         ? std::max((convTaskCount + 1) / 2, headCount)
         : std::max(convTaskCount, headCount);
     const uint32_t usedAivCoreNum = std::min(taskCount, aivCoreNum);
-    const uint32_t blockDim =
-        platform.CalcTschBlockDim(usedAivCoreNum, aicCoreNum, aivCoreNum);
+    const uint32_t blockDim = isAscend950
+        ? usedAivCoreNum
+        : platform.CalcTschBlockDim(usedAivCoreNum, aicCoreNum, aivCoreNum);
     if (blockDim == 0) {
         return ge::GRAPH_FAILED;
     }

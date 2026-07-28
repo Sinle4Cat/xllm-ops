@@ -42,7 +42,11 @@ extern "C" __global__ __aicore__ void qwen35_gdn_decode_super_op(
     GM_ADDR convStateOut, GM_ADDR ssmStateOut, GM_ADDR out,
     GM_ADDR workspace, GM_ADDR tiling)
 {
+#if defined(PTO_NPU_ARCH_A5)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+#else
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#endif
     REGISTER_TILING_DEFAULT(Qwen35GdnDecodeSuperOpTilingData);
     GET_TILING_DATA_WITH_STRUCT(Qwen35GdnDecodeSuperOpTilingData,
                                 tilingData, tiling);
