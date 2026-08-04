@@ -337,6 +337,67 @@ namespace mk_o {
 #define GDN_CHUNK_O_CALL chunk_o_kernel
 #endif
 
+template <typename T>
+AICORE inline void mega_zero_bsnd_inverse_partial_chunks(__gm__ T *out, __gm__ int32_t *cu_seqlens,
+                                                         int64_t batch_size, int64_t seq_len, int32_t num_heads)
+{
+#if defined(__DAV_VEC__)
+    if (batch_size <= 0 || seq_len < 0 || num_heads <= 0) {
+        return;
+    }
+
+    constexpr int32_t C = GDN_C;
+    using UBZero = Tile<TileType::Vec, T, 1, C, BLayout::RowMajor, 1, C, SLayout::NoneBox, 512>;
+    using GmShape = Shape<1, 1, 1, 1, DYNAMIC>;
+    using GmStride = pto::Stride<1, 1, 1, 1, 1>;
+
+    UBZero zero;
+    TASSIGN(zero, 0);
+    TEXPANDS(zero, 0.0f);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+    const int64_t worker_id =
+        static_cast<int64_t>(get_block_idx()) * 2 + static_cast<int64_t>(get_subblockid());
+    const int64_t worker_count = static_cast<int64_t>(get_block_num()) * 2;
+    int64_t task_id = 0;
+    for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+        const int64_t seq_start =
+            cu_seqlens == nullptr ? seq_idx * seq_len : static_cast<int64_t>(cu_seqlens[seq_idx]);
+        const int64_t seq_end = cu_seqlens == nullptr
+                                    ? seq_start + seq_len
+                                    : static_cast<int64_t>(cu_seqlens[seq_idx + 1]);
+        const int64_t current_seq_len = seq_end - seq_start;
+        const int32_t valid = static_cast<int32_t>(current_seq_len % C);
+        if (valid <= 0) {
+            continue;
+        }
+        const int64_t tail_chunk_start = seq_end - valid;
+        for (int32_t row = 0; row < valid; ++row) {
+            for (int32_t head = 0; head < num_heads; ++head, ++task_id) {
+                if (task_id % worker_count != worker_id) {
+                    continue;
+                }
+                const int64_t offset = ((tail_chunk_start + row) * num_heads + head) * C;
+                GmShape shape;
+                shape.shape[4] = C;
+                GlobalTensor<T, GmShape, GmStride> gm(out + offset, shape);
+                TSTORE(gm, zero);
+            }
+        }
+    }
+
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+#else
+    (void)out;
+    (void)cu_seqlens;
+    (void)batch_size;
+    (void)seq_len;
+    (void)num_heads;
+#endif
+}
+
 template <typename ComputeT>
 AICORE inline void mega_solve_tril(__gm__ ComputeT *out, __gm__ ComputeT *in, __gm__ ComputeT *minus_id,
                                    uint32_t matrix_size, uint32_t num_matrices, uint32_t num_bsnd_heads,
@@ -467,6 +528,14 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     return;
 #endif
 
+    SyncAllImpl<false>();
+
+    // The triangular inverse only overwrites the live square of a partial
+    // chunk. Initialize the complete stored rows so WY never consumes stale
+    // allocator contents from the upper triangle or padded columns.
+    mega_zero_bsnd_inverse_partial_chunks<ComputeT>(
+        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr), reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, H);
     SyncAllImpl<false>();
 
     mega_solve_tril<ComputeT>(reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),

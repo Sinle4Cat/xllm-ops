@@ -177,6 +177,8 @@ def _run_mega(q_cpu, k_cpu, v_cpu, g_cpu, beta_cpu, cu_list=None, initial_state_
 @pytest.mark.parametrize(
     ("total_tokens", "cu_list", "num_value_heads", "num_key_heads"),
     [
+        pytest.param(22, None, 12, 4, id="qwen35-tp4-short-H12-Hg4"),
+        pytest.param(47, [0, 22, 47], 12, 4, id="qwen35-tp4-ragged-short-H12-Hg4"),
         pytest.param(129, None, 2, 1, id="single-H2-Hg1"),
         pytest.param(129, None, 4, 2, id="single-H4-Hg2"),
         pytest.param(129, None, 6, 2, id="single-H6-Hg2"),
