@@ -530,7 +530,7 @@ mega_chunk_gdn(
     at::Tensor beta_t = at::empty({num_heads, total_tokens}, beta.options());
     at::Tensor a = at::zeros({1, total_tokens, num_heads, kChunkSize}, beta.options());
     at::Tensor a_inv_f32 = at::zeros({1, total_tokens, num_heads, kChunkSize}, g.options().dtype(at::kFloat));
-    at::Tensor a_inv = at::zeros({1, total_tokens, num_heads, kChunkSize}, beta.options());
+    at::Tensor a_inv = at::empty({1, total_tokens, num_heads, kChunkSize}, beta.options());
     at::Tensor w = at::empty_like(v);
     at::Tensor u = at::empty_like(v);
     at::Tensor h = at::zeros({num_matrices, head_dim, head_dim}, v.options());
@@ -1905,6 +1905,8 @@ at::Tensor lightning_indexer_quant_metadata_impl_npu(
                sparse_count, sparse_mode, is_fd, pre_token, next_token, cmp_ratio,
                meta_t);
   return meta_t;
+}
+
 std::tuple<at::Tensor, at::Tensor&, at::Tensor&, at::Tensor>
 mega_gdn_decode(
     const at::Tensor& qkv,
