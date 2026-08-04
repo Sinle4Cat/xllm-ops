@@ -5,14 +5,9 @@
 // The included PTO implementation owns its explicit MTE2/V/MTE3 event chain.
 struct MegaGdnMtpDecodeTilingData {
   int64_t batch_size;
-  int64_t speculative_tokens;
   int64_t sequence_length;
-  int64_t conv_state_length;
   int64_t num_k_heads;
   int64_t num_v_heads;
-  int64_t conv_tile_count;
-  int64_t checkpoint_stride;
-  int64_t use_dynamic_k;
 };
 
 template <int32_t SpeculativeTokens,

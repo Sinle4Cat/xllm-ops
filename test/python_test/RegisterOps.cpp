@@ -1925,6 +1925,45 @@ mega_gdn_decode(
       conv_out, conv_state, ssm_state, out);
 }
 
+std::tuple<at::Tensor, at::Tensor&, at::Tensor&, at::Tensor>
+mega_gdn_mtp_decode(
+    const at::Tensor& qkv,
+    const at::Tensor& z,
+    const at::Tensor& b,
+    const at::Tensor& a,
+    const at::Tensor& conv_weight,
+    at::Tensor& conv_state,
+    const at::Tensor& a_log,
+    const at::Tensor& dt_bias,
+    at::Tensor& ssm_state,
+    const at::Tensor& read_state_indices,
+    const at::Tensor& write_state_indices,
+    const at::Tensor& num_accepted_tokens,
+    const at::Tensor& norm_weight) {
+  at::Tensor conv_out = at::empty_like(qkv);
+  at::Tensor out = at::empty_like(z);
+  EXEC_NPU_CMD(aclnnMegaGdnMtpDecode,
+               qkv,
+               z,
+               b,
+               a,
+               conv_weight,
+               conv_state,
+               a_log,
+               dt_bias,
+               ssm_state,
+               read_state_indices,
+               write_state_indices,
+               num_accepted_tokens,
+               norm_weight,
+               conv_out,
+               conv_state,
+               ssm_state,
+               out);
+  return std::tuple<at::Tensor, at::Tensor&, at::Tensor&, at::Tensor>(
+      conv_out, conv_state, ssm_state, out);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_unshared_kv", &select_unshared_kv_impl_npu, "select_unshared_kv");
   m.def("cache_unshared_kv", &cache_unshared_kv_impl_npu, "cache_unshared_kv");
@@ -1950,6 +1989,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mega_gdn_decode",
         &mega_gdn_decode,
         "mega_gdn_decode");
+  m.def("mega_gdn_mtp_decode",
+        &mega_gdn_mtp_decode,
+        "mega_gdn_mtp_decode");
   m.def("layer_norm_fwd", &layer_norm_fwd_impl_npu, "layer_norm_fwd");
   m.def("moe_fused_add_topk", &moe_fused_add_topk_impl_npu, "moe_fused_add_topk");
   m.def("moe_fused_reducesum_div", &moe_fused_reducesum_div_impl_npu, "moe_fused_reducesum_div");

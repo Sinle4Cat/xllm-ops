@@ -21,6 +21,52 @@ constexpr int32_t kMaxConvDim =
     (2 * kMaxNumKHeads + kMaxNumVHeads) * kHeadDim;
 constexpr int32_t kQkGroupCacheSequenceLength = 9;
 
+namespace ub_layout {
+
+// All values are byte offsets in UB. The regions are intentionally reused
+// only after the named lifetime ends:
+//
+// Conv phase:
+// - kUbConvWeightHalf0..3: BF16[128] each, one channel tile.
+// - kUbConvWeight0..3: FP32[128] each, one channel tile.
+// - kUbConvHistoryHalf0..2: BF16[128] each, one batch row.
+// - kUbConvHistory0..2: FP32[128] each, one batch row.
+// - kUbConvInput{Half,HalfPong}: BF16[128], one token.
+// - kUbConvInput/kUbConvAcc/kUbConvTmp/kUbConvOutput: FP32[128], one token.
+// - kUbConvOutput{Half,HalfPong}: BF16[128], one token GM hand-off.
+//
+// Recurrent phase:
+// - kUbQHalf/kUbKHalf/kUbVHalf: BF16[128], one token.
+// - kUbAHalf/kUbBHalf: BF16[16] scalar lanes, one token.
+// - kUbQ/kUbK/kUbV: FP32[128], one normalized/current token.
+// - kUbScalar/kUbScalar2: FP32[8], a/b scalars for one token.
+// - kUbScalarTmp/kUbScalarWork: FP32[8], g/beta scratch for one step.
+// - kUbExpA: BF16[16], g/beta rounding scratch for one step.
+// - kUbState: FP32[128,128], persistent for one head across all tokens.
+// - kUbStateCompute: FP32[128,128], one recurrent projection/update.
+// - kUbPrediction/kUbDelta: FP32[128], one recurrent step.
+// - kUbColumnSumTmp: FP32[32,128], one reduction.
+//
+// Norm phase:
+// - kUbOutputHalf/kUbNormHalf/kUbZHalf: BF16[128], one token.
+// - kUbNormWeightHalf: BF16[128], one head.
+// - kUbNorm/kUbZ/kUbSquare/kUbGate: FP32[128], one token.
+// - kUbNormWeight: FP32[128], one head.
+// - kUbRms: FP32[8], one RMS scalar; kUbFinalHalf: BF16[128] output.
+// - kUbVectorScratch: FP32[128], one Conv/Norm vector operation.
+// - kUbNormSquare: FP32[128], one Q/K normalization.
+// - kUbNormValue: FP32[8], one Q/K norm scalar.
+// - kUbReduceTmp: UINT8[128,64], one Q/K or RMS reduction.
+// - kUbALogStatic/kUbDtBiasStatic: FP32[8], one head.
+//
+// Specialized tails:
+// - kUbQkBatch{Q,K}Half: BF16[9,128], reuse Conv weights for one Q/K group.
+// - kUbQkNormSquare: FP32[9,128]; kUbQkNormReduceTmp: FP32[9,64].
+// - kUbQkNorm/kUbQkNormSqrt: FP32[16] each. These Q/K Norm buffers reuse
+//   State..V before the initial SSM State is loaded.
+// - kUbQkCacheTail/kUbQkCacheK: FP32[9,128], one K8 Q/K group.
+// - kUbDeferredReadoutHalf/kUbDeferredZHalf: BF16[9,128], survive all
+//   recurrent steps until the deferred Norm phase.
 constexpr int32_t kUbConvWeightHalf0 = 0;
 constexpr int32_t kUbConvWeightHalf1 = 256;
 constexpr int32_t kUbConvWeightHalf2 = 512;
@@ -94,6 +140,18 @@ constexpr int32_t kUbDeferredZHalf =
 constexpr int32_t kUbDeferredRowsEnd =
     kUbDeferredZHalf +
     kQkGroupCacheSequenceLength * kHeadDim * sizeof(bfloat16_t);
+constexpr int32_t kUbQkBatchQHalf = kUbConvWeightHalf0;
+constexpr int32_t kUbQkBatchKHalf =
+    kUbQkBatchQHalf +
+    kQkGroupCacheSequenceLength * kHeadDim * sizeof(bfloat16_t);
+constexpr int32_t kUbQkNormSquare = kUbState;
+constexpr int32_t kUbQkNormReduceTmp =
+    kUbQkNormSquare +
+    kQkGroupCacheSequenceLength * kHeadDim * sizeof(float);
+constexpr int32_t kUbQkNorm =
+    kUbQkNormReduceTmp +
+    kQkGroupCacheSequenceLength * 64 * sizeof(float);
+constexpr int32_t kUbQkNormSqrt = kUbQkNorm + 16 * sizeof(float);
 
 static_assert(kUbQHalf % 32 == 0);
 static_assert(
@@ -105,6 +163,11 @@ static_assert(kUbQkCacheTail ==
 static_assert(kUbQkCacheEnd == 183328);
 static_assert(kUbDeferredRowsEnd == 187936);
 static_assert(kUbDeferredRowsEnd <= 192 * 1024);
+static_assert(kUbQkNormSqrt + 16 * sizeof(float) <= kUbV);
+
+}  // namespace ub_layout
+
+using namespace ub_layout;
 
 template <typename T, int32_t Rows, int32_t Cols>
 AICORE PTO_INLINE void SiluNoCopy(
@@ -329,56 +392,23 @@ AICORE PTO_INLINE void NormalizeQkRows(
   }
 }
 
-template <int32_t SpeculativeTokens,
-          bool UseQkGroupCache,
-          bool UseDeferredNorm = UseQkGroupCache>
-AICORE PTO_INLINE void Run(
+template <int32_t SpeculativeTokens>
+AICORE PTO_INLINE void RunConvPhase(
     __gm__ bfloat16_t* qkv_handle,
-    __gm__ bfloat16_t* z_handle,
-    __gm__ bfloat16_t* b_handle,
-    __gm__ bfloat16_t* a_handle,
     __gm__ bfloat16_t* conv_weight_handle,
     __gm__ bfloat16_t* conv_state_handle,
-    __gm__ float* a_log_handle,
-    __gm__ float* dt_bias_handle,
-    __gm__ float* ssm_state_handle,
     __gm__ int* read_state_indices_handle,
     __gm__ int* write_state_indices_handle,
     __gm__ int* num_accepted_tokens_handle,
-    __gm__ bfloat16_t* norm_weight_handle,
     __gm__ bfloat16_t* conv_out_handle,
     __gm__ bfloat16_t* conv_state_out_handle,
-    __gm__ float* ssm_state_out_handle,
-    __gm__ bfloat16_t* out_handle,
-    int32_t num_k_heads,
-    int32_t num_v_heads,
+    int32_t sequence_length,
     int32_t batch_size,
-    int32_t runtime_sequence_length) {
-  constexpr bool kIsDynamic = SpeculativeTokens == 0;
-  static_assert(!UseDeferredNorm || !kIsDynamic);
-  constexpr int32_t kRunDeferredNormRows =
-      UseDeferredNorm ? SpeculativeTokens + 1 : 1;
-  constexpr int32_t kRunDeferredReadoutHalf =
-      UseQkGroupCache ? kUbDeferredReadoutHalf : kUbQkCacheTail;
-  constexpr int32_t kRunDeferredZHalf =
-      kRunDeferredReadoutHalf +
-      kRunDeferredNormRows * kHeadDim * sizeof(bfloat16_t);
-  constexpr int32_t kRunDeferredRowsEnd =
-      kRunDeferredZHalf +
-      kRunDeferredNormRows * kHeadDim * sizeof(bfloat16_t);
-  static_assert(!UseDeferredNorm || kRunDeferredRowsEnd <= 192 * 1024);
-  const int32_t sequence_length =
-      kIsDynamic ? runtime_sequence_length : SpeculativeTokens + 1;
-  const int32_t conv_state_length = sequence_length + 2;
-  const int32_t conv_dim =
-      (2 * num_k_heads + num_v_heads) * kHeadDim;
-  const int32_t conv_tile_count = conv_dim / kHeadDim;
-  const int32_t conv_state_stride = conv_state_length * conv_dim;
-  const int32_t v_heads_per_k = num_v_heads / num_k_heads;
-  const int32_t v_width = num_v_heads * kHeadDim;
-  const int32_t ssm_checkpoint_stride =
-      num_v_heads * kSsmHeadElements;
-
+    int32_t conv_dim,
+    int32_t conv_tile_count,
+    int32_t conv_state_stride,
+    int32_t vector_core_idx,
+    int32_t vector_core_count) {
   TileUbDataND<bfloat16_t, 1, 128> w_half0;
   TASSIGN(w_half0, kUbConvWeightHalf0);
   TileUbDataND<bfloat16_t, 1, 128> w_half1;
@@ -420,110 +450,6 @@ AICORE PTO_INLINE void Run(
   TileUbDataND<bfloat16_t, 1, 128> conv_y_half;
   TASSIGN(conv_y_half, kUbConvOutputHalf);
 
-  TileUbDataND<bfloat16_t, 1, 128> q_half;
-  TASSIGN(q_half, kUbQHalf);
-  TileUbDataND<bfloat16_t, 1, 128> k_half;
-  TASSIGN(k_half, kUbKHalf);
-  TileUbDataND<bfloat16_t, 1, 16, 1, 1> a_half;
-  TASSIGN(a_half, kUbAHalf);
-  TileUbDataND<bfloat16_t, 1, 16, 1, 1> b_half;
-  TASSIGN(b_half, kUbBHalf);
-  TileUbDataND<float, 1, 128> q_fp32;
-  TASSIGN(q_fp32, kUbQ);
-  TileUbDataND<float, 1, 128> k_fp32;
-  TASSIGN(k_fp32, kUbK);
-  TileUbDataND<float, 1, 8, 1, 1> scalar;
-  TASSIGN(scalar, kUbScalar);
-  TileUbDataND<float, 1, 8, 1, 1> scalar2;
-  TASSIGN(scalar2, kUbScalar2);
-  TileUbDataND<float, 1, 128> norm_square;
-  TASSIGN(norm_square, kUbNormSquare);
-  TileUbDataND<float, 1, 8, 1, 1> norm_value;
-  TASSIGN(norm_value, kUbNormValue);
-  TileUbDataND<uint8_t, 128, 64> reduce_tmp;
-  TASSIGN(reduce_tmp, kUbReduceTmp);
-  TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
-  TASSIGN(scalar_tmp, kUbScalarTmp);
-  TileUbDataND<bfloat16_t, 1, 16, 1, 1> rounded_gate_half;
-  TASSIGN(rounded_gate_half, kUbExpA);
-  TileUbDataND<float, 1, 8, 1, 1> scalar_work;
-  TASSIGN(scalar_work, kUbScalarWork);
-  TileUbDataND<bfloat16_t, 1, 128> v_half;
-  TASSIGN(v_half, kUbVHalf);
-  TileUbDataND<float, 128, 128> state;
-  TASSIGN(state, kUbState);
-  TileUbDataND<float, 1, 128> v_fp32;
-  TASSIGN(v_fp32, kUbV);
-  TileUbDataND<float, 128, 128> compute;
-  TASSIGN(compute, kUbStateCompute);
-  TileUbDataND<float, 1, 128> prediction;
-  TASSIGN(prediction, kUbPrediction);
-  TileUbDataND<float, 1, 128> delta;
-  TASSIGN(delta, kUbDelta);
-  TileUbDataND<bfloat16_t, 1, 128> readout_half;
-  TASSIGN(readout_half, kUbOutputHalf);
-  TileUbDataND<bfloat16_t, 1, 128> norm_half;
-  TASSIGN(norm_half, kUbNormHalf);
-  TileUbDataND<bfloat16_t, 1, 128> z_half;
-  TASSIGN(z_half, kUbZHalf);
-  TileUbDataND<bfloat16_t, 1, 128> norm_weight_half;
-  TASSIGN(norm_weight_half, kUbNormWeightHalf);
-  TileUbDataND<float, 1, 128> norm_fp32;
-  TASSIGN(norm_fp32, kUbNorm);
-  TileUbDataND<float, 1, 128> z_fp32;
-  TASSIGN(z_fp32, kUbZ);
-  TileUbDataND<float, 1, 128> norm_weight_fp32;
-  TASSIGN(norm_weight_fp32, kUbNormWeight);
-  TileUbDataND<float, 1, 128> square_fp32;
-  TASSIGN(square_fp32, kUbSquare);
-  TileUbDataND<float, 1, 8, 1, 1> rms;
-  TASSIGN(rms, kUbRms);
-  TileUbDataND<float, 1, 128> gate_fp32;
-  TASSIGN(gate_fp32, kUbGate);
-  TileUbDataND<bfloat16_t, 1, 128> final_half;
-  TASSIGN(final_half, kUbFinalHalf);
-  TileUbDataND<float, 32, 128> colsum_tmp;
-  TASSIGN(colsum_tmp, kUbColumnSumTmp);
-  TileUbDataND<float, 1, 8, 1, 1> a_log_static;
-  TASSIGN(a_log_static, kUbALogStatic);
-  TileUbDataND<float, 1, 8, 1, 1> dt_bias_static;
-  TASSIGN(dt_bias_static, kUbDtBiasStatic);
-  // Full-span alias keeps the static UB footprint parser aware of the
-  // dynamically addressed all-token Q/K subtiles.
-  TileUbDataND<
-      float,
-      2 * kQkGroupCacheSequenceLength,
-      128> qk_cache_tail;
-  TASSIGN(qk_cache_tail, kUbQkCacheTail);
-  TileUbDataND<
-      bfloat16_t,
-      kRunDeferredNormRows,
-      kHeadDim>
-      deferred_readout_half;
-  TASSIGN(deferred_readout_half, kRunDeferredReadoutHalf);
-  TileUbDataND<
-      bfloat16_t,
-      kRunDeferredNormRows,
-      kHeadDim>
-      deferred_z_half;
-  TASSIGN(deferred_z_half, kRunDeferredZHalf);
-
-#if defined(__DAV_VEC__) || defined(__DAV_C220_VEC__)
-#if defined(PTO_NPU_ARCH_A2A3)
-  const auto cid = get_block_idx();
-  const auto vid = get_subblockid();
-  set_mask_norm();
-  set_vector_mask(-1, -1);
-  const int32_t vector_core_idx = cid * get_subblockdim() + vid;
-  const int32_t vector_core_count =
-      get_block_num() * get_subblockdim();
-#else
-  const int32_t vector_core_idx = get_block_idx();
-  const int32_t vector_core_count = get_block_num();
-#endif
-
-  // Phase 1: select accepted Conv history, process all S tokens, and write
-  // the private extended window.
   for (int32_t conv_tile = vector_core_idx; conv_tile < conv_tile_count;
        conv_tile += vector_core_count) {
     const int32_t channel_offset = conv_tile * kHeadDim;
@@ -567,9 +493,7 @@ AICORE PTO_INLINE void Run(
       TCVT(hist2, hist_half2, RoundMode::CAST_NONE);
       qwen35_decode_pto::VectorBarrier();
 
-      // Snapshot the accepted source rows before a same-slot write can
-      // overwrite them. The explicit ready/free pair makes the single UB
-      // buffer correct before introducing ping-pong overlap.
+      // Snapshot accepted rows before a same-slot write can overwrite them.
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       StoreBf16Row(
@@ -635,6 +559,8 @@ AICORE PTO_INLINE void Run(
         qwen35_decode_pto::Silu<float, 1, 128>(
             conv_y, conv_acc, silu_tmp);
         qwen35_decode_pto::VectorBarrier();
+        // Numerical contract: Conv output is materialized as BF16 before
+        // Q/K/V split, matching the unfused CausalConv hand-off.
         if constexpr (SpeculativeTokens == 8) {
           wait_flag(PIPE_MTE3, PIPE_V, conv_pingpong_event);
           TileUbDataND<bfloat16_t, 1, 128> conv_output_half;
@@ -689,6 +615,562 @@ AICORE PTO_INLINE void Run(
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
     }
   }
+}
+
+AICORE PTO_INLINE void LoadInitialState(
+    __gm__ float* ssm_state_handle,
+    __gm__ bfloat16_t* norm_weight_handle,
+    __gm__ float* a_log_handle,
+    __gm__ float* dt_bias_handle,
+    int32_t read_slot,
+    int32_t accepted,
+    int32_t sequence_length,
+    int32_t ssm_checkpoint_stride,
+    int32_t head_idx,
+    bool load_norm_weight) {
+  const int32_t read_checkpoint =
+      read_slot * sequence_length + accepted - 1;
+  const int64_t read_state_offset =
+      static_cast<int64_t>(read_checkpoint) * ssm_checkpoint_stride +
+      head_idx * kSsmHeadElements;
+
+  TileUbDataND<bfloat16_t, 1, 128> norm_weight_half;
+  TASSIGN(norm_weight_half, kUbNormWeightHalf);
+  TileUbDataND<float, 1, 128> norm_weight_fp32;
+  TASSIGN(norm_weight_fp32, kUbNormWeight);
+  TileUbDataND<float, 1, 8, 1, 1> a_log_static;
+  TASSIGN(a_log_static, kUbALogStatic);
+
+  LoadState(ssm_state_handle + read_state_offset, kUbState);
+  if (load_norm_weight) {
+    LoadBf16Row(norm_weight_handle, kUbNormWeightHalf);
+  }
+  LoadFloatScalar(a_log_handle + head_idx, kUbALogStatic);
+  LoadFloatScalar(dt_bias_handle + head_idx, kUbDtBiasStatic);
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  if (load_norm_weight) {
+    TCVT(norm_weight_fp32, norm_weight_half, RoundMode::CAST_NONE);
+  }
+  TEXP(a_log_static, a_log_static);
+  qwen35_decode_pto::VectorBarrier();
+}
+
+template <bool UseDeferredNorm>
+AICORE PTO_INLINE void RunRecurrentStep(
+    int32_t q_token_address,
+    int32_t k_token_address,
+    int32_t deferred_readout_address) {
+  TileUbDataND<float, 1, 128> q_token;
+  TASSIGN(q_token, q_token_address);
+  TileUbDataND<float, 1, 128> k_token;
+  TASSIGN(k_token, k_token_address);
+  TileUbDataND<float, 1, 8, 1, 1> scalar;
+  TASSIGN(scalar, kUbScalar);
+  TileUbDataND<float, 1, 8, 1, 1> scalar2;
+  TASSIGN(scalar2, kUbScalar2);
+  TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
+  TASSIGN(scalar_tmp, kUbScalarTmp);
+  TileUbDataND<bfloat16_t, 1, 16, 1, 1> rounded_gate_half;
+  TASSIGN(rounded_gate_half, kUbExpA);
+  TileUbDataND<float, 1, 8, 1, 1> scalar_work;
+  TASSIGN(scalar_work, kUbScalarWork);
+  TileUbDataND<float, 1, 8, 1, 1> a_log_static;
+  TASSIGN(a_log_static, kUbALogStatic);
+  TileUbDataND<float, 1, 8, 1, 1> dt_bias_static;
+  TASSIGN(dt_bias_static, kUbDtBiasStatic);
+  TileUbDataND<float, 128, 128> state;
+  TASSIGN(state, kUbState);
+  TileUbDataND<float, 1, 128> v_fp32;
+  TASSIGN(v_fp32, kUbV);
+  TileUbDataND<float, 128, 128> compute;
+  TASSIGN(compute, kUbStateCompute);
+  TileUbDataND<float, 1, 128> prediction;
+  TASSIGN(prediction, kUbPrediction);
+  TileUbDataND<float, 1, 128> delta;
+  TASSIGN(delta, kUbDelta);
+  TileUbDataND<float, 32, 128> colsum_tmp;
+  TASSIGN(colsum_tmp, kUbColumnSumTmp);
+  TileUbDataND<bfloat16_t, 1, 128> readout_half;
+  TASSIGN(readout_half, kUbOutputHalf);
+  TileUbDataND<bfloat16_t, 1, 128> norm_half;
+  TASSIGN(norm_half, kUbNormHalf);
+
+  // decay = exp(-exp(a_log) * softplus(a + dt_bias)).
+  TADD(scalar_tmp, scalar, dt_bias_static);
+  qwen35_decode_pto::VectorBarrier();
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  const float gate_input = scalar_tmp.GetValue(0);
+  if (gate_input > 20.0f) {
+    TMOV(scalar_work, scalar_tmp);
+  } else {
+    TEXP(scalar_work, scalar_tmp);
+    qwen35_decode_pto::VectorBarrier();
+    TADDS(scalar_work, scalar_work, 1.0f);
+    qwen35_decode_pto::VectorBarrier();
+    TLOG(scalar_work, scalar_work);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(scalar_tmp, a_log_static, scalar_work);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(scalar_tmp, scalar_tmp, -1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  // Numerical contract: the unfused gate path materializes g as BF16
+  // before exp(g); removing this RINT changes accepted-token numerics.
+  TCVT(rounded_gate_half, scalar_tmp, RoundMode::CAST_RINT);
+  qwen35_decode_pto::VectorBarrier();
+  TCVT(scalar_tmp, rounded_gate_half, RoundMode::CAST_NONE);
+  qwen35_decode_pto::VectorBarrier();
+  TEXP(scalar_work, scalar_tmp);
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  const float decay = scalar_work.GetValue(0);
+
+  // beta = sigmoid(b).
+  TMULS(scalar_tmp, scalar2, -1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TEXP(scalar_work, scalar_tmp);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(scalar_tmp, scalar_work, 1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TRECIP(scalar_work, scalar_tmp);
+  qwen35_decode_pto::VectorBarrier();
+  // Numerical contract: torch::sigmoid(BF16) returns BF16 in the unfused
+  // path, so beta must RINT before the FP32 recurrent update.
+  TCVT(rounded_gate_half, scalar_work, RoundMode::CAST_RINT);
+  qwen35_decode_pto::VectorBarrier();
+  TCVT(scalar_work, rounded_gate_half, RoundMode::CAST_NONE);
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  const float beta = scalar_work.GetValue(0);
+
+  TMULS(state, state, decay);
+  qwen35_decode_pto::VectorBarrier();
+  {
+    TileUbDataDN<float, 128, 1> k_row;
+    TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
+    TROWEXPANDMUL(compute, state, k_row);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  qwen35_decode_pto::ColSum128(prediction, compute, colsum_tmp);
+  TSUB(delta, v_fp32, prediction);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(delta, delta, beta);
+  qwen35_decode_pto::VectorBarrier();
+  {
+    TileUbDataDN<float, 128, 1> k_row;
+    TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
+#if defined(PTO_NPU_ARCH_A5)
+    TROWEXPAND(compute, k_row);
+    qwen35_decode_pto::VectorBarrier();
+    TCOLEXPANDMUL(compute, compute, delta);
+    qwen35_decode_pto::VectorBarrier();
+    TADD(state, state, compute);
+#else
+    qwen35_decode_pto::OuterProductAdd128(state, delta, k_row);
+#endif
+  }
+  qwen35_decode_pto::VectorBarrier();
+  {
+    TileUbDataDN<float, 128, 1> q_row;
+    TASSIGN(q_row, reinterpret_cast<std::uintptr_t>(q_token.data()));
+    TROWEXPANDMUL(compute, state, q_row);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  qwen35_decode_pto::ColSum128(prediction, compute, colsum_tmp);
+  // Numerical contract: recurrent readout is BF16 before RMSNorm, matching
+  // the unfused RecurrentGatedDeltaRule -> Norm tensor boundary.
+  if constexpr (UseDeferredNorm) {
+    TileUbDataND<bfloat16_t, 1, kHeadDim> cached_readout_half;
+    TASSIGN(cached_readout_half, deferred_readout_address);
+    TCVT(cached_readout_half, prediction, RoundMode::CAST_RINT);
+  } else {
+    TCVT(readout_half, prediction, RoundMode::CAST_RINT);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  if constexpr (!UseDeferredNorm) {
+    TMOV(norm_half, readout_half);
+  }
+}
+
+AICORE PTO_INLINE void WriteCheckpoint(
+    __gm__ float* ssm_state_out_handle,
+    int32_t write_slot,
+    int32_t sequence_length,
+    int32_t ssm_checkpoint_stride,
+    int32_t head_idx,
+    int32_t token_idx) {
+  const int32_t write_checkpoint =
+      write_slot * sequence_length + token_idx;
+  const int64_t write_state_offset =
+      static_cast<int64_t>(write_checkpoint) * ssm_checkpoint_stride +
+      head_idx * kSsmHeadElements;
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+  StoreState(ssm_state_out_handle + write_state_offset, kUbState);
+  set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+  wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+}
+
+template <int32_t SpeculativeTokens>
+AICORE PTO_INLINE void RunNormStep(
+    __gm__ bfloat16_t* out_handle,
+    int32_t batch_idx,
+    int32_t token_idx,
+    int32_t head_idx,
+    int32_t sequence_length,
+    int32_t v_width) {
+  TileUbDataND<bfloat16_t, 1, 128> norm_half;
+  TASSIGN(norm_half, kUbNormHalf);
+  TileUbDataND<float, 1, 128> norm_fp32;
+  TASSIGN(norm_fp32, kUbNorm);
+  TileUbDataND<float, 1, 128> z_fp32;
+  TASSIGN(z_fp32, kUbZ);
+  TileUbDataND<float, 1, 128> norm_weight_fp32;
+  TASSIGN(norm_weight_fp32, kUbNormWeight);
+  TileUbDataND<float, 1, 128> square_fp32;
+  TASSIGN(square_fp32, kUbSquare);
+  TileUbDataND<float, 1, 8, 1, 1> rms;
+  TASSIGN(rms, kUbRms);
+  TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
+  TASSIGN(scalar_tmp, kUbScalarTmp);
+  TileUbDataND<float, 1, 128> gate_fp32;
+  TASSIGN(gate_fp32, kUbGate);
+  TileUbDataND<bfloat16_t, 1, 128> final_half;
+  TASSIGN(final_half, kUbFinalHalf);
+
+  TCVT(norm_fp32, norm_half, RoundMode::CAST_NONE);
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(square_fp32, norm_fp32, norm_fp32);
+  qwen35_decode_pto::VectorBarrier();
+  TileUbDataDN<float, 8, 1, 1, 1> rms_dn;
+  TASSIGN(rms_dn, kUbRms);
+  TileUbDataND<float, 1, 64, 1, 64> rms_reduce_tmp;
+  TASSIGN(rms_reduce_tmp, kUbReduceTmp);
+  TROWSUM(rms_dn, square_fp32, rms_reduce_tmp);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(rms, rms, 1.0f / 128.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(rms, rms, 1.0e-6f);
+  qwen35_decode_pto::VectorBarrier();
+  TSQRT(scalar_tmp, rms);
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  const float rms_value = scalar_tmp.GetValue(0);
+  TMULS(norm_fp32, norm_fp32, 1.0f / rms_value);
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
+  TileUbDataND<float, 1, 128> silu_tmp;
+  TASSIGN(silu_tmp, kUbVectorScratch);
+  qwen35_decode_pto::Silu<float, 1, 128>(
+      gate_fp32, z_fp32, silu_tmp);
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(norm_fp32, norm_fp32, gate_fp32);
+  qwen35_decode_pto::VectorBarrier();
+  TCVT(final_half, norm_fp32, RoundMode::CAST_RINT);
+  qwen35_decode_pto::VectorBarrier();
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+  StoreBf16Row(
+      out_handle +
+          (batch_idx * sequence_length + token_idx) * v_width +
+          head_idx * kHeadDim,
+      kUbFinalHalf);
+  set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+  wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+  if constexpr (SpeculativeTokens != 8) {
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
+  }
+}
+
+template <int32_t Rows, bool UseQkGroupCache>
+class DeferredNormUbLayout final {
+ public:
+  // BF16 cached rows live from recurrent readout until deferred Norm.
+  static constexpr int32_t kReadoutHalf =
+      UseQkGroupCache ? kUbDeferredReadoutHalf : kUbQkCacheTail;
+  static constexpr int32_t kZHalf =
+      kReadoutHalf + Rows * kHeadDim * sizeof(bfloat16_t);
+  static constexpr int32_t kCachedRowsEnd =
+      kZHalf + Rows * kHeadDim * sizeof(bfloat16_t);
+
+  // The StateCompute..Prediction range is dead after the recurrent loop and
+  // is reused by batched Norm: BF16 input/Z, FP32 input/Z/square/gate,
+  // BF16 output, FP32 SiLU/reduction scratch, and FP32 RMS scalars.
+  static constexpr int32_t kInputHalfBatch = kUbStateCompute;
+  static constexpr int32_t kZHalfBatch =
+      kInputHalfBatch + Rows * kHeadDim * sizeof(bfloat16_t);
+  static constexpr int32_t kInputBatch =
+      kZHalfBatch + Rows * kHeadDim * sizeof(bfloat16_t);
+  static constexpr int32_t kZBatch =
+      kInputBatch + Rows * kHeadDim * sizeof(float);
+  static constexpr int32_t kSquareBatch =
+      kZBatch + Rows * kHeadDim * sizeof(float);
+  static constexpr int32_t kGateBatch =
+      kSquareBatch + Rows * kHeadDim * sizeof(float);
+  static constexpr int32_t kFinalHalfBatch =
+      kGateBatch + Rows * kHeadDim * sizeof(float);
+  static constexpr int32_t kSiluTmpBatch =
+      kFinalHalfBatch + Rows * kHeadDim * sizeof(bfloat16_t);
+  static constexpr int32_t kReduceTmpBatch =
+      kSiluTmpBatch + Rows * kHeadDim * sizeof(float);
+  static constexpr int32_t kRmsBatch =
+      kReduceTmpBatch + Rows * 64 * sizeof(float);
+  static constexpr int32_t kRmsBatchCapacity = Rows <= 16 ? 16 : 32;
+  static constexpr int32_t kRmsSqrtBatch =
+      kRmsBatch + kRmsBatchCapacity * sizeof(float);
+  static constexpr int32_t kWorkEnd =
+      kRmsSqrtBatch + kRmsBatchCapacity * sizeof(float);
+
+  static_assert(kCachedRowsEnd <= 192 * 1024);
+  static_assert(kWorkEnd <= kUbPrediction);
+};
+
+template <int32_t Rows, bool UseQkGroupCache>
+AICORE PTO_INLINE void RunDeferredNorm(
+    __gm__ bfloat16_t* out_handle,
+    int32_t batch_idx,
+    int32_t head_idx,
+    int32_t sequence_length,
+    int32_t v_width) {
+  using Layout = DeferredNormUbLayout<Rows, UseQkGroupCache>;
+  pipe_barrier(PIPE_ALL);
+
+  // Full-span aliases keep the static UB footprint parser aware of every
+  // dynamically addressed row below.
+  TileUbDataND<bfloat16_t, Rows, kHeadDim> cached_readout_half_batch;
+  TASSIGN(cached_readout_half_batch, Layout::kReadoutHalf);
+  TileUbDataND<bfloat16_t, Rows, kHeadDim> cached_z_half_batch;
+  TASSIGN(cached_z_half_batch, Layout::kZHalf);
+  TileUbDataND<bfloat16_t, Rows, kHeadDim> readout_half_batch;
+  TASSIGN(readout_half_batch, Layout::kInputHalfBatch);
+  TileUbDataND<bfloat16_t, Rows, kHeadDim> z_half_batch;
+  TASSIGN(z_half_batch, Layout::kZHalfBatch);
+  TileUbDataND<float, Rows, kHeadDim> input_batch;
+  TASSIGN(input_batch, Layout::kInputBatch);
+  TileUbDataND<float, Rows, kHeadDim> z_batch;
+  TASSIGN(z_batch, Layout::kZBatch);
+  TileUbDataND<float, Rows, kHeadDim> square_batch;
+  TASSIGN(square_batch, Layout::kSquareBatch);
+  TileUbDataND<float, Rows, kHeadDim> gate_batch;
+  TASSIGN(gate_batch, Layout::kGateBatch);
+  TileUbDataND<bfloat16_t, Rows, kHeadDim> final_half_batch;
+  TASSIGN(final_half_batch, Layout::kFinalHalfBatch);
+  TileUbDataND<float, Rows, kHeadDim> silu_tmp_batch;
+  TASSIGN(silu_tmp_batch, Layout::kSiluTmpBatch);
+  TileUbDataDN<float, Layout::kRmsBatchCapacity, 1, Rows, 1> rms_batch_dn;
+  TASSIGN(rms_batch_dn, Layout::kRmsBatch);
+  TileUbDataND<float, 1, Layout::kRmsBatchCapacity, 1, Rows> rms_batch;
+  TASSIGN(rms_batch, Layout::kRmsBatch);
+  TileUbDataND<float, 1, Layout::kRmsBatchCapacity, 1, Rows>
+      rms_sqrt_batch;
+  TASSIGN(rms_sqrt_batch, Layout::kRmsSqrtBatch);
+  TileUbDataND<float, Rows, 64> reduce_tmp_batch;
+  TASSIGN(reduce_tmp_batch, Layout::kReduceTmpBatch);
+  TileUbDataND<float, 1, 128> norm_weight_fp32;
+  TASSIGN(norm_weight_fp32, kUbNormWeight);
+
+  for (int32_t row = 0; row < Rows; ++row) {
+    TileUbDataND<bfloat16_t, 1, kHeadDim> cached_readout_row;
+    TASSIGN(
+        cached_readout_row,
+        Layout::kReadoutHalf + row * kHeadDim * sizeof(bfloat16_t));
+    TileUbDataND<bfloat16_t, 1, kHeadDim> cached_z_row;
+    TASSIGN(
+        cached_z_row,
+        Layout::kZHalf + row * kHeadDim * sizeof(bfloat16_t));
+    TileUbDataND<float, 1, kHeadDim> input_row;
+    TASSIGN(
+        input_row,
+        Layout::kInputBatch + row * kHeadDim * sizeof(float));
+    TileUbDataND<float, 1, kHeadDim> z_row;
+    TASSIGN(
+        z_row,
+        Layout::kZBatch + row * kHeadDim * sizeof(float));
+    TCVT(input_row, cached_readout_row, RoundMode::CAST_NONE);
+    TCVT(z_row, cached_z_row, RoundMode::CAST_NONE);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(square_batch, input_batch, input_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TROWSUM(rms_batch_dn, square_batch, reduce_tmp_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(rms_batch, rms_batch, 1.0f / 128.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(rms_batch, rms_batch, 1.0e-6f);
+  qwen35_decode_pto::VectorBarrier();
+  TSQRT(rms_sqrt_batch, rms_batch);
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  for (int32_t row = 0; row < Rows; ++row) {
+    TileUbDataND<float, 1, kHeadDim> input_row;
+    TASSIGN(
+        input_row,
+        Layout::kInputBatch + row * kHeadDim * sizeof(float));
+    const float rms_value = rms_sqrt_batch.GetValue(row);
+    TMULS(input_row, input_row, 1.0f / rms_value);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  for (int32_t row = 0; row < Rows; ++row) {
+    TileUbDataND<float, 1, kHeadDim> input_row;
+    TASSIGN(
+        input_row,
+        Layout::kInputBatch + row * kHeadDim * sizeof(float));
+    TMUL(input_row, input_row, norm_weight_fp32);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  SiluNoCopy<float, Rows, kHeadDim>(
+      gate_batch, z_batch, silu_tmp_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(input_batch, input_batch, gate_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TCVT(final_half_batch, input_batch, RoundMode::CAST_RINT);
+  qwen35_decode_pto::VectorBarrier();
+
+  const int64_t output_base_offset =
+      static_cast<int64_t>(batch_idx) * sequence_length * v_width +
+      head_idx * kHeadDim;
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+  StoreStridedBf16Rows<Rows>(
+      out_handle + output_base_offset,
+      Layout::kFinalHalfBatch,
+      v_width);
+  set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+  wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+}
+
+template <int32_t SpeculativeTokens,
+          bool UseQkGroupCache,
+          bool UseDeferredNorm = UseQkGroupCache>
+AICORE PTO_INLINE void Run(
+    __gm__ bfloat16_t* qkv_handle,
+    __gm__ bfloat16_t* z_handle,
+    __gm__ bfloat16_t* b_handle,
+    __gm__ bfloat16_t* a_handle,
+    __gm__ bfloat16_t* conv_weight_handle,
+    __gm__ bfloat16_t* conv_state_handle,
+    __gm__ float* a_log_handle,
+    __gm__ float* dt_bias_handle,
+    __gm__ float* ssm_state_handle,
+    __gm__ int* read_state_indices_handle,
+    __gm__ int* write_state_indices_handle,
+    __gm__ int* num_accepted_tokens_handle,
+    __gm__ bfloat16_t* norm_weight_handle,
+    __gm__ bfloat16_t* conv_out_handle,
+    __gm__ bfloat16_t* conv_state_out_handle,
+    __gm__ float* ssm_state_out_handle,
+    __gm__ bfloat16_t* out_handle,
+    int32_t num_k_heads,
+    int32_t num_v_heads,
+    int32_t batch_size,
+    int32_t runtime_sequence_length) {
+  constexpr bool kIsDynamic = SpeculativeTokens == 0;
+  static_assert(!UseDeferredNorm || !kIsDynamic);
+  constexpr int32_t kRunDeferredNormRows =
+      UseDeferredNorm ? SpeculativeTokens + 1 : 1;
+  using RunDeferredLayout =
+      DeferredNormUbLayout<kRunDeferredNormRows, UseQkGroupCache>;
+  constexpr int32_t kRunDeferredReadoutHalf =
+      RunDeferredLayout::kReadoutHalf;
+  constexpr int32_t kRunDeferredZHalf = RunDeferredLayout::kZHalf;
+  const int32_t sequence_length =
+      kIsDynamic ? runtime_sequence_length : SpeculativeTokens + 1;
+  const int32_t conv_state_length = sequence_length + 2;
+  const int32_t conv_dim =
+      (2 * num_k_heads + num_v_heads) * kHeadDim;
+  const int32_t conv_tile_count = conv_dim / kHeadDim;
+  const int32_t conv_state_stride = conv_state_length * conv_dim;
+  const int32_t v_heads_per_k = num_v_heads / num_k_heads;
+  const int32_t v_width = num_v_heads * kHeadDim;
+  const int32_t ssm_checkpoint_stride =
+      num_v_heads * kSsmHeadElements;
+
+  TileUbDataND<bfloat16_t, 1, 128> q_half;
+  TASSIGN(q_half, kUbQHalf);
+  TileUbDataND<bfloat16_t, 1, 128> k_half;
+  TASSIGN(k_half, kUbKHalf);
+  TileUbDataND<bfloat16_t, 1, 16, 1, 1> a_half;
+  TASSIGN(a_half, kUbAHalf);
+  TileUbDataND<bfloat16_t, 1, 16, 1, 1> b_half;
+  TASSIGN(b_half, kUbBHalf);
+  TileUbDataND<float, 1, 128> q_fp32;
+  TASSIGN(q_fp32, kUbQ);
+  TileUbDataND<float, 1, 128> k_fp32;
+  TASSIGN(k_fp32, kUbK);
+  TileUbDataND<float, 1, 8, 1, 1> scalar;
+  TASSIGN(scalar, kUbScalar);
+  TileUbDataND<float, 1, 8, 1, 1> scalar2;
+  TASSIGN(scalar2, kUbScalar2);
+  TileUbDataND<float, 1, 128> norm_square;
+  TASSIGN(norm_square, kUbNormSquare);
+  TileUbDataND<float, 1, 8, 1, 1> norm_value;
+  TASSIGN(norm_value, kUbNormValue);
+  TileUbDataND<uint8_t, 128, 64> reduce_tmp;
+  TASSIGN(reduce_tmp, kUbReduceTmp);
+  TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
+  TASSIGN(scalar_tmp, kUbScalarTmp);
+  TileUbDataND<bfloat16_t, 1, 128> v_half;
+  TASSIGN(v_half, kUbVHalf);
+  TileUbDataND<float, 1, 128> v_fp32;
+  TASSIGN(v_fp32, kUbV);
+  TileUbDataND<bfloat16_t, 1, 128> z_half;
+  TASSIGN(z_half, kUbZHalf);
+  TileUbDataND<float, 1, 128> z_fp32;
+  TASSIGN(z_fp32, kUbZ);
+  // Full-span alias keeps the static UB footprint parser aware of the
+  // dynamically addressed all-token Q/K subtiles.
+  TileUbDataND<
+      float,
+      2 * kQkGroupCacheSequenceLength,
+      128> qk_cache_tail;
+  TASSIGN(qk_cache_tail, kUbQkCacheTail);
+  TileUbDataND<
+      bfloat16_t,
+      kRunDeferredNormRows,
+      kHeadDim>
+      deferred_readout_half;
+  TASSIGN(deferred_readout_half, kRunDeferredReadoutHalf);
+  TileUbDataND<
+      bfloat16_t,
+      kRunDeferredNormRows,
+      kHeadDim>
+      deferred_z_half;
+  TASSIGN(deferred_z_half, kRunDeferredZHalf);
+
+#if defined(__DAV_VEC__) || defined(__DAV_C220_VEC__)
+#if defined(PTO_NPU_ARCH_A2A3)
+  const auto cid = get_block_idx();
+  const auto vid = get_subblockid();
+  set_mask_norm();
+  set_vector_mask(-1, -1);
+  const int32_t vector_core_idx = cid * get_subblockdim() + vid;
+  const int32_t vector_core_count =
+      get_block_num() * get_subblockdim();
+#else
+  const int32_t vector_core_idx = get_block_idx();
+  const int32_t vector_core_count = get_block_num();
+#endif
+
+  // Phase 1: select accepted Conv history and write the private window.
+  RunConvPhase<SpeculativeTokens>(
+      qkv_handle,
+      conv_weight_handle,
+      conv_state_handle,
+      read_state_indices_handle,
+      write_state_indices_handle,
+      num_accepted_tokens_handle,
+      conv_out_handle,
+      conv_state_out_handle,
+      sequence_length,
+      batch_size,
+      conv_dim,
+      conv_tile_count,
+      conv_state_stride,
+      vector_core_idx,
+      vector_core_count);
 
   // Conv output is a GM hand-off between different channel/head owners.
   qwen35_decode_pto::SyncAllAiv();
@@ -731,24 +1213,18 @@ AICORE PTO_INLINE void Run(
       if (task_head_idx == 0) {
         const int32_t batch_conv_offset =
             batch_idx * sequence_length * conv_dim;
-        constexpr int32_t q_bf16_cache_address =
-            kUbConvWeightHalf0;
-        constexpr int32_t k_bf16_cache_address =
-            q_bf16_cache_address +
-            kDeferredNormRows * kHeadDim *
-                sizeof(bfloat16_t);
         LoadStridedBf16Rows<kDeferredNormRows>(
             conv_out_handle +
                 batch_conv_offset +
                 qk_head_idx * kHeadDim,
-            q_bf16_cache_address,
+            kUbQkBatchQHalf,
             conv_dim);
         LoadStridedBf16Rows<kDeferredNormRows>(
             conv_out_handle +
                 batch_conv_offset +
                 num_k_heads * kHeadDim +
                 qk_head_idx * kHeadDim,
-            k_bf16_cache_address,
+            kUbQkBatchKHalf,
             conv_dim);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
@@ -756,12 +1232,12 @@ AICORE PTO_INLINE void Run(
             bfloat16_t,
             kDeferredNormRows,
             kHeadDim> q_half_batch;
-        TASSIGN(q_half_batch, q_bf16_cache_address);
+        TASSIGN(q_half_batch, kUbQkBatchQHalf);
         TileUbDataND<
             bfloat16_t,
             kDeferredNormRows,
             kHeadDim> k_half_batch;
-        TASSIGN(k_half_batch, k_bf16_cache_address);
+        TASSIGN(k_half_batch, kUbQkBatchKHalf);
         TileUbDataND<float, kDeferredNormRows, kHeadDim> q_batch;
         TASSIGN(q_batch, kUbQkCacheTail);
         TileUbDataND<float, kDeferredNormRows, kHeadDim> k_batch;
@@ -770,56 +1246,34 @@ AICORE PTO_INLINE void Run(
         TCVT(k_batch, k_half_batch, RoundMode::CAST_NONE);
         qwen35_decode_pto::VectorBarrier();
 
-        constexpr int32_t qk_square_address = kUbState;
-        constexpr int32_t qk_reduce_tmp_address =
-            qk_square_address +
-            kDeferredNormRows * kHeadDim * sizeof(float);
-        constexpr int32_t qk_norm_address =
-            qk_reduce_tmp_address +
-            kDeferredNormRows * 64 * sizeof(float);
-        constexpr int32_t qk_norm_sqrt_address =
-            qk_norm_address + 16 * sizeof(float);
-        static_assert(
-            qk_norm_sqrt_address + 16 * sizeof(float) <= kUbV);
         NormalizeQkRows<true, kDeferredNormRows>(
             kUbQkCacheTail,
-            qk_square_address,
-            qk_reduce_tmp_address,
-            qk_norm_address,
-            qk_norm_sqrt_address);
+            kUbQkNormSquare,
+            kUbQkNormReduceTmp,
+            kUbQkNorm,
+            kUbQkNormSqrt);
         NormalizeQkRows<false, kDeferredNormRows>(
             kUbQkCacheK,
-            qk_square_address,
-            qk_reduce_tmp_address,
-            qk_norm_address,
-            qk_norm_sqrt_address);
+            kUbQkNormSquare,
+            kUbQkNormReduceTmp,
+            kUbQkNorm,
+            kUbQkNormSqrt);
       }
     }
     const int32_t read_slot = *(read_state_indices_handle + batch_idx);
     const int32_t write_slot = *(write_state_indices_handle + batch_idx);
     const int32_t accepted =
         *(num_accepted_tokens_handle + batch_idx);
-    const int32_t read_checkpoint =
-        read_slot * sequence_length + accepted - 1;
-    const int64_t read_state_offset =
-        static_cast<int64_t>(read_checkpoint) * ssm_checkpoint_stride +
-        head_idx * kSsmHeadElements;
-
-    LoadState(
-        ssm_state_handle + read_state_offset,
-        kUbState);
-    if (load_norm_weight) {
-      LoadBf16Row(norm_weight_handle, kUbNormWeightHalf);
-    }
-    LoadFloatScalar(a_log_handle + head_idx, kUbALogStatic);
-    LoadFloatScalar(dt_bias_handle + head_idx, kUbDtBiasStatic);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    if (load_norm_weight) {
-      TCVT(norm_weight_fp32, norm_weight_half, RoundMode::CAST_NONE);
-    }
-    TEXP(a_log_static, a_log_static);
-    qwen35_decode_pto::VectorBarrier();
+    LoadInitialState(ssm_state_handle,
+                     norm_weight_handle,
+                     a_log_handle,
+                     dt_bias_handle,
+                     read_slot,
+                     accepted,
+                     sequence_length,
+                     ssm_checkpoint_stride,
+                     head_idx,
+                     load_norm_weight);
 
     for (int32_t token_idx = 0; token_idx < sequence_length;
          ++token_idx) {
@@ -951,396 +1405,36 @@ AICORE PTO_INLINE void Run(
             kUbQkCacheK +
             token_idx * kHeadDim * sizeof(float);
       }
-      TileUbDataND<float, 1, 128> q_token;
-      TASSIGN(q_token, q_token_address);
-      TileUbDataND<float, 1, 128> k_token;
-      TASSIGN(k_token, k_token_address);
-
-      // decay = exp(-exp(a_log) * softplus(a + dt_bias)).
-      TADD(scalar_tmp, scalar, dt_bias_static);
-      qwen35_decode_pto::VectorBarrier();
-      set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      const float gate_input = scalar_tmp.GetValue(0);
-      if (gate_input > 20.0f) {
-        TMOV(scalar_work, scalar_tmp);
-      } else {
-        TEXP(scalar_work, scalar_tmp);
-        qwen35_decode_pto::VectorBarrier();
-        TADDS(scalar_work, scalar_work, 1.0f);
-        qwen35_decode_pto::VectorBarrier();
-        TLOG(scalar_work, scalar_work);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      TMUL(scalar_tmp, a_log_static, scalar_work);
-      qwen35_decode_pto::VectorBarrier();
-      TMULS(scalar_tmp, scalar_tmp, -1.0f);
-      qwen35_decode_pto::VectorBarrier();
-      // The small-op path materializes g as BF16 before computing exp(g).
-      TCVT(rounded_gate_half, scalar_tmp, RoundMode::CAST_RINT);
-      qwen35_decode_pto::VectorBarrier();
-      TCVT(scalar_tmp, rounded_gate_half, RoundMode::CAST_NONE);
-      qwen35_decode_pto::VectorBarrier();
-      TEXP(scalar_work, scalar_tmp);
-      set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      const float decay = scalar_work.GetValue(0);
-
-      // beta = sigmoid(b).
-      TMULS(scalar_tmp, scalar2, -1.0f);
-      qwen35_decode_pto::VectorBarrier();
-      TEXP(scalar_work, scalar_tmp);
-      qwen35_decode_pto::VectorBarrier();
-      TADDS(scalar_tmp, scalar_work, 1.0f);
-      qwen35_decode_pto::VectorBarrier();
-      TRECIP(scalar_work, scalar_tmp);
-      qwen35_decode_pto::VectorBarrier();
-      // torch::sigmoid(BF16) returns BF16 on the small-op path.
-      TCVT(rounded_gate_half, scalar_work, RoundMode::CAST_RINT);
-      qwen35_decode_pto::VectorBarrier();
-      TCVT(scalar_work, rounded_gate_half, RoundMode::CAST_NONE);
-      set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      const float beta = scalar_work.GetValue(0);
-
-      TMULS(state, state, decay);
-      qwen35_decode_pto::VectorBarrier();
-      {
-        TileUbDataDN<float, 128, 1> k_row;
-        TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
-        TROWEXPANDMUL(compute, state, k_row);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      qwen35_decode_pto::ColSum128(
-          prediction, compute, colsum_tmp);
-      TSUB(delta, v_fp32, prediction);
-      qwen35_decode_pto::VectorBarrier();
-      TMULS(delta, delta, beta);
-      qwen35_decode_pto::VectorBarrier();
-      {
-        TileUbDataDN<float, 128, 1> k_row;
-        TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
-#if defined(PTO_NPU_ARCH_A5)
-        TROWEXPAND(compute, k_row);
-        qwen35_decode_pto::VectorBarrier();
-        TCOLEXPANDMUL(compute, compute, delta);
-        qwen35_decode_pto::VectorBarrier();
-        TADD(state, state, compute);
-#else
-        qwen35_decode_pto::OuterProductAdd128(state, delta, k_row);
-#endif
-      }
-      qwen35_decode_pto::VectorBarrier();
-      {
-        TileUbDataDN<float, 128, 1> q_row;
-        TASSIGN(q_row, reinterpret_cast<std::uintptr_t>(q_token.data()));
-        TROWEXPANDMUL(compute, state, q_row);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      qwen35_decode_pto::ColSum128(
-          prediction, compute, colsum_tmp);
-      if constexpr (UseDeferredNorm) {
-        TileUbDataND<bfloat16_t, 1, kHeadDim>
-            cached_readout_half;
-        TASSIGN(
-            cached_readout_half,
-            kRunDeferredReadoutHalf +
-                token_idx * kHeadDim * sizeof(bfloat16_t));
-        TCVT(
-            cached_readout_half,
-            prediction,
-            RoundMode::CAST_RINT);
-      } else {
-        TCVT(readout_half, prediction, RoundMode::CAST_RINT);
-      }
-      qwen35_decode_pto::VectorBarrier();
+      const int32_t deferred_readout_address =
+          kRunDeferredReadoutHalf +
+          token_idx * kHeadDim * sizeof(bfloat16_t);
+      RunRecurrentStep<UseDeferredNorm>(
+          q_token_address,
+          k_token_address,
+          deferred_readout_address);
+      WriteCheckpoint(ssm_state_out_handle,
+                      write_slot,
+                      sequence_length,
+                      ssm_checkpoint_stride,
+                      head_idx,
+                      token_idx);
       if constexpr (!UseDeferredNorm) {
-        TMOV(norm_half, readout_half);
-      }
-
-      const int32_t write_checkpoint =
-          write_slot * sequence_length + token_idx;
-      const int64_t write_state_offset =
-          static_cast<int64_t>(write_checkpoint) * ssm_checkpoint_stride +
-          head_idx * kSsmHeadElements;
-      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-      StoreState(
-          ssm_state_out_handle + write_state_offset,
-          kUbState);
-      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-
-      if constexpr (!UseDeferredNorm) {
-        TCVT(norm_fp32, norm_half, RoundMode::CAST_NONE);
-        qwen35_decode_pto::VectorBarrier();
-        TMUL(square_fp32, norm_fp32, norm_fp32);
-        qwen35_decode_pto::VectorBarrier();
-        TileUbDataDN<float, 8, 1, 1, 1> rms_dn;
-        TASSIGN(rms_dn, kUbRms);
-        TileUbDataND<float, 1, 64, 1, 64> rms_reduce_tmp;
-        TASSIGN(rms_reduce_tmp, kUbReduceTmp);
-        TROWSUM(rms_dn, square_fp32, rms_reduce_tmp);
-        qwen35_decode_pto::VectorBarrier();
-        TMULS(rms, rms, 1.0f / 128.0f);
-        qwen35_decode_pto::VectorBarrier();
-        TADDS(rms, rms, 1.0e-6f);
-        qwen35_decode_pto::VectorBarrier();
-        TSQRT(scalar_tmp, rms);
-        set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-        const float rms_value = scalar_tmp.GetValue(0);
-        TMULS(norm_fp32, norm_fp32, 1.0f / rms_value);
-        qwen35_decode_pto::VectorBarrier();
-        TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
-        TileUbDataND<float, 1, 128> silu_tmp;
-        TASSIGN(silu_tmp, kUbVectorScratch);
-        qwen35_decode_pto::Silu<float, 1, 128>(
-            gate_fp32, z_fp32, silu_tmp);
-        qwen35_decode_pto::VectorBarrier();
-        TMUL(norm_fp32, norm_fp32, gate_fp32);
-        qwen35_decode_pto::VectorBarrier();
-        TCVT(final_half, norm_fp32, RoundMode::CAST_RINT);
-        qwen35_decode_pto::VectorBarrier();
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-        StoreBf16Row(
-            out_handle +
-                (batch_idx * sequence_length + token_idx) * v_width +
-                head_idx * kHeadDim,
-            kUbFinalHalf);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-        if constexpr (SpeculativeTokens != 8) {
-          set_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
-          wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
-        }
+        RunNormStep<SpeculativeTokens>(out_handle,
+                                       batch_idx,
+                                       token_idx,
+                                       head_idx,
+                                       sequence_length,
+                                       v_width);
       }
     }
 
     if constexpr (UseDeferredNorm) {
-      if constexpr (true) {
-      pipe_barrier(PIPE_ALL);
-      constexpr int32_t input_half_batch_address = kUbStateCompute;
-      constexpr int32_t z_half_batch_address =
-          input_half_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(bfloat16_t);
-      constexpr int32_t input_batch_address =
-          z_half_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(bfloat16_t);
-      constexpr int32_t z_batch_address =
-          input_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(float);
-      constexpr int32_t square_batch_address =
-          z_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(float);
-      constexpr int32_t gate_batch_address =
-          square_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(float);
-      constexpr int32_t final_half_batch_address =
-          gate_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(float);
-      constexpr int32_t silu_tmp_batch_address =
-          final_half_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(bfloat16_t);
-      constexpr int32_t reduce_tmp_batch_address =
-          silu_tmp_batch_address +
-          kRunDeferredNormRows * kHeadDim * sizeof(float);
-      constexpr int32_t rms_batch_address =
-          reduce_tmp_batch_address +
-          kRunDeferredNormRows * 64 * sizeof(float);
-      constexpr int32_t rms_batch_capacity =
-          kRunDeferredNormRows <= 16 ? 16 : 32;
-      constexpr int32_t rms_sqrt_batch_address =
-          rms_batch_address +
-          rms_batch_capacity * sizeof(float);
-      static_assert(
-          rms_sqrt_batch_address +
-              rms_batch_capacity * sizeof(float) <=
-          kUbPrediction);
-
-      TileUbDataND<bfloat16_t, kRunDeferredNormRows, kHeadDim>
-          cached_readout_half_batch;
-      TASSIGN(
-          cached_readout_half_batch, kRunDeferredReadoutHalf);
-      TileUbDataND<bfloat16_t, kRunDeferredNormRows, kHeadDim>
-          cached_z_half_batch;
-      TASSIGN(cached_z_half_batch, kRunDeferredZHalf);
-      TileUbDataND<bfloat16_t, kRunDeferredNormRows, kHeadDim>
-          readout_half_batch;
-      TASSIGN(readout_half_batch, input_half_batch_address);
-      TileUbDataND<bfloat16_t, kRunDeferredNormRows, kHeadDim>
-          z_half_batch;
-      TASSIGN(z_half_batch, z_half_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, kHeadDim> input_batch;
-      TASSIGN(input_batch, input_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, kHeadDim> z_batch;
-      TASSIGN(z_batch, z_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, kHeadDim> square_batch;
-      TASSIGN(square_batch, square_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, kHeadDim> gate_batch;
-      TASSIGN(gate_batch, gate_batch_address);
-      TileUbDataND<bfloat16_t, kRunDeferredNormRows, kHeadDim>
-          final_half_batch;
-      TASSIGN(final_half_batch, final_half_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, kHeadDim>
-          silu_tmp_batch;
-      TASSIGN(silu_tmp_batch, silu_tmp_batch_address);
-      TileUbDataDN<float,
-                   rms_batch_capacity,
-                   1,
-                   kRunDeferredNormRows,
-                   1> rms_batch_dn;
-      TASSIGN(rms_batch_dn, rms_batch_address);
-      TileUbDataND<float,
-                   1,
-                   rms_batch_capacity,
-                   1,
-                   kRunDeferredNormRows> rms_batch;
-      TASSIGN(rms_batch, rms_batch_address);
-      TileUbDataND<float,
-                   1,
-                   rms_batch_capacity,
-                   1,
-                   kRunDeferredNormRows> rms_sqrt_batch;
-      TASSIGN(rms_sqrt_batch, rms_sqrt_batch_address);
-      TileUbDataND<float, kRunDeferredNormRows, 64> reduce_tmp_batch;
-      TASSIGN(reduce_tmp_batch, reduce_tmp_batch_address);
-
-      for (int32_t row = 0; row < kRunDeferredNormRows; ++row) {
-        TileUbDataND<bfloat16_t, 1, kHeadDim> cached_readout_row;
-        TASSIGN(
-            cached_readout_row,
-            kRunDeferredReadoutHalf +
-                row * kHeadDim * sizeof(bfloat16_t));
-        TileUbDataND<bfloat16_t, 1, kHeadDim> cached_z_row;
-        TASSIGN(
-            cached_z_row,
-            kRunDeferredZHalf +
-                row * kHeadDim * sizeof(bfloat16_t));
-        TileUbDataND<float, 1, kHeadDim> input_row;
-        TASSIGN(
-            input_row,
-            input_batch_address +
-                row * kHeadDim * sizeof(float));
-        TileUbDataND<float, 1, kHeadDim> z_row;
-        TASSIGN(
-            z_row,
-            z_batch_address +
-                row * kHeadDim * sizeof(float));
-        TCVT(input_row, cached_readout_row, RoundMode::CAST_NONE);
-        TCVT(z_row, cached_z_row, RoundMode::CAST_NONE);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      TMUL(square_batch, input_batch, input_batch);
-      qwen35_decode_pto::VectorBarrier();
-      TROWSUM(rms_batch_dn, square_batch, reduce_tmp_batch);
-      qwen35_decode_pto::VectorBarrier();
-      TMULS(rms_batch, rms_batch, 1.0f / 128.0f);
-      qwen35_decode_pto::VectorBarrier();
-      TADDS(rms_batch, rms_batch, 1.0e-6f);
-      qwen35_decode_pto::VectorBarrier();
-      TSQRT(rms_sqrt_batch, rms_batch);
-      set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      for (int32_t row = 0; row < kRunDeferredNormRows; ++row) {
-        TileUbDataND<float, 1, kHeadDim> input_row;
-        TASSIGN(
-            input_row,
-            input_batch_address +
-                row * kHeadDim * sizeof(float));
-        const float rms_value = rms_sqrt_batch.GetValue(row);
-        TMULS(input_row, input_row, 1.0f / rms_value);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      for (int32_t row = 0; row < kRunDeferredNormRows; ++row) {
-        TileUbDataND<float, 1, kHeadDim> input_row;
-        TASSIGN(
-            input_row,
-            input_batch_address +
-                row * kHeadDim * sizeof(float));
-        TMUL(input_row, input_row, norm_weight_fp32);
-      }
-      qwen35_decode_pto::VectorBarrier();
-      SiluNoCopy<float, kRunDeferredNormRows, kHeadDim>(
-          gate_batch, z_batch, silu_tmp_batch);
-      qwen35_decode_pto::VectorBarrier();
-      TMUL(input_batch, input_batch, gate_batch);
-      qwen35_decode_pto::VectorBarrier();
-      TCVT(final_half_batch, input_batch, RoundMode::CAST_RINT);
-      qwen35_decode_pto::VectorBarrier();
-
-      const int64_t output_base_offset =
-          static_cast<int64_t>(batch_idx) *
-              sequence_length * v_width +
-          head_idx * kHeadDim;
-      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-      StoreStridedBf16Rows<kRunDeferredNormRows>(
-          out_handle + output_base_offset,
-          final_half_batch_address,
+      RunDeferredNorm<kRunDeferredNormRows, UseQkGroupCache>(
+          out_handle,
+          batch_idx,
+          head_idx,
+          sequence_length,
           v_width);
-      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-      } else {
-        const int64_t output_base_offset =
-            static_cast<int64_t>(batch_idx) *
-                sequence_length * v_width +
-            head_idx * kHeadDim;
-        for (int32_t row = 0; row < sequence_length; ++row) {
-          TileUbDataND<bfloat16_t, 1, kHeadDim>
-              cached_readout_half;
-          TASSIGN(
-              cached_readout_half,
-              kRunDeferredReadoutHalf +
-                  row * kHeadDim * sizeof(bfloat16_t));
-          TileUbDataND<bfloat16_t, 1, kHeadDim> cached_z_half;
-          TASSIGN(
-              cached_z_half,
-              kRunDeferredZHalf +
-                  row * kHeadDim * sizeof(bfloat16_t));
-          TCVT(norm_fp32, cached_readout_half, RoundMode::CAST_NONE);
-          TCVT(z_fp32, cached_z_half, RoundMode::CAST_NONE);
-          qwen35_decode_pto::VectorBarrier();
-          TMUL(square_fp32, norm_fp32, norm_fp32);
-          qwen35_decode_pto::VectorBarrier();
-          TileUbDataDN<float, 8, 1, 1, 1> cached_rms_dn;
-          TASSIGN(cached_rms_dn, kUbRms);
-          TileUbDataND<float, 1, 64, 1, 64>
-              cached_rms_reduce_tmp;
-          TASSIGN(cached_rms_reduce_tmp, kUbReduceTmp);
-          TROWSUM(
-              cached_rms_dn, square_fp32, cached_rms_reduce_tmp);
-          qwen35_decode_pto::VectorBarrier();
-          TMULS(rms, rms, 1.0f / 128.0f);
-          qwen35_decode_pto::VectorBarrier();
-          TADDS(rms, rms, 1.0e-6f);
-          qwen35_decode_pto::VectorBarrier();
-          TSQRT(scalar_tmp, rms);
-          set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-          wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-          const float cached_rms_value = scalar_tmp.GetValue(0);
-          TMULS(norm_fp32, norm_fp32, 1.0f / cached_rms_value);
-          qwen35_decode_pto::VectorBarrier();
-          TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
-          TileUbDataND<float, 1, kHeadDim> cached_silu_tmp;
-          TASSIGN(cached_silu_tmp, kUbVectorScratch);
-          qwen35_decode_pto::Silu<float, 1, kHeadDim>(
-              gate_fp32, z_fp32, cached_silu_tmp);
-          qwen35_decode_pto::VectorBarrier();
-          TMUL(norm_fp32, norm_fp32, gate_fp32);
-          qwen35_decode_pto::VectorBarrier();
-          TCVT(final_half, norm_fp32, RoundMode::CAST_RINT);
-          qwen35_decode_pto::VectorBarrier();
-          set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-          wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
-          StoreBf16Row(
-              out_handle + output_base_offset + row * v_width,
-              kUbFinalHalf);
-          set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-          wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
-        }
-      }
     }
   }
 #endif

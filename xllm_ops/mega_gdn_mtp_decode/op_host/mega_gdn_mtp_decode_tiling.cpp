@@ -240,14 +240,9 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
 
   MegaGdnMtpDecodeTilingData tiling;
   tiling.set_batch_size(info.batch_size);
-  tiling.set_speculative_tokens(info.speculative_tokens);
   tiling.set_sequence_length(info.sequence_length);
-  tiling.set_conv_state_length(info.conv_state_length);
   tiling.set_num_k_heads(info.num_k_heads);
   tiling.set_num_v_heads(info.num_v_heads);
-  tiling.set_conv_tile_count(info.conv_tile_count);
-  tiling.set_checkpoint_stride(info.sequence_length);
-  tiling.set_use_dynamic_k(tiling_key == 100);
   const size_t lib_workspace_size = platform.GetLibApiWorkSpaceSize();
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                       context->GetRawTilingData()->GetCapacity());
