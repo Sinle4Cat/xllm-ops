@@ -390,16 +390,14 @@ OPP tiling 回调。tiling 回调只校验 tensor 的 dtype、rank 和 shape，�
 ```cpp
 struct MegaGdnMtpDecodeTilingData {
   int64_t batch_size;
-  int64_t speculative_tokens;       // K
-  int64_t sequence_length;          // K + 1
-  int64_t conv_state_length;        // K + 3
+  int64_t sequence_length;  // K + 1，动态 key 100 使用
   int64_t num_k_heads;
   int64_t num_v_heads;
-  int64_t conv_tile_count;           // C / 128
-  int64_t checkpoint_stride;         // K + 1
-  int64_t use_dynamic_k;
 };
 ```
+
+`K`、Conv state 长度、Conv tile 数和 checkpoint stride 均可由 tiling key
+及上述 shape 字段推导，不重复放入 Host/device ABI。
 
 ### 5.2 Tiling key
 

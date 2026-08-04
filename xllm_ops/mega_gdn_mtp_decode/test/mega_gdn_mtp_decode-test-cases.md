@@ -207,6 +207,22 @@ BOUNDARY_VALUES = [
 
 ## 3. 使用说明
 
+### xllm_ops 可执行 NPU 门禁
+
+在 `test/python_test` 构建 `custom_ops_lib` 后执行：
+
+```bash
+cd test/python_test
+python3 setup.py build_ext --inplace
+python3 -m pytest -q test_mega_gdn_mtp_decode.py
+```
+
+该门禁共 39 例，直接通过 pybind 调用 `aclnnMegaGdnMtpDecode`，覆盖 K=1～16、
+same-slot、Prefix Cache fork-slot、accepted 首/中/末、动态 key 100、
+K8 key 208、deferred Norm key 210～216，以及 Qwen3.5 各模型组的
+head geometry。所有 `conv_out`、Conv state、SSM checkpoint 和最终
+`out` 均与保留小算子 BF16 舍入点的 CPU Golden 对比。
+
 ### 生成测试数据示例
 
 ```python
