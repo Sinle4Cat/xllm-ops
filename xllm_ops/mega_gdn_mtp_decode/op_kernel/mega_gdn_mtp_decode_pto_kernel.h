@@ -169,6 +169,7 @@ static_assert(kUbQkNormSqrt + 16 * sizeof(float) <= kUbV);
 
 using namespace ub_layout;
 
+#if !defined(PTO_NPU_ARCH_A5)
 template <typename T, int32_t Rows, int32_t Cols>
 AICORE PTO_INLINE void SiluNoCopy(
     TileUbDataND<T, Rows, Cols>& dst,
@@ -184,6 +185,7 @@ AICORE PTO_INLINE void SiluNoCopy(
   qwen35_decode_pto::VectorBarrier();
   TMUL(dst, src, dst);
 }
+#endif
 
 AICORE PTO_INLINE void LoadBf16Row(__gm__ bfloat16_t* handle,
                                    int32_t ub_address) {
@@ -383,11 +385,20 @@ AICORE PTO_INLINE void NormalizeQkRows(
         row_tile,
         rows_address + row * kHeadDim * sizeof(float));
     const float row_norm = norm_sqrt.GetValue(row);
+#if defined(PTO_NPU_ARCH_A5)
+    TDIVS(row_tile, row_tile, row_norm);
+#else
     TMULS(row_tile, row_tile, 1.0f / row_norm);
+#endif
   }
   qwen35_decode_pto::VectorBarrier();
   if constexpr (ApplyQScale) {
+#if defined(PTO_NPU_ARCH_A5)
+    // Exact FP32 rounding of 1 / sqrt(128), matching Triton's scale.
+    TMULS(rows, rows, 0.0883883461356163f);
+#else
     TMULS(rows, rows, 8.838835e-02f);
+#endif
     qwen35_decode_pto::VectorBarrier();
   }
 }
@@ -541,13 +552,12 @@ AICORE PTO_INLINE void RunConvPhase(
         qwen35_decode_pto::VectorBarrier();
 
         TMUL(conv_acc, w0, hist0);
-        TMUL(conv_tmp, w1, hist1);
         qwen35_decode_pto::VectorBarrier();
-        TADD(conv_acc, conv_acc, conv_tmp);
+        qwen35_decode_pto::MulAddDst<float, 1, 128>(
+            conv_acc, hist1, w1, conv_tmp);
         qwen35_decode_pto::VectorBarrier();
-        TMUL(conv_tmp, w2, hist2);
-        qwen35_decode_pto::VectorBarrier();
-        TADD(conv_acc, conv_acc, conv_tmp);
+        qwen35_decode_pto::MulAddDst<float, 1, 128>(
+            conv_acc, hist2, w2, conv_tmp);
         qwen35_decode_pto::VectorBarrier();
         TileUbDataND<float, 1, 128> mul_add_tmp;
         TASSIGN(mul_add_tmp, kUbVectorScratch);
@@ -705,11 +715,30 @@ AICORE PTO_INLINE void RunRecurrentStep(
   if (gate_input > 20.0f) {
     TMOV(scalar_work, scalar_tmp);
   } else {
+#if defined(PTO_NPU_ARCH_A5)
+    // Compensated log1p: log(1 + y) alone loses the low bits of y when
+    // y = exp(x) is small. Recover the addition residual before applying
+    // the BF16 gate rounding used by the unfused path.
+    TEXP(scalar_work, scalar_tmp);
+    qwen35_decode_pto::VectorBarrier();
+    TADDS(scalar_tmp, scalar_work, 1.0f);
+    qwen35_decode_pto::VectorBarrier();
+    TADDS(scalar, scalar_tmp, -1.0f);
+    qwen35_decode_pto::VectorBarrier();
+    TSUB(scalar, scalar_work, scalar);
+    qwen35_decode_pto::VectorBarrier();
+    TDIV(scalar, scalar, scalar_tmp);
+    qwen35_decode_pto::VectorBarrier();
+    TLOG(scalar_work, scalar_tmp);
+    qwen35_decode_pto::VectorBarrier();
+    TADD(scalar_work, scalar_work, scalar);
+#else
     TEXP(scalar_work, scalar_tmp);
     qwen35_decode_pto::VectorBarrier();
     TADDS(scalar_work, scalar_work, 1.0f);
     qwen35_decode_pto::VectorBarrier();
     TLOG(scalar_work, scalar_work);
+#endif
   }
   qwen35_decode_pto::VectorBarrier();
   TMUL(scalar_tmp, a_log_static, scalar_work);
@@ -833,10 +862,16 @@ AICORE PTO_INLINE void RunNormStep(
   TASSIGN(square_fp32, kUbSquare);
   TileUbDataND<float, 1, 8, 1, 1> rms;
   TASSIGN(rms, kUbRms);
+#if defined(PTO_NPU_ARCH_A5)
+  TileUbDataDN<float, 8, 1, 1, 1> rstd_dn;
+  TASSIGN(rstd_dn, kUbRms);
+#endif
   TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
   TASSIGN(scalar_tmp, kUbScalarTmp);
+#if !defined(PTO_NPU_ARCH_A5)
   TileUbDataND<float, 1, 128> gate_fp32;
   TASSIGN(gate_fp32, kUbGate);
+#endif
   TileUbDataND<bfloat16_t, 1, 128> final_half;
   TASSIGN(final_half, kUbFinalHalf);
 
@@ -848,13 +883,52 @@ AICORE PTO_INLINE void RunNormStep(
   TASSIGN(rms_dn, kUbRms);
   TileUbDataND<float, 1, 64, 1, 64> rms_reduce_tmp;
   TASSIGN(rms_reduce_tmp, kUbReduceTmp);
+#if defined(PTO_NPU_ARCH_A5)
+  TileUbDataND<float, 1, 64> square_low;
+  TASSIGN(square_low, kUbSquare);
+  TileUbDataND<float, 1, 64> square_high;
+  TASSIGN(square_high, kUbSquare + 64 * sizeof(float));
+  // Match layer_norm_fwd's N=128 reduction tree: add the two 64-wide
+  // halves elementwise, then reduce the resulting 64 values.
+  TADD(rms_reduce_tmp, square_low, square_high);
+  qwen35_decode_pto::VectorBarrier();
+  TROWSUM(rms_dn, rms_reduce_tmp, square_fp32);
+#else
   TROWSUM(rms_dn, square_fp32, rms_reduce_tmp);
+#endif
   qwen35_decode_pto::VectorBarrier();
   TMULS(rms, rms, 1.0f / 128.0f);
   qwen35_decode_pto::VectorBarrier();
   TADDS(rms, rms, 1.0e-6f);
   qwen35_decode_pto::VectorBarrier();
   TSQRT(scalar_tmp, rms);
+#if defined(PTO_NPU_ARCH_A5)
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(rms, rms, 0.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(rms, rms, 1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  // layer_norm_fwd obtains rstd with vector Div rather than scalar division.
+  TDIV(rms, rms, scalar_tmp);
+  qwen35_decode_pto::VectorBarrier();
+  TROWEXPANDMUL(norm_fp32, norm_fp32, rstd_dn);
+  qwen35_decode_pto::VectorBarrier();
+  TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
+  // Match layer_norm_fwd's A5 hot path exactly: multiply by z before the
+  // division so FP32 rounding is identical at BF16 midpoint boundaries.
+  TMUL(norm_fp32, norm_fp32, z_fp32);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(z_fp32, z_fp32, -1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TEXP(z_fp32, z_fp32);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(z_fp32, z_fp32, 1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TDIV(norm_fp32, norm_fp32, z_fp32);
+  qwen35_decode_pto::VectorBarrier();
+  // Triton's A5 f32-to-bf16 conversion rounds midpoint ties away from zero.
+  TCVT(final_half, norm_fp32, RoundMode::CAST_ROUND);
+#else
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
   const float rms_value = scalar_tmp.GetValue(0);
@@ -869,6 +943,7 @@ AICORE PTO_INLINE void RunNormStep(
   TMUL(norm_fp32, norm_fp32, gate_fp32);
   qwen35_decode_pto::VectorBarrier();
   TCVT(final_half, norm_fp32, RoundMode::CAST_RINT);
+#endif
   qwen35_decode_pto::VectorBarrier();
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
@@ -954,12 +1029,16 @@ AICORE PTO_INLINE void RunDeferredNorm(
   TASSIGN(z_batch, Layout::kZBatch);
   TileUbDataND<float, Rows, kHeadDim> square_batch;
   TASSIGN(square_batch, Layout::kSquareBatch);
+#if !defined(PTO_NPU_ARCH_A5)
   TileUbDataND<float, Rows, kHeadDim> gate_batch;
   TASSIGN(gate_batch, Layout::kGateBatch);
+#endif
   TileUbDataND<bfloat16_t, Rows, kHeadDim> final_half_batch;
   TASSIGN(final_half_batch, Layout::kFinalHalfBatch);
+#if !defined(PTO_NPU_ARCH_A5)
   TileUbDataND<float, Rows, kHeadDim> silu_tmp_batch;
   TASSIGN(silu_tmp_batch, Layout::kSiluTmpBatch);
+#endif
   TileUbDataDN<float, Layout::kRmsBatchCapacity, 1, Rows, 1> rms_batch_dn;
   TASSIGN(rms_batch_dn, Layout::kRmsBatch);
   TileUbDataND<float, 1, Layout::kRmsBatchCapacity, 1, Rows> rms_batch;
@@ -995,13 +1074,41 @@ AICORE PTO_INLINE void RunDeferredNorm(
   qwen35_decode_pto::VectorBarrier();
   TMUL(square_batch, input_batch, input_batch);
   qwen35_decode_pto::VectorBarrier();
+#if defined(PTO_NPU_ARCH_A5)
+  for (int32_t row = 0; row < Rows; ++row) {
+    TileUbDataND<float, 1, 64> square_low;
+    TASSIGN(square_low,
+            Layout::kSquareBatch + row * kHeadDim * sizeof(float));
+    TileUbDataND<float, 1, 64> square_high;
+    TASSIGN(square_high,
+            Layout::kSquareBatch +
+                (row * kHeadDim + 64) * sizeof(float));
+    TileUbDataND<float, 1, 64> reduced_row;
+    TASSIGN(reduced_row,
+            Layout::kReduceTmpBatch + row * 64 * sizeof(float));
+    TADD(reduced_row, square_low, square_high);
+  }
+  qwen35_decode_pto::VectorBarrier();
+  TROWSUM(rms_batch_dn, reduce_tmp_batch, square_batch);
+#else
   TROWSUM(rms_batch_dn, square_batch, reduce_tmp_batch);
+#endif
   qwen35_decode_pto::VectorBarrier();
   TMULS(rms_batch, rms_batch, 1.0f / 128.0f);
   qwen35_decode_pto::VectorBarrier();
   TADDS(rms_batch, rms_batch, 1.0e-6f);
   qwen35_decode_pto::VectorBarrier();
   TSQRT(rms_sqrt_batch, rms_batch);
+#if defined(PTO_NPU_ARCH_A5)
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(rms_batch, rms_batch, 0.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(rms_batch, rms_batch, 1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TDIV(rms_batch, rms_batch, rms_sqrt_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TROWEXPANDMUL(input_batch, input_batch, rms_batch_dn);
+#else
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
   for (int32_t row = 0; row < Rows; ++row) {
@@ -1012,6 +1119,7 @@ AICORE PTO_INLINE void RunDeferredNorm(
     const float rms_value = rms_sqrt_batch.GetValue(row);
     TMULS(input_row, input_row, 1.0f / rms_value);
   }
+#endif
   qwen35_decode_pto::VectorBarrier();
   for (int32_t row = 0; row < Rows; ++row) {
     TileUbDataND<float, 1, kHeadDim> input_row;
@@ -1021,12 +1129,28 @@ AICORE PTO_INLINE void RunDeferredNorm(
     TMUL(input_row, input_row, norm_weight_fp32);
   }
   qwen35_decode_pto::VectorBarrier();
+#if defined(PTO_NPU_ARCH_A5)
+  // Preserve layer_norm_fwd's (value * z) / (1 + exp(-z)) operation order.
+  TMUL(input_batch, input_batch, z_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TMULS(z_batch, z_batch, -1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TEXP(z_batch, z_batch);
+  qwen35_decode_pto::VectorBarrier();
+  TADDS(z_batch, z_batch, 1.0f);
+  qwen35_decode_pto::VectorBarrier();
+  TDIV(input_batch, input_batch, z_batch);
+  qwen35_decode_pto::VectorBarrier();
+  // Match the A5 Triton backend's midpoint-tie behavior at the norm boundary.
+  TCVT(final_half_batch, input_batch, RoundMode::CAST_ROUND);
+#else
   SiluNoCopy<float, Rows, kHeadDim>(
       gate_batch, z_batch, silu_tmp_batch);
   qwen35_decode_pto::VectorBarrier();
   TMUL(input_batch, input_batch, gate_batch);
   qwen35_decode_pto::VectorBarrier();
   TCVT(final_half_batch, input_batch, RoundMode::CAST_RINT);
+#endif
   qwen35_decode_pto::VectorBarrier();
 
   const int64_t output_base_offset =
@@ -1044,7 +1168,8 @@ AICORE PTO_INLINE void RunDeferredNorm(
 
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
-          bool UseDeferredNorm = UseQkGroupCache>
+          bool UseDeferredNorm = UseQkGroupCache,
+          bool UseTwoOwnerQkGroups = false>
 AICORE PTO_INLINE void Run(
     __gm__ bfloat16_t* qkv_handle,
     __gm__ bfloat16_t* z_handle,
@@ -1069,6 +1194,8 @@ AICORE PTO_INLINE void Run(
     int32_t runtime_sequence_length) {
   constexpr bool kIsDynamic = SpeculativeTokens == 0;
   static_assert(!UseDeferredNorm || !kIsDynamic);
+  static_assert(!UseTwoOwnerQkGroups || UseQkGroupCache);
+  static_assert(!UseTwoOwnerQkGroups || SpeculativeTokens == 8);
   constexpr int32_t kRunDeferredNormRows =
       UseDeferredNorm ? SpeculativeTokens + 1 : 1;
   using RunDeferredLayout =
@@ -1176,41 +1303,87 @@ AICORE PTO_INLINE void Run(
   qwen35_decode_pto::SyncAllAiv();
 
   // Phase 2: each owner keeps one complete FP32 state in UB for all S steps.
-  // The K8/B4/NK8/NV24 bucket maps one batch x Q/K group to each of the
-  // first 32 AIVs, caches normalized Q/K for all nine tokens, and then
-  // processes the group's three value heads without recomputing Q/K.
+  // Key 208 assigns all value heads in one Q/K group to one owner. A5 key 308
+  // assigns heads 0/1 to the group owner and head 2 to a singleton owner.
+  // With 56 AIVs, eight singleton owners process a second group; with 64 AIVs,
+  // every singleton has its own owner. Hosts with more than 64 AIVs launch 64.
   static_assert(!UseQkGroupCache || SpeculativeTokens == 8);
   const int32_t total_heads = batch_size * num_v_heads;
-  const int32_t recurrent_loop_end =
-      UseQkGroupCache ? vector_core_count * v_heads_per_k : total_heads;
-  for (int32_t head_index = vector_core_idx;
-       head_index < recurrent_loop_end;
-       head_index += vector_core_count) {
-    if constexpr (UseQkGroupCache) {
-      if (vector_core_idx >= batch_size * num_k_heads) {
-        break;
+  const int32_t qk_group_count = batch_size * num_k_heads;
+  const bool use_two_owner_schedule =
+      UseTwoOwnerQkGroups && v_heads_per_k == 3 &&
+      vector_core_count > qk_group_count;
+  int32_t owner_task_count = 0;
+  if constexpr (UseTwoOwnerQkGroups) {
+    if (use_two_owner_schedule) {
+      if (vector_core_idx < qk_group_count) {
+        owner_task_count = v_heads_per_k - 1;
+      } else {
+        const int32_t singleton_owner_count =
+            vector_core_count - qk_group_count;
+        const int32_t first_singleton_group =
+            vector_core_idx - qk_group_count;
+        if (first_singleton_group < qk_group_count) {
+          owner_task_count =
+              (qk_group_count - first_singleton_group +
+               singleton_owner_count - 1) /
+              singleton_owner_count;
+        }
       }
+    } else if (vector_core_idx < qk_group_count) {
+      owner_task_count = v_heads_per_k;
     }
-    const int32_t task_head_idx =
-        UseQkGroupCache
-            ? (head_index - vector_core_idx) / vector_core_count
-            : 0;
-    const int32_t batch_idx =
-        UseQkGroupCache ? vector_core_idx / num_k_heads
-                        : head_index / num_v_heads;
-    const int32_t qk_head_idx =
-        UseQkGroupCache ? vector_core_idx % num_k_heads
-                        : (head_index % num_v_heads) /
-                              v_heads_per_k;
+  } else if constexpr (UseQkGroupCache) {
+    owner_task_count =
+        vector_core_idx < qk_group_count ? v_heads_per_k : 0;
+  } else if (vector_core_idx < total_heads) {
+    owner_task_count =
+        (total_heads - vector_core_idx + vector_core_count - 1) /
+        vector_core_count;
+  }
+
+  int32_t cached_qk_group = -1;
+  for (int32_t owner_task_idx = 0;
+       owner_task_idx < owner_task_count;
+       ++owner_task_idx) {
+    int32_t qk_group = 0;
+    int32_t local_v_head_idx = 0;
+    if constexpr (UseTwoOwnerQkGroups) {
+      if (use_two_owner_schedule) {
+        if (vector_core_idx < qk_group_count) {
+          qk_group = vector_core_idx;
+          local_v_head_idx = owner_task_idx;
+        } else {
+          const int32_t singleton_owner_count =
+              vector_core_count - qk_group_count;
+          qk_group = vector_core_idx - qk_group_count +
+                     owner_task_idx * singleton_owner_count;
+          local_v_head_idx = v_heads_per_k - 1;
+        }
+      } else {
+        qk_group = vector_core_idx;
+        local_v_head_idx = owner_task_idx;
+      }
+    } else if constexpr (UseQkGroupCache) {
+      qk_group = vector_core_idx;
+      local_v_head_idx = owner_task_idx;
+    } else {
+      const int32_t head_index =
+          vector_core_idx + owner_task_idx * vector_core_count;
+      const int32_t batch_head_idx = head_index % num_v_heads;
+      qk_group = (head_index / num_v_heads) * num_k_heads +
+                 batch_head_idx / v_heads_per_k;
+      local_v_head_idx = batch_head_idx % v_heads_per_k;
+    }
+    const int32_t batch_idx = qk_group / num_k_heads;
+    const int32_t qk_head_idx = qk_group % num_k_heads;
     const int32_t head_idx =
-        UseQkGroupCache
-            ? qk_head_idx * v_heads_per_k + task_head_idx
-            : head_index % num_v_heads;
+        qk_head_idx * v_heads_per_k + local_v_head_idx;
     const bool load_norm_weight =
-        !UseQkGroupCache || task_head_idx == 0;
+        !UseQkGroupCache || owner_task_idx == 0;
 
     if constexpr (UseQkGroupCache) {
-      if (task_head_idx == 0) {
+      if (qk_group != cached_qk_group) {
         const int32_t batch_conv_offset =
             batch_idx * sequence_length * conv_dim;
         LoadStridedBf16Rows<kDeferredNormRows>(
@@ -1258,6 +1431,7 @@ AICORE PTO_INLINE void Run(
             kUbQkNormReduceTmp,
             kUbQkNorm,
             kUbQkNormSqrt);
+        cached_qk_group = qk_group;
       }
     }
     const int32_t read_slot = *(read_state_indices_handle + batch_idx);

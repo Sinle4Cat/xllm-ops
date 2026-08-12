@@ -35,7 +35,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("stateIndices")
+        this->Input("readStateIndices")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("writeStateIndices")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})

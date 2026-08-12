@@ -21,7 +21,8 @@ SPDX-License-Identifier: Apache-2.0 -->
 TileLang 原型继续为 `K=1/2/3/4/5/8` 提供静态 specialization。生产 PTO
 支持 `1 <= K <= 16`：六个常用 K 使用静态 key，`K=6/7/9..16` 保留动态
 key 100 fallback；UB 不小于 182,816B 时，K=10～16 使用 deferred-Norm
-key 210～216。`K=8/B=4/NK=8/NV=24` 进入独立 key 208 热点路径。
+key 210～216。`K=8/B=4/NK=8/NV=24` 在 A2/A3 进入 key 208，在
+A5 且 AIV 不少于 48 时进入动态 two-owner key 308。
 
 ### 1.2 对原方案补充的强约束
 
@@ -410,6 +411,7 @@ struct MegaGdnMtpDecodeTilingData {
 | 105 | 5 | `RunMtp<5>` |
 | 108 | 8 | `RunMtp<8>` |
 | 208 | 8 | `RunMtpQkGroupCache<8>`，仅 `B=4/NK=8/NV=24` |
+| 308 | 8 | A5 two-owner Q/K group cache，同一 binary 支持 56/64/72 AIV |
 | 210～216 | 10～16 | `RunMtp<K, deferred_norm=true>`，要求 UB≥182,816B |
 | 100 | 6/7/9..16 | `RunMtpDynamic`；K10～16 在 UB 不足时回退该路径 |
 
@@ -418,6 +420,15 @@ key 208 按 `batch × key-head` 分配 32 个 AIV owner。每个 owner 只对 Q/
 UB 中，供同组 3 个 value head 复用。该路径的 Q/K、readout 和 Z cache
 extent 固定为 9 行，由 `kQkGroupCacheSequenceLength=9` 显式约束。其他 shape
 继续使用原 key，不能把该特化泛化为动态 K 或动态 head 配置。
+
+key 308 保持相同的九行 Q/K cache 和 deferred-Norm UB layout，但将每个
+Q/K group 的 3 个 value head 拆为 `(0, 1)` pair 与 `2` singleton。Host
+使用 `min(platform_aiv_count, 64)` 个 AIV：56 核时 32 个 pair owner 加
+24 个 singleton owner，其中 8 个 singleton owner 各处理两个 group；64
+核时每个 singleton 独占一个 owner；72 核规格仍启动 64 核，因为 96 个
+head 的关键路径已经是每 owner 2 个 head，额外 8 核不能再缩短该路径。
+每个 group 只进行两次 Q/K load、BF16→FP32 与 L2Norm，而不是按 3 个
+value head 各重算一次。
 
 ### 5.3 Block 级 Tiling
 
@@ -436,6 +447,9 @@ recurrent_tasks = B * NV
 task_count = max(conv_tasks, recurrent_tasks)
 used_aiv = min(task_count, platform_aiv_count)
 ```
+
+key 308 将 `recurrent_tasks` 的调度上限设为 64，因此 A5 三档规格分别
+启动 56、64、64 个 AIV。其他 key 继续使用上述通用公式。
 
 910B/910_93 使用 `CalcTschBlockDim`，950 使用 AIV-only block dim。
 Host 设置 `schedule_mode=1`。Conv 写回后执行 MTE3 completion 和
@@ -486,6 +500,9 @@ readout/Z cache，Host reserve 为 187,936B；A2/A3 PTO scratch 从 188,416B
 `a_log/dt_bias` 各占 32B，并联动 Host reserve 与 A3 192 KiB 上限。源码审计
 必须分别验证两条路径的最大 `TASSIGN` offset 加 tile 大小，不能把原型的
 较低占用作为生产 PTO 的容量证明。
+
+key 308 复用 key 208 的全部 UB offset，owner 调度不会增加单核驻留数据，
+因此 Host reserve 同为 187,936B。
 
 key 210～216 从 `kUbQkCacheTail=174112` 开始缓存 `K+1` 行 BF16 readout
 和 Z。最重 K16 的末地址为 182,816B，Host 仅在平台 UB 不小于该值时下发；
@@ -1045,6 +1062,9 @@ Graph executor/persistent 参数均编译通过，以下目标成功链接：
 - [x] K8 kernel 内部 prefetch/ping-pong fresh ABBA 与同卡 msprof 门禁通过。
 - [x] K8/B4 key 208 Q/K group cache 通过机器码隔离、57 项 ACLNN、
       四输出 bitwise、fallback 与 fresh A-B-B-A/profile 门禁。
+- [x] A5 key 308 two-owner 调度实现完成，56/64/72 映射覆盖测试通过，
+      Ascend950 与 Ascend910B 交叉编译通过。
+- [ ] A5 56/64/72 三档实机四输出精度、确定性和性能门禁通过。
 - [x] candidate 720ah 达成 K8/B4 正式 A-B-B-A 10.363%，K=1～16 与
       Qwen3.5 head 几何 ACLNN 301/301、逐函数机器码隔离通过。
 - [x] deferred-Norm key 210～216 通过 ACLNN 832/832、旧 key 机器码隔离；

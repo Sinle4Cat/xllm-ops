@@ -217,11 +217,13 @@ python3 setup.py build_ext --inplace
 python3 -m pytest -q test_mega_gdn_mtp_decode.py
 ```
 
-该门禁共 39 例，直接通过 pybind 调用 `aclnnMegaGdnMtpDecode`，覆盖 K=1～16、
+该门禁共 42 例，其中 39 例直接通过 pybind 调用
+`aclnnMegaGdnMtpDecode`，覆盖 K=1～16、
 same-slot、Prefix Cache fork-slot、accepted 首/中/末、动态 key 100、
-K8 key 208、deferred Norm key 210～216，以及 Qwen3.5 各模型组的
-head geometry。所有 `conv_out`、Conv state、SSM checkpoint 和最终
-`out` 均与保留小算子 BF16 舍入点的 CPU Golden 对比。
+K8 key 208/308、deferred Norm key 210～216，以及 Qwen3.5 各模型组的
+head geometry；另外 3 例验证 A5 56/64/72 AIV 的 two-owner 映射。
+所有 `conv_out`、Conv state、SSM checkpoint 和最终 `out` 均与保留
+小算子 BF16 舍入点的参考链对比。
 
 ### 生成测试数据示例
 

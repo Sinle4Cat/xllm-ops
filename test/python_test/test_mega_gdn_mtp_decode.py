@@ -118,6 +118,7 @@ def _reference(
     write_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     norm_weight: torch.Tensor,
+    conv_output: torch.Tensor | None = None,
 ) -> MegaGdnMtpResult:
     batch_size, sequence_length, conv_dim = qkv.shape
     num_v_heads = z.size(2)
@@ -147,22 +148,25 @@ def _reference(
         write_slot = int(write_state_indices[batch_idx])
         accepted = int(num_accepted_tokens[batch_idx])
         read_conv = read_conv_snapshots[batch_idx]
-        history = read_conv[accepted - 1 : accepted + 2].float()
-        token_conv_outputs = []
-
-        for token_idx in range(sequence_length):
-            token = qkv[batch_idx, token_idx].float()
-            conv_acc = (
-                (history * conv_weight[:3].float()).sum(dim=0)
-                + token * conv_weight[3].float()
-            )
-            conv_fp32 = conv_acc * torch.reciprocal(
-                torch.exp(-conv_acc) + 1.0
-            )
-            token_conv_outputs.append(conv_fp32.to(torch.bfloat16))
-            history = torch.cat((history[1:], token.unsqueeze(0)), dim=0)
-
-        batch_conv = torch.stack(token_conv_outputs)
+        if conv_output is None:
+            history = read_conv[accepted - 1 : accepted + 2].float()
+            token_conv_outputs = []
+            for token_idx in range(sequence_length):
+                token = qkv[batch_idx, token_idx].float()
+                conv_acc = (
+                    (history * conv_weight[:3].float()).sum(dim=0)
+                    + token * conv_weight[3].float()
+                )
+                conv_fp32 = conv_acc * torch.reciprocal(
+                    torch.exp(-conv_acc) + 1.0
+                )
+                token_conv_outputs.append(conv_fp32.to(torch.bfloat16))
+                history = torch.cat(
+                    (history[1:], token.unsqueeze(0)), dim=0
+                )
+            batch_conv = torch.stack(token_conv_outputs)
+        else:
+            batch_conv = conv_output[batch_idx]
         conv_outputs.append(batch_conv)
         conv_state_out[write_slot, :2] = read_conv[
             accepted : accepted + 2
@@ -227,6 +231,44 @@ def _reference(
     )
 
 
+def _run_unfused_conv(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    batch_size, sequence_length, _ = inputs["qkv"].shape
+    read_state_indices = inputs["read_state_indices"].to(torch.int64)
+    conv_state = inputs["conv_state"].index_select(
+        0, read_state_indices
+    ).clone()
+    query_start_loc = tuple(
+        index * sequence_length for index in range(batch_size + 1)
+    )
+    cache_indices = tuple(range(batch_size))
+    num_accepted_tokens = tuple(
+        int(value) for value in inputs["num_accepted_tokens"]
+    )
+
+    conv_output = custom_ops.causal_conv1d(
+        inputs["qkv"].to("npu:0"),
+        inputs["conv_weight"].to("npu:0"),
+        conv_state.to("npu:0"),
+        None,
+        query_start_loc,
+        cache_indices,
+        (),
+        num_accepted_tokens,
+        1,
+        -1,
+        1,
+    )
+    torch.npu.synchronize()
+    return conv_output.cpu()
+
+
+def _expected_from_unfused_conv(
+    inputs: dict[str, torch.Tensor],
+) -> MegaGdnMtpResult:
+    conv_output = _run_unfused_conv(inputs)
+    return _reference(**inputs, conv_output=conv_output)
+
+
 def _run_npu(inputs: dict[str, torch.Tensor]) -> MegaGdnMtpResult:
     argument_names = (
         "qkv",
@@ -283,7 +325,7 @@ def test_k1_to_k16_matches_reference(speculative_tokens: int) -> None:
     same_slot = speculative_tokens % 2 == 0
     inputs = _make_inputs(speculative_tokens, same_slot=same_slot)
 
-    expected = _reference(**inputs)
+    expected = _expected_from_unfused_conv(inputs)
     actual = _run_npu(inputs)
 
     _assert_matches_reference(actual, expected)
@@ -308,13 +350,13 @@ def test_accepted_checkpoint_boundaries(
         accepted_values[accepted_position]
     )
 
-    expected = _reference(**inputs)
+    expected = _expected_from_unfused_conv(inputs)
     actual = _run_npu(inputs)
 
     _assert_matches_reference(actual, expected)
 
 
-def test_k8_key208_prefix_fork_matches_reference() -> None:
+def test_k8_qk_group_cache_prefix_fork_matches_reference() -> None:
     inputs = _make_inputs(
         8,
         batch_size=4,
@@ -326,10 +368,46 @@ def test_k8_key208_prefix_fork_matches_reference() -> None:
         (1, 3, 6, 9), dtype=torch.int32
     )
 
-    expected = _reference(**inputs)
+    expected = _expected_from_unfused_conv(inputs)
     actual = _run_npu(inputs)
 
     _assert_matches_reference(actual, expected)
+
+
+@pytest.mark.parametrize("aiv_count", (56, 64, 72))
+def test_k8_two_owner_schedule_covers_each_head_once(
+    aiv_count: int,
+) -> None:
+    group_count = 4 * 8
+    active_cores = min(aiv_count, 2 * group_count)
+    singleton_owner_count = active_cores - group_count
+    owner_tasks: list[list[tuple[int, int]]] = [
+        [] for _ in range(active_cores)
+    ]
+
+    for core_idx in range(active_cores):
+        if core_idx < group_count:
+            owner_tasks[core_idx].extend(
+                ((core_idx, 0), (core_idx, 1))
+            )
+            continue
+        singleton_idx = core_idx - group_count
+        for group_idx in range(
+            singleton_idx, group_count, singleton_owner_count
+        ):
+            owner_tasks[core_idx].append((group_idx, 2))
+
+    actual_tasks = sorted(
+        task for tasks in owner_tasks for task in tasks
+    )
+    expected_tasks = [
+        (group_idx, value_head_idx)
+        for group_idx in range(group_count)
+        for value_head_idx in range(3)
+    ]
+    assert actual_tasks == expected_tasks
+    assert max(map(len, owner_tasks)) == 2
+    assert active_cores == min(aiv_count, 64)
 
 
 @pytest.mark.parametrize(
@@ -352,7 +430,7 @@ def test_qwen35_model_head_geometries(
         same_slot=True,
     )
 
-    expected = _reference(**inputs)
+    expected = _expected_from_unfused_conv(inputs)
     actual = _run_npu(inputs)
 
     _assert_matches_reference(actual, expected)

@@ -36,8 +36,11 @@ ge::graphStatus GetShapeInfo(gert::TilingContext* context,
     const auto* convWeightShape = context->GetInputShape(4);
     const auto* convStateShape = context->GetInputShape(5);
     const auto* ssmStateShape = context->GetInputShape(8);
+    const auto* readStateIndicesShape = context->GetInputShape(9);
+    const auto* writeStateIndicesShape = context->GetInputShape(10);
     if (qkvShape == nullptr || zShape == nullptr || convWeightShape == nullptr ||
-        convStateShape == nullptr || ssmStateShape == nullptr) {
+        convStateShape == nullptr || ssmStateShape == nullptr ||
+        readStateIndicesShape == nullptr || writeStateIndicesShape == nullptr) {
         return ge::GRAPH_FAILED;
     }
 
@@ -46,9 +49,14 @@ ge::graphStatus GetShapeInfo(gert::TilingContext* context,
     const gert::Shape& convWeight = convWeightShape->GetStorageShape();
     const gert::Shape& convState = convStateShape->GetStorageShape();
     const gert::Shape& ssmState = ssmStateShape->GetStorageShape();
+    const gert::Shape& readStateIndices =
+        readStateIndicesShape->GetStorageShape();
+    const gert::Shape& writeStateIndices =
+        writeStateIndicesShape->GetStorageShape();
     if (qkv.GetDimNum() != 2 || z.GetDimNum() != 3 ||
         convWeight.GetDimNum() != 2 || convState.GetDimNum() != 3 ||
-        ssmState.GetDimNum() != 4) {
+        ssmState.GetDimNum() != 4 || readStateIndices.GetDimNum() != 1 ||
+        writeStateIndices.GetDimNum() != 1) {
         return ge::GRAPH_FAILED;
     }
 
@@ -67,7 +75,9 @@ ge::graphStatus GetShapeInfo(gert::TilingContext* context,
         ssmState.GetDim(0) != convState.GetDim(0) ||
         ssmState.GetDim(1) != numVHeads ||
         ssmState.GetDim(2) != kHeadDim ||
-        ssmState.GetDim(3) != kHeadDim) {
+        ssmState.GetDim(3) != kHeadDim ||
+        readStateIndices.GetDim(0) != batchSize ||
+        writeStateIndices.GetDim(0) != batchSize) {
         return ge::GRAPH_FAILED;
     }
 

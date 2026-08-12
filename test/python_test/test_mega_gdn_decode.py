@@ -33,7 +33,8 @@ def _reference_decode(
     a_log,
     dt_bias,
     ssm_state,
-    state_indices,
+    read_state_indices,
+    write_state_indices,
     norm_weight,
     num_k_heads,
     num_v_heads,
@@ -44,8 +45,9 @@ def _reference_decode(
     expected_ssm_state = ssm_state.clone()
 
     for batch_idx in range(batch_size):
-        state_idx = state_indices[batch_idx].item()
-        history = expected_conv_state[state_idx].float()
+        read_state_idx = read_state_indices[batch_idx].item()
+        write_state_idx = write_state_indices[batch_idx].item()
+        history = conv_state[read_state_idx].float()
         x = qkv[batch_idx].float()
         weights = conv_weight.float()
         conv_acc = weights[0] * history[0]
@@ -53,9 +55,9 @@ def _reference_decode(
         conv_acc = conv_acc + weights[2] * history[2]
         conv_acc = conv_acc + weights[3] * x
         conv_out[batch_idx] = F.silu(conv_acc).to(torch.bfloat16)
-        expected_conv_state[state_idx, 0] = expected_conv_state[state_idx, 1]
-        expected_conv_state[state_idx, 1] = expected_conv_state[state_idx, 2]
-        expected_conv_state[state_idx, 2] = qkv[batch_idx]
+        expected_conv_state[write_state_idx, 0] = conv_state[read_state_idx, 1]
+        expected_conv_state[write_state_idx, 1] = conv_state[read_state_idx, 2]
+        expected_conv_state[write_state_idx, 2] = qkv[batch_idx]
 
     q, k, v = torch.split(
         conv_out,
@@ -78,9 +80,10 @@ def _reference_decode(
     beta = torch.sigmoid(b.float())
     attention_out = torch.empty_like(v)
     for batch_idx in range(batch_size):
-        state_idx = state_indices[batch_idx].item()
+        read_state_idx = read_state_indices[batch_idx].item()
+        write_state_idx = write_state_indices[batch_idx].item()
         for head_idx in range(num_v_heads):
-            state = expected_ssm_state[state_idx, head_idx] * decay[
+            state = ssm_state[read_state_idx, head_idx] * decay[
                 batch_idx, head_idx
             ]
             prediction = torch.sum(state * k[batch_idx, head_idx, :, None], dim=0)
@@ -88,7 +91,7 @@ def _reference_decode(
                 batch_idx, head_idx
             ]
             state = state + k[batch_idx, head_idx, :, None] * delta[None, :]
-            expected_ssm_state[state_idx, head_idx] = state
+            expected_ssm_state[write_state_idx, head_idx] = state
             attention_out[batch_idx, head_idx] = torch.sum(
                 state * q[batch_idx, head_idx, :, None], dim=0
             )
@@ -133,6 +136,7 @@ def _run_case(num_k_heads, num_v_heads, batch_size):
         dt_bias,
         ssm_state,
         state_indices,
+        state_indices,
         norm_weight,
     )
     torch.npu.synchronize()
@@ -174,10 +178,13 @@ def test_representative_batch_shapes(num_k_heads, num_v_heads, batch_size):
     ("num_k_heads", "num_v_heads", "batch_size"),
     [(1, 2, 1), (2, 4, 2)],
 )
-def test_nonzero_inputs_match_reference(num_k_heads, num_v_heads, batch_size):
+@pytest.mark.parametrize("prefix_fork", [False, True])
+def test_nonzero_inputs_match_reference(
+    num_k_heads, num_v_heads, batch_size, prefix_fork
+):
     generator = torch.Generator().manual_seed(20260727)
     conv_dim = (2 * num_k_heads + num_v_heads) * HEAD_DIM
-    cache_slots = 3
+    cache_slots = batch_size + 2
 
     def randn(shape, scale, dtype=torch.bfloat16):
         return (torch.randn(shape, generator=generator) * scale).to(dtype)
@@ -193,8 +200,19 @@ def test_nonzero_inputs_match_reference(num_k_heads, num_v_heads, batch_size):
     ssm_state = randn(
         (cache_slots, num_v_heads, HEAD_DIM, HEAD_DIM), 0.02, torch.float32
     )
-    state_indices = torch.tensor([2, 0][:batch_size], dtype=torch.int32)
+    if prefix_fork:
+        read_state_indices = torch.zeros(batch_size, dtype=torch.int32)
+        write_state_indices = torch.arange(
+            2, 2 + batch_size, dtype=torch.int32
+        )
+    else:
+        read_state_indices = torch.tensor(
+            [1, 0][:batch_size], dtype=torch.int32
+        )
+        write_state_indices = read_state_indices
     norm_weight = 1 + randn((HEAD_DIM,), 0.05)
+    shared_conv_state = conv_state[0].clone() if prefix_fork else None
+    shared_ssm_state = ssm_state[0].clone() if prefix_fork else None
 
     expected = _reference_decode(
         qkv,
@@ -206,7 +224,8 @@ def test_nonzero_inputs_match_reference(num_k_heads, num_v_heads, batch_size):
         a_log,
         dt_bias,
         ssm_state,
-        state_indices,
+        read_state_indices,
+        write_state_indices,
         norm_weight,
         num_k_heads,
         num_v_heads,
@@ -223,7 +242,8 @@ def test_nonzero_inputs_match_reference(num_k_heads, num_v_heads, batch_size):
             a_log,
             dt_bias,
             ssm_state,
-            state_indices,
+            read_state_indices,
+            write_state_indices,
             norm_weight,
         )
     ]
@@ -235,3 +255,6 @@ def test_nonzero_inputs_match_reference(num_k_heads, num_v_heads, batch_size):
     torch.testing.assert_close(actual[1], expected[1], rtol=0.0, atol=0.0)
     torch.testing.assert_close(actual[2], expected[2], rtol=0.003, atol=0.0003)
     torch.testing.assert_close(actual[3], expected[3], rtol=0.05, atol=0.005)
+    if prefix_fork:
+        torch.testing.assert_close(actual[1][0], shared_conv_state)
+        torch.testing.assert_close(actual[2][0], shared_ssm_state)

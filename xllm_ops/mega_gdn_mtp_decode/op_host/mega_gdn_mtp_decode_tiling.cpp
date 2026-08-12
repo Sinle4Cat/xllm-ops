@@ -20,6 +20,7 @@ constexpr int64_t kMaxNumCacheSlots = 1024;
 constexpr uint64_t kRequiredUbBytes = 175360;
 constexpr uint64_t kQkGroupCacheRequiredUbBytes = 187936;
 constexpr uint64_t kQkGroupCacheTilingKey = 208;
+constexpr uint64_t kA5TwoOwnerQkGroupTilingKey = 308;
 constexpr int64_t kMinDeferredNormSpeculativeTokens = 10;
 constexpr uint64_t kDeferredNormRequiredUbBytes = 182816;
 constexpr uint64_t kDeferredNormTilingKeyBase = 200;
@@ -209,10 +210,27 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
       static_cast<uint32_t>(info.batch_size * info.num_v_heads);
   const uint32_t conv_tasks =
       static_cast<uint32_t>(info.conv_tile_count);
-  const uint32_t task_count = std::max(conv_tasks, recurrent_tasks);
-  const uint32_t used_aiv_cores = std::min(task_count, aiv_core_count);
   const bool is_ascend950 =
       platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
+  const bool is_qk_group_cache_shape =
+      info.speculative_tokens == 8 && info.batch_size == 4 &&
+      info.num_k_heads == 8 && info.num_v_heads == 24;
+  const uint32_t qk_group_count =
+      static_cast<uint32_t>(info.batch_size * info.num_k_heads);
+  const uint32_t min_two_owner_aiv_cores =
+      (recurrent_tasks + 1) / 2;
+  const uint32_t max_useful_two_owner_aiv_cores = 2 * qk_group_count;
+  const bool use_a5_two_owner_qk_group =
+      is_ascend950 && is_qk_group_cache_shape &&
+      aiv_core_count >= min_two_owner_aiv_cores &&
+      ub_size >= kQkGroupCacheRequiredUbBytes;
+  const uint32_t recurrent_dispatch_tasks =
+      use_a5_two_owner_qk_group
+          ? std::min(recurrent_tasks, max_useful_two_owner_aiv_cores)
+          : recurrent_tasks;
+  const uint32_t task_count =
+      std::max(conv_tasks, recurrent_dispatch_tasks);
+  const uint32_t used_aiv_cores = std::min(task_count, aiv_core_count);
   const uint32_t block_dim =
       is_ascend950
           ? used_aiv_cores
@@ -224,19 +242,21 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   const uint32_t launched_aiv_cores =
       is_ascend950 ? block_dim : block_dim * kAivPerA2A3MixedBlock;
   const bool use_qk_group_cache =
-      info.speculative_tokens == 8 && info.batch_size == 4 &&
-      info.num_k_heads == 8 && info.num_v_heads == 24 &&
+      is_qk_group_cache_shape &&
       launched_aiv_cores >= kQkGroupCacheRequiredAivCores &&
       ub_size >= kQkGroupCacheRequiredUbBytes;
   const bool use_deferred_norm =
       info.speculative_tokens >= kMinDeferredNormSpeculativeTokens &&
       ub_size >= kDeferredNormRequiredUbBytes;
-  const uint64_t tiling_key =
-      use_qk_group_cache ? kQkGroupCacheTilingKey
-      : use_deferred_norm
-          ? kDeferredNormTilingKeyBase +
-                static_cast<uint64_t>(info.speculative_tokens)
-          : GetTilingKey(info.speculative_tokens);
+  uint64_t tiling_key = GetTilingKey(info.speculative_tokens);
+  if (use_a5_two_owner_qk_group) {
+    tiling_key = kA5TwoOwnerQkGroupTilingKey;
+  } else if (use_qk_group_cache) {
+    tiling_key = kQkGroupCacheTilingKey;
+  } else if (use_deferred_norm) {
+    tiling_key = kDeferredNormTilingKeyBase +
+                 static_cast<uint64_t>(info.speculative_tokens);
+  }
 
   MegaGdnMtpDecodeTilingData tiling;
   tiling.set_batch_size(info.batch_size);

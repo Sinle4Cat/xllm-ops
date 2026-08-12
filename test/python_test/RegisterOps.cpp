@@ -1918,7 +1918,8 @@ mega_gdn_decode(
     const at::Tensor& a_log,
     const at::Tensor& dt_bias,
     at::Tensor& ssm_state,
-    const at::Tensor& state_indices,
+    const at::Tensor& read_state_indices,
+    const at::Tensor& write_state_indices,
     const at::Tensor& norm_weight) {
   at::Tensor conv_out = at::empty_like(qkv);
   at::Tensor out = at::empty_like(z);
@@ -1932,7 +1933,8 @@ mega_gdn_decode(
                a_log,
                dt_bias,
                ssm_state,
-               state_indices,
+               read_state_indices,
+               write_state_indices,
                norm_weight,
                conv_out,
                conv_state,

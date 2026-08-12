@@ -23,12 +23,18 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
 
 import custom_ops_lib
+
+pytestmark = pytest.mark.skipif(
+    torch_npu.npu.get_device_name(0).startswith("Ascend910B"),
+    reason="DispatchGmmCombineDecode supports only Ascend910_93 and Ascend950",
+)
 
 torch.manual_seed(42)
 torch_npu.npu.config.allow_internal_format = True
