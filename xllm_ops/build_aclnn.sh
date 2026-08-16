@@ -140,6 +140,7 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "causal_conv1d_qkv"
         "mega_gdn_decode"
         "mega_gdn_mtp_decode"
+        "mega_gdn_prefill_op"
         "convert_kv_cache_format"
         "beam_search"
         "index_group_matmul"
@@ -260,6 +261,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "causal_conv1d_qkv"
         "mega_gdn_decode"
         "mega_gdn_mtp_decode"
+        "mega_gdn_prefill_op"
         "convert_kv_cache_format"
         "beam_search"
         "index_group_matmul"
@@ -349,8 +351,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "moe_grouped_matmul_swiglu_quant"
         "pp_matmul_opt"
         "replace_token"
-        "mtp_prepare_next_draft"
         "reshape_and_cache_a5"
+        "mtp_prepare_next_draft"
         "select_unshared_kv"
         # "x_attention_tl"  # A5 kernel not adapted
         "x_flash_attention_infer"
@@ -359,6 +361,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
          "multi_latent_attention"
         "laser_attention"
         "mega_chunk_gdn"
+        "mega_gdn_prefill_op"
         "layer_norm_fwd"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
