@@ -23,6 +23,8 @@ BEGIN_TILING_DATA_DEF(ReshapeAndCacheA5TilingData)
   TILING_DATA_FIELD_DEF(uint32_t, row_elements);
   TILING_DATA_FIELD_DEF(uint32_t, total_slots);
   TILING_DATA_FIELD_DEF(uint32_t, tile_elements);
+  TILING_DATA_FIELD_DEF(uint32_t, physical_nz);
+  TILING_DATA_FIELD_DEF(uint32_t, block_size);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ReshapeAndCacheA5, ReshapeAndCacheA5TilingData)

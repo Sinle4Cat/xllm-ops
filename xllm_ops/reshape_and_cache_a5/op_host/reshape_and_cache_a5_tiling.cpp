@@ -61,12 +61,20 @@ ge::graphStatus TilingFunc(gert::TilingContext* context) {
       context->GetInputShape(kValueCacheInput)->GetStorageShape();
   const gert::Shape slot_shape =
       context->GetInputShape(kSlotMappingInput)->GetStorageShape();
+  const bool standard_layout =
+      key_shape.GetDimNum() == 3 && cache_shape.GetDimNum() == 4 &&
+      key_shape.GetDim(1) == cache_shape.GetDim(2) &&
+      key_shape.GetDim(2) == cache_shape.GetDim(3);
+  const bool physical_nz_layout =
+      key_shape.GetDimNum() == 3 && cache_shape.GetDimNum() == 4 &&
+      cache_shape.GetDim(3) == 16 &&
+      key_shape.GetDim(1) * key_shape.GetDim(2) ==
+          cache_shape.GetDim(1) * cache_shape.GetDim(3);
   if (key_shape.GetDimNum() != 3 || cache_shape.GetDimNum() != 4 ||
       slot_shape.GetDimNum() != 1 || !ShapesMatch(key_shape, value_shape) ||
       !ShapesMatch(cache_shape, value_cache_shape) ||
       key_shape.GetDim(0) != slot_shape.GetDim(0) ||
-      key_shape.GetDim(1) != cache_shape.GetDim(2) ||
-      key_shape.GetDim(2) != cache_shape.GetDim(3) ||
+      (!standard_layout && !physical_nz_layout) ||
       key_shape.GetDim(1) <= 0 || key_shape.GetDim(2) <= 0 ||
       cache_shape.GetDim(0) <= 0 || cache_shape.GetDim(1) <= 0) {
     return ge::GRAPH_FAILED;
@@ -75,8 +83,10 @@ ge::graphStatus TilingFunc(gert::TilingContext* context) {
   const uint32_t num_tokens = static_cast<uint32_t>(key_shape.GetDim(0));
   const uint32_t row_elements =
       static_cast<uint32_t>(key_shape.GetDim(1) * key_shape.GetDim(2));
-  const uint32_t total_slots =
-      static_cast<uint32_t>(cache_shape.GetDim(0) * cache_shape.GetDim(1));
+  const uint32_t block_size = static_cast<uint32_t>(
+      physical_nz_layout ? cache_shape.GetDim(2) : cache_shape.GetDim(1));
+  const uint32_t total_slots = static_cast<uint32_t>(
+      cache_shape.GetDim(0) * static_cast<int64_t>(block_size));
 
   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
   uint64_t ub_bytes = 0;
@@ -100,6 +110,8 @@ ge::graphStatus TilingFunc(gert::TilingContext* context) {
   tiling.set_row_elements(row_elements);
   tiling.set_total_slots(total_slots);
   tiling.set_tile_elements(tile_elements);
+  tiling.set_physical_nz(physical_nz_layout ? 1U : 0U);
+  tiling.set_block_size(block_size);
 
   const uint32_t aiv_num = platform.GetCoreNumAiv();
   context->SetBlockDim(std::max(1U, std::min(num_tokens, aiv_num)));

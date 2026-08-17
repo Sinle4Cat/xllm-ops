@@ -339,6 +339,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "x_attention"
         "cache_unshared_kv"
         "causal_conv1d"
+        "causal_conv1d_graph_a5"
         "causal_conv1d_qkv"
         "mega_gdn_decode"
         "mega_gdn_mtp_decode"

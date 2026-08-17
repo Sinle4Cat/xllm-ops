@@ -60,20 +60,35 @@ class ReshapeAndCacheA5Kernel {
       }
       const uint64_t source_offset =
           static_cast<uint64_t>(token) * tiling_.row_elements;
-      const uint64_t cache_offset =
-          static_cast<uint64_t>(slot) * tiling_.row_elements;
-      CopyRow(key_gm_,
-              key_cache_gm_,
-              source_offset,
-              cache_offset,
-              mte2_to_mte3,
-              mte3_to_mte2);
-      CopyRow(value_gm_,
-              value_cache_gm_,
-              source_offset,
-              cache_offset,
-              mte2_to_mte3,
-              mte3_to_mte2);
+      if (tiling_.physical_nz != 0U) {
+        CopyRowPhysicalNz(key_gm_,
+                          key_cache_gm_,
+                          source_offset,
+                          static_cast<uint32_t>(slot),
+                          mte2_to_mte3,
+                          mte3_to_mte2);
+        CopyRowPhysicalNz(value_gm_,
+                          value_cache_gm_,
+                          source_offset,
+                          static_cast<uint32_t>(slot),
+                          mte2_to_mte3,
+                          mte3_to_mte2);
+      } else {
+        const uint64_t cache_offset =
+            static_cast<uint64_t>(slot) * tiling_.row_elements;
+        CopyRow(key_gm_,
+                key_cache_gm_,
+                source_offset,
+                cache_offset,
+                mte2_to_mte3,
+                mte3_to_mte2);
+        CopyRow(value_gm_,
+                value_cache_gm_,
+                source_offset,
+                cache_offset,
+                mte2_to_mte3,
+                mte3_to_mte2);
+      }
     }
   }
 
@@ -100,6 +115,39 @@ class ReshapeAndCacheA5Kernel {
       SetFlag<HardEvent::MTE3_MTE2>(mte3_to_mte2);
       WaitFlag<HardEvent::MTE3_MTE2>(mte3_to_mte2);
       copied += elements;
+    }
+  }
+
+  __aicore__ inline void CopyRowPhysicalNz(const GlobalTensor<T>& source,
+                                           GlobalTensor<T>& destination,
+                                           uint64_t source_offset,
+                                           uint32_t slot,
+                                           TEventID mte2_to_mte3,
+                                           TEventID mte3_to_mte2) {
+    constexpr uint32_t kNzInner = 16;
+    LocalTensor<T> local = copy_buffer_.Get<T>();
+    const uint32_t block = slot / tiling_.block_size;
+    const uint32_t block_offset = slot % tiling_.block_size;
+    const uint32_t group_count = tiling_.row_elements / kNzInner;
+    DataCopyExtParams copy_params = {
+        1, static_cast<uint32_t>(kNzInner * sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> pad_params = {false, 0, 0, 0};
+    for (uint32_t group = 0; group < group_count; ++group) {
+      const uint64_t destination_offset =
+          ((static_cast<uint64_t>(block) * group_count + group) *
+               tiling_.block_size +
+           block_offset) *
+          kNzInner;
+      DataCopyPad(local,
+                  source[source_offset +
+                         static_cast<uint64_t>(group) * kNzInner],
+                  copy_params,
+                  pad_params);
+      SetFlag<HardEvent::MTE2_MTE3>(mte2_to_mte3);
+      WaitFlag<HardEvent::MTE2_MTE3>(mte2_to_mte3);
+      DataCopyPad(destination[destination_offset], local, copy_params);
+      SetFlag<HardEvent::MTE3_MTE2>(mte3_to_mte2);
+      WaitFlag<HardEvent::MTE3_MTE2>(mte3_to_mte2);
     }
   }
 

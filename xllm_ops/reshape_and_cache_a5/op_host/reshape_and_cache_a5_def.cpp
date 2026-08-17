@@ -21,20 +21,22 @@ class ReshapeAndCacheA5 : public OpDef {
   explicit ReshapeAndCacheA5(const char* name) : OpDef(name) {
     const std::initializer_list<ge::DataType> cache_types = {ge::DT_FLOAT16,
                                                              ge::DT_BF16};
-    const std::initializer_list<ge::Format> cache_formats = {ge::FORMAT_ND,
+    const std::initializer_list<ge::Format> input_formats = {ge::FORMAT_ND,
                                                              ge::FORMAT_ND};
+    const std::initializer_list<ge::Format> cache_formats = {
+        ge::FORMAT_FRACTAL_NZ, ge::FORMAT_FRACTAL_NZ};
 
     this->Input("key")
         .ParamType(REQUIRED)
         .DataType(cache_types)
-        .Format(cache_formats)
-        .UnknownShapeFormat(cache_formats)
+        .Format(input_formats)
+        .UnknownShapeFormat(input_formats)
         .AutoContiguous();
     this->Input("value")
         .ParamType(REQUIRED)
         .DataType(cache_types)
-        .Format(cache_formats)
-        .UnknownShapeFormat(cache_formats)
+        .Format(input_formats)
+        .UnknownShapeFormat(input_formats)
         .AutoContiguous();
     this->Input("keyCache")
         .ParamType(REQUIRED)
@@ -49,8 +51,8 @@ class ReshapeAndCacheA5 : public OpDef {
     this->Input("slotMapping")
         .ParamType(REQUIRED)
         .DataType({ge::DT_INT32, ge::DT_INT32})
-        .Format(cache_formats)
-        .UnknownShapeFormat(cache_formats)
+        .Format(input_formats)
+        .UnknownShapeFormat(input_formats)
         .AutoContiguous();
     this->Output("keyCacheOut")
         .ParamType(REQUIRED)
