@@ -8,7 +8,7 @@ struct MegaGdnDecodeTilingData {
     int64_t num_v_heads;
 };
 
-template <bool IsBatchOne>
+template <bool IsBatchOne, bool FlaSsmStateLayout>
 AICORE PTO_INLINE void RunMegaGdnDecode(
     GM_ADDR qkv, GM_ADDR z, GM_ADDR b, GM_ADDR a, GM_ADDR convWeight,
     GM_ADDR convState, GM_ADDR aLog, GM_ADDR dtBias, GM_ADDR ssmState,
@@ -17,7 +17,7 @@ AICORE PTO_INLINE void RunMegaGdnDecode(
     GM_ADDR convStateOut, GM_ADDR ssmStateOut, GM_ADDR out,
     int32_t numKHeads, int32_t numVHeads, int32_t batchSize)
 {
-    qwen35_decode_pto::Run<IsBatchOne>(
+    qwen35_decode_pto::Run<IsBatchOne, FlaSsmStateLayout>(
         reinterpret_cast<__gm__ bfloat16_t *>(qkv),
         reinterpret_cast<__gm__ bfloat16_t *>(z),
         reinterpret_cast<__gm__ bfloat16_t *>(b),
@@ -56,7 +56,7 @@ extern "C" __global__ __aicore__ void mega_gdn_decode(
     (void)workspace;
 
     if constexpr (TILING_KEY_IS(2)) {
-        RunMegaGdnDecode<true>(
+        RunMegaGdnDecode<true, true>(
             qkv, z, b, a, convWeight, convState, aLog, dtBias, ssmState,
             readStateIndices, writeStateIndices, normWeight, convOut,
             convStateOut, ssmStateOut, out,
@@ -64,7 +64,22 @@ extern "C" __global__ __aicore__ void mega_gdn_decode(
             static_cast<int32_t>(tilingData.num_v_heads), 1);
     } else if constexpr (TILING_KEY_IS(1)) {
         const int32_t batchSize = static_cast<int32_t>(tilingData.batch_size);
-        RunMegaGdnDecode<false>(
+        RunMegaGdnDecode<false, true>(
+            qkv, z, b, a, convWeight, convState, aLog, dtBias, ssmState,
+            readStateIndices, writeStateIndices, normWeight, convOut,
+            convStateOut, ssmStateOut, out,
+            static_cast<int32_t>(tilingData.num_k_heads),
+            static_cast<int32_t>(tilingData.num_v_heads), batchSize);
+    } else if constexpr (TILING_KEY_IS(12)) {
+        RunMegaGdnDecode<true, false>(
+            qkv, z, b, a, convWeight, convState, aLog, dtBias, ssmState,
+            readStateIndices, writeStateIndices, normWeight, convOut,
+            convStateOut, ssmStateOut, out,
+            static_cast<int32_t>(tilingData.num_k_heads),
+            static_cast<int32_t>(tilingData.num_v_heads), 1);
+    } else if constexpr (TILING_KEY_IS(11)) {
+        const int32_t batchSize = static_cast<int32_t>(tilingData.batch_size);
+        RunMegaGdnDecode<false, false>(
             qkv, z, b, a, convWeight, convState, aLog, dtBias, ssmState,
             readStateIndices, writeStateIndices, normWeight, convOut,
             convStateOut, ssmStateOut, out,

@@ -26,6 +26,8 @@ constexpr uint64_t kDeferredNormRequiredUbBytes = 182816;
 constexpr uint64_t kDeferredNormTilingKeyBase = 200;
 constexpr uint32_t kQkGroupCacheRequiredAivCores = 32;
 constexpr uint32_t kAivPerA2A3MixedBlock = 2;
+constexpr size_t kFlaSsmStateLayoutAttr = 0;
+constexpr uint64_t kNonFlaTilingKeyOffset = 1000;
 
 enum InputIndex : size_t {
   kQkv = 0,
@@ -206,6 +208,14 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   }
   const uint32_t aic_core_count = platform.GetCoreNumAic();
   const uint32_t aiv_core_count = platform.GetCoreNumAiv();
+  const auto* attrs = context->GetAttrs();
+  const bool* fla_ssm_state_layout =
+      attrs == nullptr
+          ? nullptr
+          : attrs->GetAttrPointer<bool>(kFlaSsmStateLayoutAttr);
+  if (fla_ssm_state_layout == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
   const uint32_t recurrent_tasks =
       static_cast<uint32_t>(info.batch_size * info.num_v_heads);
   const uint32_t conv_tasks =
@@ -221,7 +231,7 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
       (recurrent_tasks + 1) / 2;
   const uint32_t max_useful_two_owner_aiv_cores = 2 * qk_group_count;
   const bool use_a5_two_owner_qk_group =
-      is_ascend950 && is_qk_group_cache_shape &&
+      *fla_ssm_state_layout && is_ascend950 && is_qk_group_cache_shape &&
       aiv_core_count >= min_two_owner_aiv_cores &&
       ub_size >= kQkGroupCacheRequiredUbBytes;
   const uint32_t recurrent_dispatch_tasks =
@@ -242,10 +252,11 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   const uint32_t launched_aiv_cores =
       is_ascend950 ? block_dim : block_dim * kAivPerA2A3MixedBlock;
   const bool use_qk_group_cache =
-      is_qk_group_cache_shape &&
+      *fla_ssm_state_layout && is_qk_group_cache_shape &&
       launched_aiv_cores >= kQkGroupCacheRequiredAivCores &&
       ub_size >= kQkGroupCacheRequiredUbBytes;
   const bool use_deferred_norm =
+      *fla_ssm_state_layout &&
       info.speculative_tokens >= kMinDeferredNormSpeculativeTokens &&
       ub_size >= kDeferredNormRequiredUbBytes;
   uint64_t tiling_key = GetTilingKey(info.speculative_tokens);
@@ -256,6 +267,9 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   } else if (use_deferred_norm) {
     tiling_key = kDeferredNormTilingKeyBase +
                  static_cast<uint64_t>(info.speculative_tokens);
+  }
+  if (!*fla_ssm_state_layout) {
+    tiling_key += kNonFlaTilingKeyOffset;
   }
 
   MegaGdnMtpDecodeTilingData tiling;

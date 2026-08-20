@@ -119,6 +119,7 @@ def _reference(
     num_accepted_tokens: torch.Tensor,
     norm_weight: torch.Tensor,
     conv_output: torch.Tensor | None = None,
+    fla_ssm_state_layout: bool = True,
 ) -> MegaGdnMtpResult:
     batch_size, sequence_length, conv_dim = qkv.shape
     num_v_heads = z.size(2)
@@ -190,7 +191,12 @@ def _reference(
         q = q.repeat_interleave(repeats, dim=1)
         k = k.repeat_interleave(repeats, dim=1)
 
-        state = read_ssm_snapshots[batch_idx].float()
+        stored_state = read_ssm_snapshots[batch_idx].float()
+        state = (
+            stored_state
+            if fla_ssm_state_layout
+            else stored_state.transpose(-1, -2)
+        )
         token_outputs = []
         for token_idx in range(sequence_length):
             g = (
@@ -210,7 +216,11 @@ def _reference(
             readout = torch.einsum("hkv,hk->hv", state, q[token_idx])
 
             checkpoint = write_slot * state_stride + token_idx
-            ssm_state_out[checkpoint] = state
+            ssm_state_out[checkpoint] = (
+                state
+                if fla_ssm_state_layout
+                else state.transpose(-1, -2)
+            )
 
             norm_input = readout.to(torch.bfloat16).float()
             rms_inv = torch.rsqrt(
@@ -264,12 +274,20 @@ def _run_unfused_conv(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def _expected_from_unfused_conv(
     inputs: dict[str, torch.Tensor],
+    fla_ssm_state_layout: bool = True,
 ) -> MegaGdnMtpResult:
     conv_output = _run_unfused_conv(inputs)
-    return _reference(**inputs, conv_output=conv_output)
+    return _reference(
+        **inputs,
+        conv_output=conv_output,
+        fla_ssm_state_layout=fla_ssm_state_layout,
+    )
 
 
-def _run_npu(inputs: dict[str, torch.Tensor]) -> MegaGdnMtpResult:
+def _run_npu(
+    inputs: dict[str, torch.Tensor],
+    fla_ssm_state_layout: bool = True,
+) -> MegaGdnMtpResult:
     argument_names = (
         "qkv",
         "z",
@@ -289,7 +307,8 @@ def _run_npu(inputs: dict[str, torch.Tensor]) -> MegaGdnMtpResult:
         name: tensor.to("npu:0") for name, tensor in inputs.items()
     }
     actual = custom_ops.mega_gdn_mtp_decode(
-        *(device_inputs[name] for name in argument_names)
+        *(device_inputs[name] for name in argument_names),
+        fla_ssm_state_layout,
     )
     torch.npu.synchronize()
     return MegaGdnMtpResult(*(tensor.cpu() for tensor in actual))
@@ -327,6 +346,68 @@ def test_k1_to_k16_matches_reference(speculative_tokens: int) -> None:
 
     expected = _expected_from_unfused_conv(inputs)
     actual = _run_npu(inputs)
+
+    _assert_matches_reference(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "speculative_tokens", SUPPORTED_SPECULATIVE_TOKENS
+)
+def test_non_fla_k1_to_k16_matches_reference(
+    speculative_tokens: int,
+) -> None:
+    inputs = _make_inputs(
+        speculative_tokens,
+        batch_size=2,
+        same_slot=speculative_tokens % 2 == 0,
+    )
+
+    expected = _expected_from_unfused_conv(
+        inputs, fla_ssm_state_layout=False
+    )
+    actual = _run_npu(inputs, fla_ssm_state_layout=False)
+
+    _assert_matches_reference(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "speculative_tokens", "same_slot"),
+    (
+        (4, 1, False),
+        (4, 8, True),
+        (4, 16, False),
+        (8, 1, True),
+        (8, 8, False),
+        (8, 16, True),
+    ),
+    ids=(
+        "b4-k1-fork",
+        "b4-k8-same",
+        "b4-k16-fork",
+        "b8-k1-same",
+        "b8-k8-fork",
+        "b8-k16-same",
+    ),
+)
+def test_non_fla_dense_mixed_batch_matches_reference(
+    batch_size: int,
+    speculative_tokens: int,
+    same_slot: bool,
+) -> None:
+    inputs = _make_inputs(
+        speculative_tokens,
+        batch_size=batch_size,
+        same_slot=same_slot,
+    )
+    sequence_length = speculative_tokens + 1
+    inputs["num_accepted_tokens"] = (
+        torch.arange(batch_size, dtype=torch.int32) % sequence_length + 1
+    )
+
+    expected = _expected_from_unfused_conv(
+        inputs, fla_ssm_state_layout=False
+    )
+    actual = _run_npu(inputs, fla_ssm_state_layout=False)
 
     _assert_matches_reference(actual, expected)
 

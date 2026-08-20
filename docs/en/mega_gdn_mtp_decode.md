@@ -88,6 +88,19 @@ out_t = RMSNorm(BF16_RINT(o_t), norm_weight, eps=1e-6)
 to its write checkpoint immediately. The next token consumes the state that
 remains in UB instead of reloading it from GM.
 
+The recurrent math always uses the logical `H[K,V]` layout. With
+`flaSsmStateLayout=true`, GM stores that layout directly; with `false`, GM stores
+its transpose `H^T[V,K]`. The non-FLA PTO path directly evaluates:
+
+```text
+pred = H_stored * k
+H_stored += delta * k^T
+out = H_stored * q
+```
+
+No physical `128 x 128` transpose is required. Both layouts use the same
+checkpoint indices, convolution state, and BF16 rounding boundaries.
+
 ## Parameters
 
 All tensors use the ND format and must be contiguous.
@@ -107,6 +120,7 @@ All tensors use the ND format and must be contiguous.
 | `writeStateIndices` | Input | INT32 | `[B]` | State slot written by each batch item |
 | `numAcceptedTokens` | Input | INT32 | `[B]` | Previous accepted count in `[1,S]` |
 | `normWeight` | Input | BF16 | `[D]` | RMSNorm weight |
+| `flaSsmStateLayout` | Attribute | BOOL | Scalar | `true` stores `[K,V]`; `false` stores `[V,K]`; defaults to `true` |
 | `convOut` | Output | BF16 | `[B,S,C]` | Convolution output at the BF16 rounding boundary |
 | `convStateOut` | Output | BF16 | `[N,L,C]` | Receives updated convolution-state write slots |
 | `ssmStateOut` | Output | FP32 | `[N*S,NV,D,D]` | Receives updated per-token write checkpoints |
@@ -206,11 +220,16 @@ The current host tiling supports:
 | 308 | Same shape as key 208, on Ascend 950 with sufficient AIV/UB | A5 two-owner Q/K-group scheduling |
 | 210-216 | `K=10-16` with at least 182,816 bytes of UB | Static K with deferred Norm |
 | 100 | Other supported K values or insufficient specialized-key resources | Dynamic-K fallback |
+| 1101-1105, 1108 | non-FLA with `K=1-5,8` | Static non-FLA K path |
+| 1100 | Other supported non-FLA K values | Dynamic non-FLA K path |
 
 Key 308 is compiled and dispatched only under `PTO_NPU_ARCH_A5`. A2 and A3
 do not contain this device branch and retain the mixed AIC/AIV path; A5 uses
 the AIV-only path. Consequently, A5-specific optimization must not change A2
 or A3 device code.
+
+The non-FLA layout currently disables the FLA-only Q/K group cache, deferred
+Norm, and A5 two-owner specializations.
 
 ### Block scheduling
 

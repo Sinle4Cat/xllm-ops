@@ -184,6 +184,24 @@ AICORE PTO_INLINE void Silu(TileUbDataND<T, Rows, Cols> &dst,
 }
 
 template <typename T, int32_t Rows, int32_t Cols>
+AICORE PTO_INLINE void CausalConvSilu(TileUbDataND<T, Rows, Cols> &dst,
+                                      TileUbDataND<T, Rows, Cols> &src,
+                                      TileUbDataND<T, Rows, Cols> &tmp)
+{
+    TMOV(tmp, src);
+    VectorBarrier();
+    TMULS(src, src, -1);
+    VectorBarrier();
+    TEXP(src, src);
+    VectorBarrier();
+    TADDS(src, src, 1);
+    VectorBarrier();
+    // Numerical contract: match AscendC::Silu at the CausalConv BF16
+    // hand-off; reciprocal followed by multiply can cross a BF16 midpoint.
+    TDIV(dst, tmp, src);
+}
+
+template <typename T, int32_t Rows, int32_t Cols>
 AICORE PTO_INLINE void MulAddDst(TileUbDataND<T, Rows, Cols> &dst,
                                  TileUbDataND<T, Rows, Cols> &src0,
                                  TileUbDataND<T, Rows, Cols> &src1,
@@ -241,31 +259,22 @@ __tf__ PTO_INTERNAL void ColSum128Impl(typename TileDst::TileDType __out__ dst,
         reinterpret_cast<__ubuf__ float *>(__cce_get_tile_ptr(dst));
     __ubuf__ float *srcPtr =
         reinterpret_cast<__ubuf__ float *>(__cce_get_tile_ptr(src));
-    __ubuf__ float *tmpPtr =
-        reinterpret_cast<__ubuf__ float *>(__cce_get_tile_ptr(tmp));
+    (void)tmp;
 
-    set_mask_count();
-    set_vector_mask(0, 128);
-    for (uint32_t i = 0; i < 64; ++i) {
-        vadd(srcPtr + i * 128, srcPtr + 2 * i * 128,
-             srcPtr + (2 * i + 1) * 128, 0, 1, 1, 1, 8, 8, 8);
-    }
-    VectorBarrier();
     set_mask_norm();
     set_vector_mask(-1, -1);
-#define QWEN35_COLSUM_STAGE(stage_dst, stage_src, rows)                       \
-    vadd(stage_dst, stage_src, stage_src + 128, (rows) / 2,                  \
-         1, 1, 1, 16, 32, 32);                                               \
-    vadd(stage_dst + 64, stage_src + 64, stage_src + 192, (rows) / 2,        \
-         1, 1, 1, 16, 32, 32);                                               \
+#define QWEN35_COLSUM_BUTTERFLY_STAGE(rows)                                  \
+    vadd(srcPtr, srcPtr, srcPtr + (rows) * 128, (rows) * 2,                  \
+         1, 1, 1, 8, 8, 8);                                                  \
     VectorBarrier()
-    QWEN35_COLSUM_STAGE(tmpPtr, srcPtr, 64);
-    QWEN35_COLSUM_STAGE(srcPtr, tmpPtr, 32);
-    QWEN35_COLSUM_STAGE(tmpPtr, srcPtr, 16);
-    QWEN35_COLSUM_STAGE(srcPtr, tmpPtr, 8);
-    QWEN35_COLSUM_STAGE(tmpPtr, srcPtr, 4);
-    QWEN35_COLSUM_STAGE(srcPtr, tmpPtr, 2);
-#undef QWEN35_COLSUM_STAGE
+    QWEN35_COLSUM_BUTTERFLY_STAGE(64);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(32);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(16);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(8);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(4);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(2);
+    QWEN35_COLSUM_BUTTERFLY_STAGE(1);
+#undef QWEN35_COLSUM_BUTTERFLY_STAGE
     copy_ubuf_to_ubuf(dstPtr, srcPtr, 0, 1, 16, 0, 0);
     VectorBarrier();
 }
@@ -276,9 +285,9 @@ AICORE PTO_INLINE void ColSum128(TileDst &dst, TileSrc &src, TileTmp &tmp)
 {
 #if defined(PTO_NPU_ARCH_A5)
     (void)tmp;
-    // Match the A5 Triton lowering of tl.sum(axis=0): a butterfly tree with
-    // descending row strides. The product tile is dead after the reduction,
-    // so each stage can compact its partial sums into the lower rows in place.
+    // Contract: TileLang lowers tl.sum(axis=0) for [128, 64] to a butterfly
+    // tree with descending row strides on both 910B and A5. The product tile
+    // is dead after reduction, so compact partial sums into its lower rows.
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(src.data());
     constexpr std::uintptr_t rowBytes = 128 * sizeof(float);
     TileUbDataND<float, 64, 128> low64;
@@ -336,6 +345,90 @@ AICORE PTO_INLINE void ColSum128(TileDst &dst, TileSrc &src, TileTmp &tmp)
 #endif
 }
 
+template <typename TileDst, typename TileSrc, typename TileTmp>
+AICORE PTO_INLINE void RowSum128(TileDst &dst, TileSrc &src, TileTmp &tmp)
+{
+    const std::uintptr_t srcBase =
+        reinterpret_cast<std::uintptr_t>(src.data());
+    const std::uintptr_t dstBase =
+        reinterpret_cast<std::uintptr_t>(dst.data());
+    constexpr std::uintptr_t kHalfStateBytes =
+        64 * 128 * sizeof(float);
+    constexpr std::uintptr_t kHalfOutputBytes = 64 * sizeof(float);
+
+    TileUbDataND<float, 64, 128> srcLow;
+    TASSIGN(srcLow, srcBase);
+    TileUbDataDN<float, 64, 1> dstLow;
+    TASSIGN(dstLow, dstBase);
+    TROWSUM(dstLow, srcLow, tmp);
+    VectorBarrier();
+
+    TileUbDataND<float, 64, 128> srcHigh;
+    TASSIGN(srcHigh, srcBase + kHalfStateBytes);
+    TileUbDataDN<float, 64, 1> dstHigh;
+    TASSIGN(dstHigh, dstBase + kHalfOutputBytes);
+    TROWSUM(dstHigh, srcHigh, tmp);
+    VectorBarrier();
+}
+
+template <bool FlaSsmStateLayout>
+AICORE PTO_INLINE void StateVectorProduct128(
+    TileUbDataND<float, 1, 128> &dst,
+    TileUbDataND<float, 128, 128> &state,
+    TileUbDataND<float, 1, 128> &vector,
+    TileUbDataND<float, 128, 128> &compute,
+    TileUbDataND<float, 32, 128> &reduceTmp)
+{
+    if constexpr (FlaSsmStateLayout) {
+        TileUbDataDN<float, 128, 1> vectorDn;
+        TASSIGN(vectorDn,
+                reinterpret_cast<std::uintptr_t>(vector.data()));
+        TROWEXPANDMUL(compute, state, vectorDn);
+        VectorBarrier();
+        ColSum128(dst, compute, reduceTmp);
+    } else {
+        TCOLEXPANDMUL(compute, state, vector);
+        VectorBarrier();
+        RowSum128(dst, compute, reduceTmp);
+    }
+}
+
+template <bool FlaSsmStateLayout>
+AICORE PTO_INLINE void StateRankOneUpdate128(
+    TileUbDataND<float, 128, 128> &state,
+    TileUbDataND<float, 1, 128> &key,
+    TileUbDataND<float, 1, 128> &delta,
+    TileUbDataND<float, 128, 128> &compute)
+{
+    if constexpr (FlaSsmStateLayout) {
+        TileUbDataDN<float, 128, 1> keyDn;
+        TASSIGN(keyDn, reinterpret_cast<std::uintptr_t>(key.data()));
+#if defined(PTO_NPU_ARCH_A5)
+        TROWEXPAND(compute, keyDn);
+        VectorBarrier();
+        TCOLEXPANDMUL(compute, compute, delta);
+        VectorBarrier();
+        TADD(state, state, compute);
+#else
+        OuterProductAdd128(state, delta, keyDn);
+#endif
+    } else {
+        TileUbDataDN<float, 128, 1> deltaDn;
+        TASSIGN(deltaDn,
+                reinterpret_cast<std::uintptr_t>(delta.data()));
+#if defined(PTO_NPU_ARCH_A5)
+        TROWEXPAND(compute, deltaDn);
+        VectorBarrier();
+        TCOLEXPANDMUL(compute, compute, key);
+        VectorBarrier();
+        TADD(state, state, compute);
+#else
+        OuterProductAdd128(state, key, deltaDn);
+#endif
+    }
+    VectorBarrier();
+}
+
 template <bool ApplyQScale>
 AICORE PTO_INLINE void NormalizeQk128(
     TileUbDataND<float, 1, 128> &row,
@@ -360,22 +453,21 @@ AICORE PTO_INLINE void NormalizeQk128(
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
     const float norm = scalar_tmp.GetValue(0);
+    // Contract: TileLang lowers q / sqrt(sum(q * q) + eps) as a direct
+    // vector division. On 910B, in-place TDIVS takes a reciprocal+vmuls
+    // shortcut, so use the dead square buffer as a non-alias destination to
+    // preserve vdiv rounding.
 #if defined(PTO_NPU_ARCH_A5)
-    // Triton lowers q / sqrt(sum(q * q) + eps) as a direct vector/scalar
-    // division. Keep that rounding path instead of precomputing a reciprocal
-    // on the scalar pipeline and multiplying the vector by it.
     TDIVS(row, row, norm);
 #else
-    TMULS(row, row, 1.0f / norm);
+    TDIVS(norm_sq, row, norm);
+    VectorBarrier();
+    TMOV(row, norm_sq);
 #endif
     if constexpr (ApplyQScale) {
         VectorBarrier();
-#if defined(PTO_NPU_ARCH_A5)
-        // Exact FP32 rounding of 1 / sqrt(128), matching Triton's scale.
+        // Exact FP32 rounding of 1 / sqrt(128), matching TileLang's scale.
         TMULS(row, row, 0.0883883461356163f);
-#else
-        TMULS(row, row, 8.838835e-02f);
-#endif
     }
 }
 
@@ -525,7 +617,7 @@ AICORE PTO_INLINE void ComputeAndStoreConvBatch(
     VectorBarrier();
     TileUbDataND<float, 1, 128> silu_tmp;
     TASSIGN(silu_tmp, kConvVectorScratch);
-    Silu<float, 1, 128>(conv_y, conv_acc, silu_tmp);
+    CausalConvSilu<float, 1, 128>(conv_y, conv_acc, silu_tmp);
     VectorBarrier();
     TCVT(y_half, conv_y, RoundMode::CAST_RINT);
     TCVT(save_half0, hist1, RoundMode::CAST_RINT);
@@ -548,7 +640,7 @@ AICORE PTO_INLINE void ComputeAndStoreConvBatch(
 // The generated PTO kernel body follows. The tile shape stays fixed while
 // model-dependent tensor strides and loop bounds come from host tiling data.
 
-template <bool IsBatchOne>
+template <bool IsBatchOne, bool FlaSsmStateLayout>
 AICORE PTO_INLINE void Run(
     __gm__ bfloat16_t *qkv_handle, __gm__ bfloat16_t *z_handle,
     __gm__ bfloat16_t *b_handle, __gm__ bfloat16_t *a_handle,
@@ -948,7 +1040,7 @@ AICORE PTO_INLINE void Run(
       qwen35_decode_pto::TileUbDataND<float, 1, 128>
           conv_y_temp_0_silu_tmp;
       TASSIGN(conv_y_temp_0_silu_tmp, kUbVectorScratch);
-      qwen35_decode_pto::Silu<float, 1, 128>(
+      qwen35_decode_pto::CausalConvSilu<float, 1, 128>(
           conv_y, conv_acc, conv_y_temp_0_silu_tmp);
       VectorBarrier();
       TCVT(y_half, conv_y, RoundMode::CAST_RINT);
@@ -1352,41 +1444,16 @@ AICORE PTO_INLINE void Run(
     TCVT(v_fp32, v_half, RoundMode::CAST_NONE);
     TMULS(h_vec, h_vec, decay);
     VectorBarrier();
-    {
-      qwen35_decode_pto::TileUbDataDN<float, 128, 1, 128, 1> k_row;
-      TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_fp32.data()));
-      TROWEXPANDMUL(compute_buf, h_vec, k_row);
-    }
-    VectorBarrier();
-    qwen35_decode_pto::ColSum128(
-        pred, compute_buf, colsum_tmp);
+    qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+        pred, h_vec, k_fp32, compute_buf, colsum_tmp);
     TSUB(delta, v_fp32, pred);
     VectorBarrier();
     TMULS(delta, delta, beta_gate);
     VectorBarrier();
-    {
-      qwen35_decode_pto::TileUbDataDN<float, 128, 1, 128, 1> k_row;
-      TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_fp32.data()));
-#if defined(PTO_NPU_ARCH_A5)
-      TROWEXPAND(compute_buf, k_row);
-      qwen35_decode_pto::VectorBarrier();
-      TCOLEXPANDMUL(compute_buf, compute_buf, delta);
-      qwen35_decode_pto::VectorBarrier();
-      TADD(h_vec, h_vec, compute_buf);
-#else
-      qwen35_decode_pto::OuterProductAdd128(
-          h_vec, delta, k_row);
-#endif
-    }
-    VectorBarrier();
-    {
-      qwen35_decode_pto::TileUbDataDN<float, 128, 1, 128, 1> q_row;
-      TASSIGN(q_row, reinterpret_cast<std::uintptr_t>(q_fp32.data()));
-      TROWEXPANDMUL(compute_buf, h_vec, q_row);
-    }
-    VectorBarrier();
-    qwen35_decode_pto::ColSum128(
-        pred, compute_buf, colsum_tmp);
+    qwen35_decode_pto::StateRankOneUpdate128<FlaSsmStateLayout>(
+        h_vec, k_fp32, delta, compute_buf);
+    qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+        pred, h_vec, q_fp32, compute_buf, colsum_tmp);
     TCVT(out_half, pred, RoundMode::CAST_RINT);
     VectorBarrier();
     TMOV(norm_half, out_half);

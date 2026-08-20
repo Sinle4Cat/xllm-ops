@@ -50,6 +50,7 @@ public:
             .DataType({ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
+        this->Attr("flaSsmStateLayout").AttrType(OPTIONAL).Bool(true);
 
         this->Output("convOut")
             .ParamType(REQUIRED)

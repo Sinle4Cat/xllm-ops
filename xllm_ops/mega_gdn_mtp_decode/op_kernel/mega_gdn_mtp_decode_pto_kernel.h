@@ -388,7 +388,16 @@ AICORE PTO_INLINE void NormalizeQkRows(
 #if defined(PTO_NPU_ARCH_A5)
     TDIVS(row_tile, row_tile, row_norm);
 #else
-    TMULS(row_tile, row_tile, 1.0f / row_norm);
+    // The in-place 910B TDIVS path becomes reciprocal+vmuls. Reuse this
+    // row's dead square tile as a non-alias destination to match TileLang's
+    // vector divf rounding.
+    TileUbDataND<float, 1, kHeadDim> square_row_tile;
+    TASSIGN(
+        square_row_tile,
+        square_address + row * kHeadDim * sizeof(float));
+    TDIVS(square_row_tile, row_tile, row_norm);
+    qwen35_decode_pto::VectorBarrier();
+    TMOV(row_tile, square_row_tile);
 #endif
   }
   qwen35_decode_pto::VectorBarrier();
@@ -577,7 +586,7 @@ AICORE PTO_INLINE void RunConvPhase(
         qwen35_decode_pto::VectorBarrier();
         TileUbDataND<float, 1, 128> silu_tmp;
         TASSIGN(silu_tmp, kUbVectorScratch);
-        qwen35_decode_pto::Silu<float, 1, 128>(
+        qwen35_decode_pto::CausalConvSilu<float, 1, 128>(
             conv_y, conv_acc, silu_tmp);
         qwen35_decode_pto::VectorBarrier();
         // Numerical contract: Conv output is materialized as BF16 before
@@ -677,7 +686,7 @@ AICORE PTO_INLINE void LoadInitialState(
   qwen35_decode_pto::VectorBarrier();
 }
 
-template <bool UseDeferredNorm>
+template <bool UseDeferredNorm, bool FlaSsmStateLayout>
 AICORE PTO_INLINE void RunRecurrentStep(
     int32_t q_token_address,
     int32_t k_token_address,
@@ -787,38 +796,16 @@ AICORE PTO_INLINE void RunRecurrentStep(
 
   TMULS(state, state, decay);
   qwen35_decode_pto::VectorBarrier();
-  {
-    TileUbDataDN<float, 128, 1> k_row;
-    TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
-    TROWEXPANDMUL(compute, state, k_row);
-  }
-  qwen35_decode_pto::VectorBarrier();
-  qwen35_decode_pto::ColSum128(prediction, compute, colsum_tmp);
+  qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+      prediction, state, k_token, compute, colsum_tmp);
   TSUB(delta, v_fp32, prediction);
   qwen35_decode_pto::VectorBarrier();
   TMULS(delta, delta, beta);
   qwen35_decode_pto::VectorBarrier();
-  {
-    TileUbDataDN<float, 128, 1> k_row;
-    TASSIGN(k_row, reinterpret_cast<std::uintptr_t>(k_token.data()));
-#if defined(PTO_NPU_ARCH_A5)
-    TROWEXPAND(compute, k_row);
-    qwen35_decode_pto::VectorBarrier();
-    TCOLEXPANDMUL(compute, compute, delta);
-    qwen35_decode_pto::VectorBarrier();
-    TADD(state, state, compute);
-#else
-    qwen35_decode_pto::OuterProductAdd128(state, delta, k_row);
-#endif
-  }
-  qwen35_decode_pto::VectorBarrier();
-  {
-    TileUbDataDN<float, 128, 1> q_row;
-    TASSIGN(q_row, reinterpret_cast<std::uintptr_t>(q_token.data()));
-    TROWEXPANDMUL(compute, state, q_row);
-  }
-  qwen35_decode_pto::VectorBarrier();
-  qwen35_decode_pto::ColSum128(prediction, compute, colsum_tmp);
+  qwen35_decode_pto::StateRankOneUpdate128<FlaSsmStateLayout>(
+      state, k_token, delta, compute);
+  qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+      prediction, state, q_token, compute, colsum_tmp);
   // Numerical contract: recurrent readout is BF16 before RMSNorm, matching
   // the unfused RecurrentGatedDeltaRule -> Norm tensor boundary.
   if constexpr (UseDeferredNorm) {
@@ -1181,11 +1168,13 @@ AICORE PTO_INLINE void RunDeferredNorm(
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
           bool UseDeferredNorm = UseQkGroupCache,
-          bool UseTwoOwnerQkGroups = false>
+          bool UseTwoOwnerQkGroups = false,
+          bool FlaSsmStateLayout = true>
 #else
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
-          bool UseDeferredNorm = UseQkGroupCache>
+          bool UseDeferredNorm = UseQkGroupCache,
+          bool FlaSsmStateLayout = true>
 #endif
 AICORE PTO_INLINE void Run(
     __gm__ bfloat16_t* qkv_handle,
@@ -1689,7 +1678,7 @@ AICORE PTO_INLINE void Run(
       const int32_t deferred_readout_address =
           kRunDeferredReadoutHalf +
           token_idx * kHeadDim * sizeof(bfloat16_t);
-      RunRecurrentStep<UseDeferredNorm>(
+      RunRecurrentStep<UseDeferredNorm, FlaSsmStateLayout>(
           q_token_address,
           k_token_address,
           deferred_readout_address);
