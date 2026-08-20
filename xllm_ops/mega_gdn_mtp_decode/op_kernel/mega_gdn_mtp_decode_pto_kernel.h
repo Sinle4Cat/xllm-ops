@@ -6,11 +6,11 @@
 // single-token kernel. The MTP schedule and state contract remain independent.
 #include "mega_gdn_decode_pto_kernel.h"
 
-namespace qwen35_mtp_decode_pto {
+namespace mega_gdn_mtp_decode_pto {
 
 using namespace pto;
-using qwen35_decode_pto::TileUbDataDN;
-using qwen35_decode_pto::TileUbDataND;
+using mega_gdn_decode_pto::TileUbDataDN;
+using mega_gdn_decode_pto::TileUbDataND;
 
 constexpr int32_t kHeadDim = 128;
 constexpr int32_t kSsmHeadElements = kHeadDim * kHeadDim;
@@ -176,20 +176,20 @@ AICORE PTO_INLINE void SiluNoCopy(
     TileUbDataND<T, Rows, Cols>& src,
     TileUbDataND<T, Rows, Cols>& tmp) {
   TMULS(tmp, src, -1);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TEXP(tmp, tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(tmp, tmp, 1);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TRECIP(dst, tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(dst, src, dst);
 }
 #endif
 
 AICORE PTO_INLINE void LoadBf16Row(__gm__ bfloat16_t* handle,
                                    int32_t ub_address) {
-  qwen35_decode_pto::CopyGmToUb<
+  mega_gdn_decode_pto::CopyGmToUb<
       bfloat16_t,
       bfloat16_t,
       1,
@@ -239,7 +239,7 @@ AICORE PTO_INLINE void LoadStridedBf16Rows(
 
 AICORE PTO_INLINE void StoreBf16Row(__gm__ bfloat16_t* handle,
                                     int32_t ub_address) {
-  qwen35_decode_pto::CopyUbToGm<
+  mega_gdn_decode_pto::CopyUbToGm<
       bfloat16_t,
       bfloat16_t,
       1,
@@ -274,7 +274,7 @@ AICORE PTO_INLINE void StoreStridedBf16Rows(
 
 AICORE PTO_INLINE void LoadBf16Scalar(__gm__ bfloat16_t* handle,
                                       int32_t ub_address) {
-  qwen35_decode_pto::CopyGmToUb<
+  mega_gdn_decode_pto::CopyGmToUb<
       bfloat16_t,
       bfloat16_t,
       1,
@@ -294,7 +294,7 @@ AICORE PTO_INLINE void LoadBf16Scalar(__gm__ bfloat16_t* handle,
 
 AICORE PTO_INLINE void LoadFloatScalar(__gm__ float* handle,
                                        int32_t ub_address) {
-  qwen35_decode_pto::CopyGmToUb<float,
+  mega_gdn_decode_pto::CopyGmToUb<float,
                                 float,
                                 1,
                                 1,
@@ -313,7 +313,7 @@ AICORE PTO_INLINE void LoadFloatScalar(__gm__ float* handle,
 }
 
 AICORE PTO_INLINE void LoadState(__gm__ float* handle, int32_t ub_address) {
-  qwen35_decode_pto::CopyGmToUb<float,
+  mega_gdn_decode_pto::CopyGmToUb<float,
                                 float,
                                 1,
                                 1,
@@ -332,7 +332,7 @@ AICORE PTO_INLINE void LoadState(__gm__ float* handle, int32_t ub_address) {
 }
 
 AICORE PTO_INLINE void StoreState(__gm__ float* handle, int32_t ub_address) {
-  qwen35_decode_pto::CopyUbToGm<float,
+  mega_gdn_decode_pto::CopyUbToGm<float,
                                 float,
                                 1,
                                 1,
@@ -371,11 +371,11 @@ AICORE PTO_INLINE void NormalizeQkRows(
   TASSIGN(norm_sqrt, norm_sqrt_address);
 
   TMUL(square, rows, rows);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TROWSUM(norm_dn, square, reduce_tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(norm, norm, 1.0e-6f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TSQRT(norm_sqrt, norm);
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
@@ -396,11 +396,11 @@ AICORE PTO_INLINE void NormalizeQkRows(
         square_row_tile,
         square_address + row * kHeadDim * sizeof(float));
     TDIVS(square_row_tile, row_tile, row_norm);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TMOV(row_tile, square_row_tile);
 #endif
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   if constexpr (ApplyQScale) {
 #if defined(PTO_NPU_ARCH_A5)
     // Exact FP32 rounding of 1 / sqrt(128), matching Triton's scale.
@@ -408,7 +408,7 @@ AICORE PTO_INLINE void NormalizeQkRows(
 #else
     TMULS(rows, rows, 8.838835e-02f);
 #endif
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
   }
 }
 
@@ -473,7 +473,7 @@ AICORE PTO_INLINE void RunConvPhase(
   for (int32_t conv_tile = vector_core_idx; conv_tile < conv_tile_count;
        conv_tile += vector_core_count) {
     const int32_t channel_offset = conv_tile * kHeadDim;
-    qwen35_decode_pto::CopyConvWeightsGmToUb(
+    mega_gdn_decode_pto::CopyConvWeightsGmToUb(
         conv_weight_handle + channel_offset,
         kUbConvWeightHalf0,
         conv_dim);
@@ -483,7 +483,7 @@ AICORE PTO_INLINE void RunConvPhase(
     TCVT(w1, w_half1, RoundMode::CAST_NONE);
     TCVT(w2, w_half2, RoundMode::CAST_NONE);
     TCVT(w3, w_half3, RoundMode::CAST_NONE);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
 
     int8_t conv_pingpong_flag;
     if constexpr (SpeculativeTokens == 8) {
@@ -502,7 +502,7 @@ AICORE PTO_INLINE void RunConvPhase(
       const int32_t read_history_offset =
           read_slot * conv_state_stride +
           (accepted - 1) * conv_dim + channel_offset;
-      qwen35_decode_pto::CopyConvHistoryGmToUb(
+      mega_gdn_decode_pto::CopyConvHistoryGmToUb(
           conv_state_handle + read_history_offset,
           kUbConvHistoryHalf0,
           conv_dim);
@@ -511,7 +511,7 @@ AICORE PTO_INLINE void RunConvPhase(
       TCVT(hist0, hist_half0, RoundMode::CAST_NONE);
       TCVT(hist1, hist_half1, RoundMode::CAST_NONE);
       TCVT(hist2, hist_half2, RoundMode::CAST_NONE);
-      qwen35_decode_pto::VectorBarrier();
+      mega_gdn_decode_pto::VectorBarrier();
 
       // Snapshot accepted rows before a same-slot write can overwrite them.
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -558,37 +558,37 @@ AICORE PTO_INLINE void RunConvPhase(
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
           TCVT(x_fp32, x_half, RoundMode::CAST_NONE);
         }
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
 
         TMUL(conv_acc, w0, hist0);
 #if defined(PTO_NPU_ARCH_A5)
-        qwen35_decode_pto::VectorBarrier();
-        qwen35_decode_pto::MulAddDst<float, 1, 128>(
+        mega_gdn_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::MulAddDst<float, 1, 128>(
             conv_acc, hist1, w1, conv_tmp);
-        qwen35_decode_pto::VectorBarrier();
-        qwen35_decode_pto::MulAddDst<float, 1, 128>(
+        mega_gdn_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::MulAddDst<float, 1, 128>(
             conv_acc, hist2, w2, conv_tmp);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
 #else
         TMUL(conv_tmp, w1, hist1);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         TADD(conv_acc, conv_acc, conv_tmp);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         TMUL(conv_tmp, w2, hist2);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         TADD(conv_acc, conv_acc, conv_tmp);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
 #endif
         TileUbDataND<float, 1, 128> mul_add_tmp;
         TASSIGN(mul_add_tmp, kUbVectorScratch);
-        qwen35_decode_pto::MulAddDst<float, 1, 128>(
+        mega_gdn_decode_pto::MulAddDst<float, 1, 128>(
             conv_acc, x_fp32, w3, mul_add_tmp);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         TileUbDataND<float, 1, 128> silu_tmp;
         TASSIGN(silu_tmp, kUbVectorScratch);
-        qwen35_decode_pto::CausalConvSilu<float, 1, 128>(
+        mega_gdn_decode_pto::CausalConvSilu<float, 1, 128>(
             conv_y, conv_acc, silu_tmp);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         // Numerical contract: Conv output is materialized as BF16 before
         // Q/K/V split, matching the unfused CausalConv hand-off.
         if constexpr (SpeculativeTokens == 8) {
@@ -599,7 +599,7 @@ AICORE PTO_INLINE void RunConvPhase(
         } else {
           TCVT(conv_y_half, conv_y, RoundMode::CAST_RINT);
         }
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         if constexpr (SpeculativeTokens == 8) {
           set_flag(PIPE_V, PIPE_MTE3, conv_pingpong_event);
           wait_flag(PIPE_V, PIPE_MTE3, conv_pingpong_event);
@@ -632,7 +632,7 @@ AICORE PTO_INLINE void RunConvPhase(
         TMOV(hist0, hist1);
         TMOV(hist1, hist2);
         TMOV(hist2, x_fp32);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
         if constexpr (SpeculativeTokens == 8) {
           conv_pingpong_flag = conv_pingpong_flag == 0 ? 1 : 0;
         }
@@ -683,7 +683,7 @@ AICORE PTO_INLINE void LoadInitialState(
     TCVT(norm_weight_fp32, norm_weight_half, RoundMode::CAST_NONE);
   }
   TEXP(a_log_static, a_log_static);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
 }
 
 template <bool UseDeferredNorm, bool FlaSsmStateLayout>
@@ -728,7 +728,7 @@ AICORE PTO_INLINE void RunRecurrentStep(
 
   // decay = exp(-exp(a_log) * softplus(a + dt_bias)).
   TADD(scalar_tmp, scalar, dt_bias_static);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
   const float gate_input = scalar_tmp.GetValue(0);
@@ -740,37 +740,37 @@ AICORE PTO_INLINE void RunRecurrentStep(
     // y = exp(x) is small. Recover the addition residual before applying
     // the BF16 gate rounding used by the unfused path.
     TEXP(scalar_work, scalar_tmp);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TADDS(scalar_tmp, scalar_work, 1.0f);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TADDS(scalar, scalar_tmp, -1.0f);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TSUB(scalar, scalar_work, scalar);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TDIV(scalar, scalar, scalar_tmp);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TLOG(scalar_work, scalar_tmp);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TADD(scalar_work, scalar_work, scalar);
 #else
     TEXP(scalar_work, scalar_tmp);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TADDS(scalar_work, scalar_work, 1.0f);
-    qwen35_decode_pto::VectorBarrier();
+    mega_gdn_decode_pto::VectorBarrier();
     TLOG(scalar_work, scalar_work);
 #endif
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(scalar_tmp, a_log_static, scalar_work);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(scalar_tmp, scalar_tmp, -1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   // Numerical contract: the unfused gate path materializes g as BF16
   // before exp(g); removing this RINT changes accepted-token numerics.
   TCVT(rounded_gate_half, scalar_tmp, RoundMode::CAST_RINT);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TCVT(scalar_tmp, rounded_gate_half, RoundMode::CAST_NONE);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TEXP(scalar_work, scalar_tmp);
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
@@ -778,33 +778,33 @@ AICORE PTO_INLINE void RunRecurrentStep(
 
   // beta = sigmoid(b).
   TMULS(scalar_tmp, scalar2, -1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TEXP(scalar_work, scalar_tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(scalar_tmp, scalar_work, 1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TRECIP(scalar_work, scalar_tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   // Numerical contract: torch::sigmoid(BF16) returns BF16 in the unfused
   // path, so beta must RINT before the FP32 recurrent update.
   TCVT(rounded_gate_half, scalar_work, RoundMode::CAST_RINT);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TCVT(scalar_work, rounded_gate_half, RoundMode::CAST_NONE);
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
   const float beta = scalar_work.GetValue(0);
 
   TMULS(state, state, decay);
-  qwen35_decode_pto::VectorBarrier();
-  qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+  mega_gdn_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
       prediction, state, k_token, compute, colsum_tmp);
   TSUB(delta, v_fp32, prediction);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(delta, delta, beta);
-  qwen35_decode_pto::VectorBarrier();
-  qwen35_decode_pto::StateRankOneUpdate128<FlaSsmStateLayout>(
+  mega_gdn_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::StateRankOneUpdate128<FlaSsmStateLayout>(
       state, k_token, delta, compute);
-  qwen35_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
+  mega_gdn_decode_pto::StateVectorProduct128<FlaSsmStateLayout>(
       prediction, state, q_token, compute, colsum_tmp);
   // Numerical contract: recurrent readout is BF16 before RMSNorm, matching
   // the unfused RecurrentGatedDeltaRule -> Norm tensor boundary.
@@ -815,7 +815,7 @@ AICORE PTO_INLINE void RunRecurrentStep(
   } else {
     TCVT(readout_half, prediction, RoundMode::CAST_RINT);
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   if constexpr (!UseDeferredNorm) {
     TMOV(norm_half, readout_half);
   }
@@ -874,9 +874,9 @@ AICORE PTO_INLINE void RunNormStep(
   TASSIGN(final_half, kUbFinalHalf);
 
   TCVT(norm_fp32, norm_half, RoundMode::CAST_NONE);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(square_fp32, norm_fp32, norm_fp32);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TileUbDataDN<float, 8, 1, 1, 1> rms_dn;
   TASSIGN(rms_dn, kUbRms);
   TileUbDataND<float, 1, 64, 1, 64> rms_reduce_tmp;
@@ -889,41 +889,41 @@ AICORE PTO_INLINE void RunNormStep(
   // Match layer_norm_fwd's N=128 reduction tree: add the two 64-wide
   // halves elementwise, then reduce the resulting 64 values.
   TADD(rms_reduce_tmp, square_low, square_high);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TROWSUM(rms_dn, rms_reduce_tmp, square_fp32);
 #else
   TROWSUM(rms_dn, square_fp32, rms_reduce_tmp);
 #endif
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(rms, rms, 1.0f / 128.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(rms, rms, 1.0e-6f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TSQRT(scalar_tmp, rms);
 #if defined(PTO_NPU_ARCH_A5)
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(rms, rms, 0.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(rms, rms, 1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   // layer_norm_fwd obtains rstd with vector Div rather than scalar division.
   TDIV(rms, rms, scalar_tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TROWEXPANDMUL(norm_fp32, norm_fp32, rstd_dn);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
   // Match layer_norm_fwd's A5 hot path exactly: multiply by z before the
   // division so FP32 rounding is identical at BF16 midpoint boundaries.
   TMUL(norm_fp32, norm_fp32, z_fp32);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(z_fp32, z_fp32, -1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TEXP(z_fp32, z_fp32);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(z_fp32, z_fp32, 1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TDIV(norm_fp32, norm_fp32, z_fp32);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   // Triton's A5 f32-to-bf16 conversion rounds midpoint ties away from zero.
   TCVT(final_half, norm_fp32, RoundMode::CAST_ROUND);
 #else
@@ -931,18 +931,18 @@ AICORE PTO_INLINE void RunNormStep(
   wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
   const float rms_value = scalar_tmp.GetValue(0);
   TMULS(norm_fp32, norm_fp32, 1.0f / rms_value);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(norm_fp32, norm_fp32, norm_weight_fp32);
   TileUbDataND<float, 1, 128> silu_tmp;
   TASSIGN(silu_tmp, kUbVectorScratch);
-  qwen35_decode_pto::Silu<float, 1, 128>(
+  mega_gdn_decode_pto::Silu<float, 1, 128>(
       gate_fp32, z_fp32, silu_tmp);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(norm_fp32, norm_fp32, gate_fp32);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TCVT(final_half, norm_fp32, RoundMode::CAST_RINT);
 #endif
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
   StoreBf16Row(
@@ -1069,9 +1069,9 @@ AICORE PTO_INLINE void RunDeferredNorm(
     TCVT(input_row, cached_readout_row, RoundMode::CAST_NONE);
     TCVT(z_row, cached_z_row, RoundMode::CAST_NONE);
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(square_batch, input_batch, input_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
 #if defined(PTO_NPU_ARCH_A5)
   for (int32_t row = 0; row < Rows; ++row) {
     TileUbDataND<float, 1, 64> square_low;
@@ -1086,25 +1086,25 @@ AICORE PTO_INLINE void RunDeferredNorm(
             Layout::kReduceTmpBatch + row * 64 * sizeof(float));
     TADD(reduced_row, square_low, square_high);
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TROWSUM(rms_batch_dn, reduce_tmp_batch, square_batch);
 #else
   TROWSUM(rms_batch_dn, square_batch, reduce_tmp_batch);
 #endif
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(rms_batch, rms_batch, 1.0f / 128.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(rms_batch, rms_batch, 1.0e-6f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TSQRT(rms_sqrt_batch, rms_batch);
 #if defined(PTO_NPU_ARCH_A5)
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(rms_batch, rms_batch, 0.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(rms_batch, rms_batch, 1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TDIV(rms_batch, rms_batch, rms_sqrt_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TROWEXPANDMUL(input_batch, input_batch, rms_batch_dn);
 #else
   set_flag(PIPE_V, PIPE_S, EVENT_ID0);
@@ -1118,7 +1118,7 @@ AICORE PTO_INLINE void RunDeferredNorm(
     TMULS(input_row, input_row, 1.0f / rms_value);
   }
 #endif
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   for (int32_t row = 0; row < Rows; ++row) {
     TileUbDataND<float, 1, kHeadDim> input_row;
     TASSIGN(
@@ -1126,30 +1126,30 @@ AICORE PTO_INLINE void RunDeferredNorm(
         Layout::kInputBatch + row * kHeadDim * sizeof(float));
     TMUL(input_row, input_row, norm_weight_fp32);
   }
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
 #if defined(PTO_NPU_ARCH_A5)
   // Preserve layer_norm_fwd's (value * z) / (1 + exp(-z)) operation order.
   TMUL(input_batch, input_batch, z_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMULS(z_batch, z_batch, -1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TEXP(z_batch, z_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TADDS(z_batch, z_batch, 1.0f);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TDIV(input_batch, input_batch, z_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   // Match the A5 Triton backend's midpoint-tie behavior at the norm boundary.
   TCVT(final_half_batch, input_batch, RoundMode::CAST_ROUND);
 #else
   SiluNoCopy<float, Rows, kHeadDim>(
       gate_batch, z_batch, silu_tmp_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TMUL(input_batch, input_batch, gate_batch);
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
   TCVT(final_half_batch, input_batch, RoundMode::CAST_RINT);
 #endif
-  qwen35_decode_pto::VectorBarrier();
+  mega_gdn_decode_pto::VectorBarrier();
 
   const int64_t output_base_offset =
       static_cast<int64_t>(batch_idx) * sequence_length * v_width +
@@ -1308,7 +1308,7 @@ AICORE PTO_INLINE void Run(
       vector_core_count);
 
   // Conv output is a GM hand-off between different channel/head owners.
-  qwen35_decode_pto::SyncAllAiv();
+  mega_gdn_decode_pto::SyncAllAiv();
 
 #if defined(PTO_NPU_ARCH_A5)
   // Phase 2: each owner keeps one complete FP32 state in UB for all S steps.
@@ -1426,7 +1426,7 @@ AICORE PTO_INLINE void Run(
         TASSIGN(k_batch, kUbQkCacheK);
         TCVT(q_batch, q_half_batch, RoundMode::CAST_NONE);
         TCVT(k_batch, k_half_batch, RoundMode::CAST_NONE);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
 
         NormalizeQkRows<true, kDeferredNormRows>(
             kUbQkCacheTail,
@@ -1513,7 +1513,7 @@ AICORE PTO_INLINE void Run(
         TASSIGN(k_batch, kUbQkCacheK);
         TCVT(q_batch, q_half_batch, RoundMode::CAST_NONE);
         TCVT(k_batch, k_half_batch, RoundMode::CAST_NONE);
-        qwen35_decode_pto::VectorBarrier();
+        mega_gdn_decode_pto::VectorBarrier();
 
         NormalizeQkRows<true, kDeferredNormRows>(
             kUbQkCacheTail,
@@ -1622,7 +1622,7 @@ AICORE PTO_INLINE void Run(
       }
       TCVT(scalar, a_half, RoundMode::CAST_NONE);
       TCVT(scalar2, b_half, RoundMode::CAST_NONE);
-      qwen35_decode_pto::VectorBarrier();
+      mega_gdn_decode_pto::VectorBarrier();
       if constexpr (SpeculativeTokens == 8) {
         set_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
@@ -1659,9 +1659,9 @@ AICORE PTO_INLINE void Run(
         }
       }
       if constexpr (!UseQkGroupCache) {
-        qwen35_decode_pto::NormalizeQk128<true>(
+        mega_gdn_decode_pto::NormalizeQk128<true>(
             q_fp32, norm_square, norm_value, reduce_tmp, scalar_tmp);
-        qwen35_decode_pto::NormalizeQk128<false>(
+        mega_gdn_decode_pto::NormalizeQk128<false>(
             k_fp32, norm_square, norm_value, reduce_tmp, scalar_tmp);
       }
 
@@ -1710,4 +1710,4 @@ AICORE PTO_INLINE void Run(
 #endif
 }
 
-}  // namespace qwen35_mtp_decode_pto
+}  // namespace mega_gdn_mtp_decode_pto

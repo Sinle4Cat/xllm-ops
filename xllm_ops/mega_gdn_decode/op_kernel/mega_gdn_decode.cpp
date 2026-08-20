@@ -17,7 +17,7 @@ AICORE PTO_INLINE void RunMegaGdnDecode(
     GM_ADDR convStateOut, GM_ADDR ssmStateOut, GM_ADDR out,
     int32_t numKHeads, int32_t numVHeads, int32_t batchSize)
 {
-    qwen35_decode_pto::Run<IsBatchOne, FlaSsmStateLayout>(
+    mega_gdn_decode_pto::Run<IsBatchOne, FlaSsmStateLayout>(
         reinterpret_cast<__gm__ bfloat16_t *>(qkv),
         reinterpret_cast<__gm__ bfloat16_t *>(z),
         reinterpret_cast<__gm__ bfloat16_t *>(b),

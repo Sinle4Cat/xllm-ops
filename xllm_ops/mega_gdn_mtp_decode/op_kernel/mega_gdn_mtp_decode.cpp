@@ -45,14 +45,14 @@ AICORE PTO_INLINE void RunMegaGdnMtpDecode(
     int32_t batch_size,
     int32_t runtime_sequence_length) {
 #if defined(PTO_NPU_ARCH_A5)
-  qwen35_mtp_decode_pto::Run<
+  mega_gdn_mtp_decode_pto::Run<
       SpeculativeTokens,
       UseQkGroupCache,
       UseDeferredNorm,
       UseTwoOwnerQkGroups,
       FlaSsmStateLayout>(
 #else
-  qwen35_mtp_decode_pto::Run<
+  mega_gdn_mtp_decode_pto::Run<
       SpeculativeTokens,
       UseQkGroupCache,
       UseDeferredNorm,
