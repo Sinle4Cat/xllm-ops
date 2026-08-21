@@ -1920,7 +1920,8 @@ mega_gdn_decode(
     at::Tensor& ssm_state,
     const at::Tensor& read_state_indices,
     const at::Tensor& write_state_indices,
-    const at::Tensor& norm_weight) {
+    const at::Tensor& norm_weight,
+    bool fla_ssm_state_layout) {
   at::Tensor conv_out = at::empty_like(qkv);
   at::Tensor out = at::empty_like(z);
   EXEC_NPU_CMD(aclnnMegaGdnDecode,
@@ -1936,6 +1937,7 @@ mega_gdn_decode(
                read_state_indices,
                write_state_indices,
                norm_weight,
+               fla_ssm_state_layout,
                conv_out,
                conv_state,
                ssm_state,
@@ -1958,7 +1960,8 @@ mega_gdn_mtp_decode(
     const at::Tensor& read_state_indices,
     const at::Tensor& write_state_indices,
     const at::Tensor& num_accepted_tokens,
-    const at::Tensor& norm_weight) {
+    const at::Tensor& norm_weight,
+    bool fla_ssm_state_layout) {
   at::Tensor conv_out = at::empty_like(qkv);
   at::Tensor out = at::empty_like(z);
   EXEC_NPU_CMD(aclnnMegaGdnMtpDecode,
@@ -1975,6 +1978,7 @@ mega_gdn_mtp_decode(
                write_state_indices,
                num_accepted_tokens,
                norm_weight,
+               fla_ssm_state_layout,
                conv_out,
                conv_state,
                ssm_state,
@@ -2007,10 +2011,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mega_chunk_gdn", &mega_chunk_gdn, "mega_chunk_gdn");
   m.def("mega_gdn_decode",
         &mega_gdn_decode,
-        "mega_gdn_decode");
+        "mega_gdn_decode",
+        pybind11::arg("qkv"),
+        pybind11::arg("z"),
+        pybind11::arg("b"),
+        pybind11::arg("a"),
+        pybind11::arg("conv_weight"),
+        pybind11::arg("conv_state"),
+        pybind11::arg("a_log"),
+        pybind11::arg("dt_bias"),
+        pybind11::arg("ssm_state"),
+        pybind11::arg("read_state_indices"),
+        pybind11::arg("write_state_indices"),
+        pybind11::arg("norm_weight"),
+        pybind11::arg("fla_ssm_state_layout") = true);
   m.def("mega_gdn_mtp_decode",
         &mega_gdn_mtp_decode,
-        "mega_gdn_mtp_decode");
+        "mega_gdn_mtp_decode",
+        pybind11::arg("qkv"),
+        pybind11::arg("z"),
+        pybind11::arg("b"),
+        pybind11::arg("a"),
+        pybind11::arg("conv_weight"),
+        pybind11::arg("conv_state"),
+        pybind11::arg("a_log"),
+        pybind11::arg("dt_bias"),
+        pybind11::arg("ssm_state"),
+        pybind11::arg("read_state_indices"),
+        pybind11::arg("write_state_indices"),
+        pybind11::arg("num_accepted_tokens"),
+        pybind11::arg("norm_weight"),
+        pybind11::arg("fla_ssm_state_layout") = true);
   m.def("layer_norm_fwd", &layer_norm_fwd_impl_npu, "layer_norm_fwd");
   m.def("moe_fused_add_topk", &moe_fused_add_topk_impl_npu, "moe_fused_add_topk");
   m.def("moe_fused_reducesum_div", &moe_fused_reducesum_div_impl_npu, "moe_fused_reducesum_div");

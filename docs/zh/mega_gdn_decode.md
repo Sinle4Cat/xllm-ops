@@ -91,6 +91,7 @@ out = RMSNorm(BF16_RINT(o), norm_weight, eps=1e-6) * SiLU(z)
 | `readStateIndices` | 输入 | INT32 | `[B]` | 每个 batch 项读取的 state slot |
 | `writeStateIndices` | 输入 | INT32 | `[B]` | 每个 batch 项写入的 state slot |
 | `normWeight` | 输入 | BF16 | `[D]` | RMSNorm 权重 |
+| `flaSsmStateLayout` | 属性 | BOOL | 标量 | `true` 表示 `[K,V]`，`false` 表示 `[V,K]`，默认 `true` |
 | `convOut` | 输出 | BF16 | `[B,C]` | 保留 BF16 舍入点的 Conv 输出 |
 | `convStateOut` | 输出 | BF16 | `[N,3,C]` | 接收更新后 write slot 的 Conv state |
 | `ssmStateOut` | 输出 | FP32 | `[N,NV,D,D]` | 接收更新后 write slot 的 SSM state |
@@ -120,6 +121,10 @@ H_read  = ssm_state[read_state_id]
 H_write = updated_gdn_state(H_read)
 ssm_state_out[write_state_id] = H_write
 ```
+
+recurrent 数学统一使用逻辑布局 `H[K,V]`。`flaSsmStateLayout=true` 时 GM
+直接保存该布局；`false` 时 GM 保存其转置 `H^T[V,K]`。non-FLA PTO 直接使用
+转置后的 matvec、归约和 rank-one update 公式，不执行 `128 x 128` 物理转置。
 
 ### 输入/输出 buffer 与 slot 所有权
 
@@ -169,6 +174,8 @@ tiling 回调不读取 device index tensor 的值。slot 范围、write 唯一�
 | ---: | --- | --- |
 | 2 | `B=1` | Batch-one 静态快路径 |
 | 1 | `B>1` | 动态 batch 路径 |
+| 12 | `B=1` 且 non-FLA state layout | Batch-one non-FLA 路径 |
+| 11 | `B>1` 且 non-FLA state layout | 动态 batch non-FLA 路径 |
 
 Tiling data 只保存 `batch_size`、`num_k_heads` 和 `num_v_heads`。
 

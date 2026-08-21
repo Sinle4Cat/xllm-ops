@@ -84,6 +84,18 @@ out_t = RMSNorm(BF16_RINT(o_t), norm_weight, eps=1e-6)
 `H_-1` 从所选 read checkpoint 读取；每次得到 `H_t` 后，立即写入相应的
 write checkpoint。下一个 token 继续使用 UB 中的 state，不从 GM 重读。
 
+recurrent 数学统一使用逻辑布局 `H[K,V]`。`flaSsmStateLayout=true` 时 GM
+直接保存该布局；`false` 时 GM 保存其转置 `H^T[V,K]`。non-FLA PTO 直接使用：
+
+```text
+pred = H_stored * k
+H_stored += delta * k^T
+out = H_stored * q
+```
+
+因此不需要执行 `128 x 128` 物理转置。两种布局使用相同的 checkpoint 索引、
+Conv state 和 BF16 舍入点。
+
 ## 参数说明
 
 所有 Tensor 使用 ND 格式且必须 contiguous。
@@ -103,6 +115,7 @@ write checkpoint。下一个 token 继续使用 UB 中的 state，不从 GM 重�
 | `writeStateIndices` | 输入 | INT32 | `[B]` | 每个 batch 项写入的 state slot |
 | `numAcceptedTokens` | 输入 | INT32 | `[B]` | 上一轮接受数，取值范围 `[1,S]` |
 | `normWeight` | 输入 | BF16 | `[D]` | RMSNorm 权重 |
+| `flaSsmStateLayout` | 属性 | BOOL | 标量 | `true` 表示 `[K,V]`，`false` 表示 `[V,K]`，默认 `true` |
 | `convOut` | 输出 | BF16 | `[B,S,C]` | 保留 BF16 舍入点的 Conv 输出 |
 | `convStateOut` | 输出 | BF16 | `[N,L,C]` | 接收更新后 write slot 的 Conv state |
 | `ssmStateOut` | 输出 | FP32 | `[N*S,NV,D,D]` | 接收更新后 write slot 的逐 token checkpoints |
@@ -198,10 +211,15 @@ tiling 回调只校验 dtype、rank 和 shape，不读取 device tensor 的值�
 | 308 | 与 key 208 相同，且为 Ascend 950、AIV/UB 满足 | A5 two-owner Q/K group 调度 |
 | 210～216 | `K=10～16` 且 UB 不小于 182,816B | 静态 K + deferred Norm |
 | 100 | 其他受支持 K，或专用 key 的资源不足 | 动态 K fallback |
+| 1101～1105、1108 | non-FLA 且 `K=1～5、8` | non-FLA 静态 K 路径 |
+| 1100 | 其他受支持的 non-FLA K | non-FLA 动态 K 路径 |
 
 key 308 只在 `PTO_NPU_ARCH_A5` 下编译和调度。A2/A3 不包含该 device
 分支，继续使用 mixed AIC/AIV 路径；A5 使用 AIV-only 路径。因此 A5 专用
 优化不能改变 A2/A3 的 device 代码。
+
+non-FLA layout 当前不使用仅针对 FLA 调优的 Q/K group cache、deferred Norm
+和 A5 two-owner 特化。
 
 ### Block 调度
 

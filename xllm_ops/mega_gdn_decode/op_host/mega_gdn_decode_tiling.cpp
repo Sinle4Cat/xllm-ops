@@ -13,6 +13,8 @@ constexpr int64_t kHeadDim = 128;
 constexpr int64_t kConvStateLen = 3;
 constexpr int64_t kMaxNumCacheSlots = 1024;
 constexpr int64_t kMaxBatchSize = 32;
+constexpr size_t kFlaSsmStateLayoutAttr = 0;
+constexpr uint64_t kNonFlaTilingKeyOffset = 10;
 
 bool IsSupportedShape(int64_t numKHeads, int64_t numVHeads)
 {
@@ -109,7 +111,19 @@ static ge::graphStatus MegaGdnDecodeTiling(gert::TilingContext* context)
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-    context->SetTilingKey(batchSize == 1 ? 2 : 1);
+    const auto* attrs = context->GetAttrs();
+    const bool* flaSsmStateLayout =
+        attrs == nullptr
+            ? nullptr
+            : attrs->GetAttrPointer<bool>(kFlaSsmStateLayoutAttr);
+    if (flaSsmStateLayout == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    uint64_t tilingKey = batchSize == 1 ? 2 : 1;
+    if (!*flaSsmStateLayout) {
+        tilingKey += kNonFlaTilingKeyOffset;
+    }
+    context->SetTilingKey(tilingKey);
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aicCoreNum = platform.GetCoreNumAic();

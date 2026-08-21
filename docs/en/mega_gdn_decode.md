@@ -93,6 +93,7 @@ All tensors use the ND format and must be contiguous.
 | `readStateIndices` | Input | INT32 | `[B]` | State slot read by each batch item |
 | `writeStateIndices` | Input | INT32 | `[B]` | State slot written by each batch item |
 | `normWeight` | Input | BF16 | `[D]` | RMSNorm weight |
+| `flaSsmStateLayout` | Attribute | BOOL | Scalar | `true` stores `[K,V]`; `false` stores `[V,K]`; defaults to `true` |
 | `convOut` | Output | BF16 | `[B,C]` | Convolution output at the BF16 rounding boundary |
 | `convStateOut` | Output | BF16 | `[N,3,C]` | Receives updated convolution-state write slots |
 | `ssmStateOut` | Output | FP32 | `[N,NV,D,D]` | Receives updated SSM-state write slots |
@@ -123,6 +124,12 @@ H_read  = ssm_state[read_state_id]
 H_write = updated_gdn_state(H_read)
 ssm_state_out[write_state_id] = H_write
 ```
+
+The recurrent math always uses the logical `H[K,V]` layout. With
+`flaSsmStateLayout=true`, GM stores that layout directly; with `false`, GM stores
+its transpose `H^T[V,K]`. The non-FLA PTO path uses transposed matvec,
+reduction, and rank-one-update formulas directly instead of physically
+transposing the `128 x 128` state.
 
 ### Input/output buffers and slot ownership
 
@@ -178,6 +185,8 @@ The current host tiling supports:
 | ---: | --- | --- |
 | 2 | `B=1` | Static batch-one fast path |
 | 1 | `B>1` | Dynamic-batch path |
+| 12 | `B=1` with non-FLA state layout | Batch-one non-FLA path |
+| 11 | `B>1` with non-FLA state layout | Dynamic-batch non-FLA path |
 
 Tiling data contains only `batch_size`, `num_k_heads`, and `num_v_heads`.
 

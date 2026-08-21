@@ -14,11 +14,13 @@ struct MegaGdnMtpDecodeTilingData {
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
           bool UseDeferredNorm,
-          bool UseTwoOwnerQkGroups = false>
+          bool UseTwoOwnerQkGroups = false,
+          bool FlaSsmStateLayout = true>
 #else
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
-          bool UseDeferredNorm>
+          bool UseDeferredNorm,
+          bool FlaSsmStateLayout = true>
 #endif
 AICORE PTO_INLINE void RunMegaGdnMtpDecode(
     GM_ADDR qkv,
@@ -43,14 +45,18 @@ AICORE PTO_INLINE void RunMegaGdnMtpDecode(
     int32_t batch_size,
     int32_t runtime_sequence_length) {
 #if defined(PTO_NPU_ARCH_A5)
-  qwen35_mtp_decode_pto::Run<
+  mega_gdn_mtp_decode_pto::Run<
       SpeculativeTokens,
       UseQkGroupCache,
       UseDeferredNorm,
-      UseTwoOwnerQkGroups>(
+      UseTwoOwnerQkGroups,
+      FlaSsmStateLayout>(
 #else
-  qwen35_mtp_decode_pto::Run<
-      SpeculativeTokens, UseQkGroupCache, UseDeferredNorm>(
+  mega_gdn_mtp_decode_pto::Run<
+      SpeculativeTokens,
+      UseQkGroupCache,
+      UseDeferredNorm,
+      FlaSsmStateLayout>(
 #endif
       reinterpret_cast<__gm__ bfloat16_t*>(qkv),
       reinterpret_cast<__gm__ bfloat16_t*>(z),
@@ -106,25 +112,43 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
 
 #if defined(PTO_NPU_ARCH_A5)
 #define RUN_MTP_IMPL(                                                       \
-    K, USE_QK_GROUP_CACHE, USE_DEFERRED_NORM, USE_TWO_OWNER_QK_GROUPS)       \
+    K,                                                                       \
+    USE_QK_GROUP_CACHE,                                                      \
+    USE_DEFERRED_NORM,                                                       \
+    USE_TWO_OWNER_QK_GROUPS,                                                 \
+    FLA_SSM_STATE_LAYOUT)                                                    \
   RunMegaGdnMtpDecode<                                                      \
       K,                                                                    \
       USE_QK_GROUP_CACHE,                                                   \
       USE_DEFERRED_NORM,                                                    \
-      USE_TWO_OWNER_QK_GROUPS>
+      USE_TWO_OWNER_QK_GROUPS,                                              \
+      FLA_SSM_STATE_LAYOUT>
 #else
 #define RUN_MTP_IMPL(                                                       \
-    K, USE_QK_GROUP_CACHE, USE_DEFERRED_NORM, USE_TWO_OWNER_QK_GROUPS)       \
-  RunMegaGdnMtpDecode<K, USE_QK_GROUP_CACHE, USE_DEFERRED_NORM>
+    K,                                                                       \
+    USE_QK_GROUP_CACHE,                                                      \
+    USE_DEFERRED_NORM,                                                       \
+    USE_TWO_OWNER_QK_GROUPS,                                                 \
+    FLA_SSM_STATE_LAYOUT)                                                    \
+  RunMegaGdnMtpDecode<                                                      \
+      K,                                                                    \
+      USE_QK_GROUP_CACHE,                                                   \
+      USE_DEFERRED_NORM,                                                    \
+      FLA_SSM_STATE_LAYOUT>
 #endif
 
 #define RUN_MTP(                                                            \
-    K, USE_QK_GROUP_CACHE, USE_DEFERRED_NORM, USE_TWO_OWNER_QK_GROUPS)       \
+    K,                                                                       \
+    USE_QK_GROUP_CACHE,                                                      \
+    USE_DEFERRED_NORM,                                                       \
+    USE_TWO_OWNER_QK_GROUPS,                                                 \
+    FLA_SSM_STATE_LAYOUT)                                                    \
   RUN_MTP_IMPL(                                                             \
       K,                                                                    \
       USE_QK_GROUP_CACHE,                                                   \
       USE_DEFERRED_NORM,                                                    \
-      USE_TWO_OWNER_QK_GROUPS)(                                             \
+      USE_TWO_OWNER_QK_GROUPS,                                              \
+      FLA_SSM_STATE_LAYOUT)(                                                \
       qkv,                                                                   \
       z,                                                                     \
       b,                                                                     \
@@ -148,39 +172,53 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
       static_cast<int32_t>(tiling_data.sequence_length))
 
   if constexpr (TILING_KEY_IS(101)) {
-    RUN_MTP(1, false, false, false);
+    RUN_MTP(1, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(102)) {
-    RUN_MTP(2, false, false, false);
+    RUN_MTP(2, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(103)) {
-    RUN_MTP(3, false, false, false);
+    RUN_MTP(3, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(104)) {
-    RUN_MTP(4, false, false, false);
+    RUN_MTP(4, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(105)) {
-    RUN_MTP(5, false, false, false);
+    RUN_MTP(5, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(108)) {
-    RUN_MTP(8, false, false, false);
+    RUN_MTP(8, false, false, false, true);
   } else if constexpr (TILING_KEY_IS(208)) {
-    RUN_MTP(8, true, true, false);
+    RUN_MTP(8, true, true, false, true);
 #if defined(PTO_NPU_ARCH_A5)
   } else if constexpr (TILING_KEY_IS(308)) {
-    RUN_MTP(8, true, true, true);
+    RUN_MTP(8, true, true, true, true);
 #endif
   } else if constexpr (TILING_KEY_IS(210)) {
-    RUN_MTP(10, false, true, false);
+    RUN_MTP(10, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(211)) {
-    RUN_MTP(11, false, true, false);
+    RUN_MTP(11, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(212)) {
-    RUN_MTP(12, false, true, false);
+    RUN_MTP(12, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(213)) {
-    RUN_MTP(13, false, true, false);
+    RUN_MTP(13, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(214)) {
-    RUN_MTP(14, false, true, false);
+    RUN_MTP(14, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(215)) {
-    RUN_MTP(15, false, true, false);
+    RUN_MTP(15, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(216)) {
-    RUN_MTP(16, false, true, false);
+    RUN_MTP(16, false, true, false, true);
   } else if constexpr (TILING_KEY_IS(100)) {
-    RUN_MTP(0, false, false, false);
+    RUN_MTP(0, false, false, false, true);
+  } else if constexpr (TILING_KEY_IS(1101)) {
+    RUN_MTP(1, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1102)) {
+    RUN_MTP(2, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1103)) {
+    RUN_MTP(3, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1104)) {
+    RUN_MTP(4, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1105)) {
+    RUN_MTP(5, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1108)) {
+    RUN_MTP(8, false, false, false, false);
+  } else if constexpr (TILING_KEY_IS(1100)) {
+    RUN_MTP(0, false, false, false, false);
   }
 #undef RUN_MTP
 #undef RUN_MTP_IMPL

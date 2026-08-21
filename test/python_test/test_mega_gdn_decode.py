@@ -38,6 +38,7 @@ def _reference_decode(
     norm_weight,
     num_k_heads,
     num_v_heads,
+    fla_ssm_state_layout=True,
 ):
     batch_size, conv_dim = qkv.shape
     conv_out = torch.empty_like(qkv)
@@ -83,15 +84,22 @@ def _reference_decode(
         read_state_idx = read_state_indices[batch_idx].item()
         write_state_idx = write_state_indices[batch_idx].item()
         for head_idx in range(num_v_heads):
-            state = ssm_state[read_state_idx, head_idx] * decay[
-                batch_idx, head_idx
-            ]
+            stored_state = ssm_state[read_state_idx, head_idx]
+            state = (
+                stored_state
+                if fla_ssm_state_layout
+                else stored_state.transpose(-1, -2)
+            ) * decay[batch_idx, head_idx]
             prediction = torch.sum(state * k[batch_idx, head_idx, :, None], dim=0)
             delta = (v[batch_idx, head_idx] - prediction) * beta[
                 batch_idx, head_idx
             ]
             state = state + k[batch_idx, head_idx, :, None] * delta[None, :]
-            expected_ssm_state[write_state_idx, head_idx] = state
+            expected_ssm_state[write_state_idx, head_idx] = (
+                state
+                if fla_ssm_state_layout
+                else state.transpose(-1, -2)
+            )
             attention_out[batch_idx, head_idx] = torch.sum(
                 state * q[batch_idx, head_idx, :, None], dim=0
             )
@@ -179,8 +187,13 @@ def test_representative_batch_shapes(num_k_heads, num_v_heads, batch_size):
     [(1, 2, 1), (2, 4, 2)],
 )
 @pytest.mark.parametrize("prefix_fork", [False, True])
+@pytest.mark.parametrize("fla_ssm_state_layout", [True, False])
 def test_nonzero_inputs_match_reference(
-    num_k_heads, num_v_heads, batch_size, prefix_fork
+    num_k_heads,
+    num_v_heads,
+    batch_size,
+    prefix_fork,
+    fla_ssm_state_layout,
 ):
     generator = torch.Generator().manual_seed(20260727)
     conv_dim = (2 * num_k_heads + num_v_heads) * HEAD_DIM
@@ -229,6 +242,7 @@ def test_nonzero_inputs_match_reference(
         norm_weight,
         num_k_heads,
         num_v_heads,
+        fla_ssm_state_layout,
     )
     npu_inputs = [
         tensor.to("npu:0")
@@ -247,7 +261,9 @@ def test_nonzero_inputs_match_reference(
             norm_weight,
         )
     ]
-    outputs = custom_ops.mega_gdn_decode(*npu_inputs)
+    outputs = custom_ops.mega_gdn_decode(
+        *npu_inputs, fla_ssm_state_layout
+    )
     torch.npu.synchronize()
     actual = tuple(tensor.cpu() for tensor in outputs)
 
