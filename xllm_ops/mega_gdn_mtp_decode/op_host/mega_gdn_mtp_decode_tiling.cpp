@@ -28,6 +28,8 @@ constexpr uint32_t kQkGroupCacheRequiredAivCores = 32;
 constexpr uint32_t kAivPerA2A3MixedBlock = 2;
 constexpr size_t kFlaSsmStateLayoutAttr = 0;
 constexpr uint64_t kNonFlaTilingKeyOffset = 1000;
+constexpr size_t kA5ReservedWorkspaceBytes = 16 * 1024 * 1024;
+constexpr size_t kA5SoftSyncWorkspaceBytes = 4 * 1024;
 
 enum InputIndex : size_t {
   kQkv = 0,
@@ -278,6 +280,9 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   tiling.set_num_k_heads(info.num_k_heads);
   tiling.set_num_v_heads(info.num_v_heads);
   const size_t lib_workspace_size = platform.GetLibApiWorkSpaceSize();
+  if (is_ascend950 && lib_workspace_size > kA5ReservedWorkspaceBytes) {
+    return ge::GRAPH_FAILED;
+  }
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                       context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -289,7 +294,10 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   }
 
   size_t* workspace_sizes = context->GetWorkspaceSizes(1);
-  workspace_sizes[0] = lib_workspace_size;
+  workspace_sizes[0] =
+      is_ascend950
+          ? kA5ReservedWorkspaceBytes + kA5SoftSyncWorkspaceBytes
+          : lib_workspace_size;
   return ge::GRAPH_SUCCESS;
 }
 

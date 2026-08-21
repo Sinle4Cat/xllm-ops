@@ -15,6 +15,7 @@ constexpr uint64_t kHeadDim = 128;
 constexpr uint64_t kChunkSize = 128;
 constexpr uint64_t kDtypeBytes = 2;
 constexpr uint64_t kFloatBytes = 4;
+constexpr uint64_t kSoftSyncBytesPerParticipant = 32;
 // Reserve the largest per-core H-workspace skew used by the compiled kernel.
 constexpr uint64_t kHWorkspacePadBytes = 8192;
 constexpr uint64_t kHWorkspaceAlignmentBytes = 16 * 1024 * 1024;
@@ -329,11 +330,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (workspace_sizes == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    workspace_sizes[0] =
+    uint64_t user_workspace_bytes =
         CalcUserWorkspaceBytes(block_dim, num_matrices, batch_size, tokens,
                                heads, conv_dim,
-                               static_cast<uint32_t>(conv_state.GetDim(1))) +
-        platform.GetLibApiWorkSpaceSize();
+                               static_cast<uint32_t>(conv_state.GetDim(1)));
+    if (is_ascend950) {
+        user_workspace_bytes +=
+            AlignWorkspace(static_cast<uint64_t>(block_dim) * 3 *
+                           kSoftSyncBytesPerParticipant);
+    }
+    workspace_sizes[0] =
+        user_workspace_bytes + platform.GetLibApiWorkSpaceSize();
     return ge::GRAPH_SUCCESS;
 }
 

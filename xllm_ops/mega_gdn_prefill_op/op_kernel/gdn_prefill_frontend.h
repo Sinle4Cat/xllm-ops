@@ -87,9 +87,53 @@ public:
         this->weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(weight));
         this->convStatesGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(convStateIn));
         this->convStatesOutGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(convStateOut));
+        convStateOutRaw_ = reinterpret_cast<__gm__ T *>(convStateOut);
         this->packedQkvYGm.SetGlobalBuffer(
             reinterpret_cast<__gm__ NsCausalConv1d::PackedQkvT *>(packedQkv));
         this->InitSharedBuffersAndEvents();
+    }
+
+    __aicore__ inline void CleanConvStateRows(int32_t writeCacheIndex,
+                                              int32_t stateRowBegin,
+                                              int32_t stateRowEnd,
+                                              int32_t channelStart,
+                                              int32_t baseDim)
+    {
+#if defined(PTO_NPU_ARCH_A5)
+        if (writeCacheIndex < 0 ||
+            writeCacheIndex >=
+                static_cast<int32_t>(this->tilingData_->numCacheLines) ||
+            stateRowBegin >= stateRowEnd) {
+            return;
+        }
+        // DCCI cleans the issuing AIV's private cache, so publish each line on
+        // the same token/channel task that issued its MTE3 state write.
+        pipe_barrier(PIPE_ALL);
+        constexpr int32_t kElementsPerCacheLine = 64 / sizeof(T);
+        const int32_t dim = static_cast<int32_t>(this->tilingData_->dim);
+        for (int32_t stateRow = stateRowBegin; stateRow < stateRowEnd;
+             ++stateRow) {
+            const int64_t rowOffset =
+                (static_cast<int64_t>(writeCacheIndex) *
+                     this->tilingData_->stateLen +
+                 stateRow) *
+                    dim +
+                channelStart;
+            for (int32_t column = 0; column < baseDim;
+                 column += kElementsPerCacheLine) {
+                dcci(static_cast<__gm__ void *>(convStateOutRaw_ + rowOffset +
+                                                column),
+                     SINGLE_CACHE_LINE);
+            }
+        }
+        dsb(DSB_ALL);
+#else
+        (void)writeCacheIndex;
+        (void)stateRowBegin;
+        (void)stateRowEnd;
+        (void)channelStart;
+        (void)baseDim;
+#endif
     }
 
     __aicore__ inline void CopyCheckpointTail(int32_t readCacheIndex,
@@ -145,9 +189,23 @@ public:
                 tokenCount, task.tokenStart, task.tokenEnd - task.tokenStart,
                 task.channelStart, task.baseDimSize,
                 static_cast<int32_t>(this->tilingData_->dim));
+            if (task.tokenEnd == tokenCount) {
+                CleanConvStateRows(
+                    writeCacheIndex, 0,
+                    static_cast<int32_t>(this->tilingData_->width) - 1,
+                    task.channelStart, task.baseDimSize);
+            }
             if (task.tokenTileId == 0) {
                 CopyCheckpointTail(readCacheIndex, writeCacheIndex,
                                    task.channelStart, task.baseDimSize, false);
+                if (readCacheIndex >= 0 &&
+                    readCacheIndex != writeCacheIndex) {
+                    CleanConvStateRows(
+                        writeCacheIndex,
+                        static_cast<int32_t>(this->tilingData_->width) - 1,
+                        static_cast<int32_t>(this->tilingData_->stateLen),
+                        task.channelStart, task.baseDimSize);
+                }
             }
         }
         this->ReleaseEvents();
@@ -215,12 +273,29 @@ public:
                         seqStart, seqEnd - seqStart, cursor, tileLen,
                         task.channelStart, task.baseDimSize,
                         static_cast<int32_t>(this->tilingData_->dim));
+                    if (tileEnd == seqEnd) {
+                        CleanConvStateRows(
+                            writeCacheIndex, 0,
+                            static_cast<int32_t>(this->tilingData_->width) - 1,
+                            task.channelStart, task.baseDimSize);
+                    }
                     if (cursor == seqStart) {
                         CopyCheckpointTail(processReadCacheIndex,
                                            writeCacheIndex,
                                            task.channelStart,
                                            task.baseDimSize,
                                            useCompactSnapshot);
+                        if (processReadCacheIndex >= 0 &&
+                            (useCompactSnapshot ||
+                             processReadCacheIndex != writeCacheIndex)) {
+                            CleanConvStateRows(
+                                writeCacheIndex,
+                                static_cast<int32_t>(this->tilingData_->width) -
+                                    1,
+                                static_cast<int32_t>(
+                                    this->tilingData_->stateLen),
+                                task.channelStart, task.baseDimSize);
+                        }
                     }
                 }
                 cursor = tileEnd;
@@ -313,6 +388,9 @@ public:
         this->convStatesGm.SetGlobalBuffer(
             reinterpret_cast<__gm__ T *>(compactSnapshot));
     }
+
+private:
+    __gm__ T *convStateOutRaw_ = nullptr;
 };
 
 __aicore__ inline void RunConv(GM_ADDR mixedQkv, GM_ADDR convWeight,

@@ -2,6 +2,15 @@
 
 add_op_to_compiled_list()
 
+# Ascend950 does not provide the FFTS hardware-sync address attached by CANN
+# to MIX 1:2 metadata.  The A5 kernel uses PTO's GM-backed MIX software
+# rendezvous instead, so register it for the guarded metadata post-processing
+# step in cmake/func.cmake.  A2/A3 builds are not modified.
+set(A5_SOFT_SYNC_MIX_OPS
+    ${A5_SOFT_SYNC_MIX_OPS}
+    mega_gdn_prefill_op
+    CACHE INTERNAL "A5 MIX operators using only software global sync" FORCE)
+
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnn PRIVATE
         mega_gdn_prefill_op_def.cpp

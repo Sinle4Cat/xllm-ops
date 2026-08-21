@@ -627,6 +627,43 @@ def test_mega_gdn_prefill_op_group_qk_underfilled_grid_regression():
         _assert_results(e2e, baseline, WRITE_SLOT)
 
 
+def test_mega_gdn_prefill_op_async_layer_queue_regression():
+    """Keep each A5 software-sync reset adjacent to its queued kernel.
+
+    Qwen3.5-27B enqueues this operator once for each of its 48 linear-attention
+    layers before synchronizing.  A reset submitted directly by the caller can
+    overtake an earlier OpCommand custom handler and leave the next kernel with
+    stale generation counters.  A single-call test, or synchronizing after
+    every call, cannot reproduce that ordering failure.
+    """
+    value_heads = 24
+    key_heads = 8
+    state_mode = "no_initial"
+    device = torch.device("npu:0")
+    torch_npu.npu.set_device(device)
+    cpu_inputs = _make_cpu_inputs(
+        value_heads,
+        key_heads,
+        state_mode=state_mode,
+    )
+    baseline_tensors = _to_device(cpu_inputs, device)
+    e2e_tensors = _to_device(cpu_inputs, device)
+    constants = _make_constants(device)
+    baseline = _run_baseline(
+        baseline_tensors,
+        constants,
+        value_heads,
+        key_heads,
+        state_mode,
+    )
+
+    for _ in range(48):
+        e2e = _run_e2e(e2e_tensors, constants)
+    torch_npu.npu.synchronize()
+
+    _assert_results(e2e, baseline, WRITE_SLOT)
+
+
 @pytest.mark.parametrize(
     ("value_heads", "key_heads"),
     QWEN35_LOCAL_HEAD_CONFIGS,

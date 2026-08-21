@@ -25,7 +25,8 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define GDN_PUBLIC_DTYPE DTYPE_MIXED_QKV
 #define MEGA_CHUNK_GDN_HELPERS_ONLY
 #define MEGA_CHUNK_GDN_HELPER_NAMESPACE qwen35_e2e_pto
-#define MEGA_GDN_BUILD_REV 2026081121
+#define MEGA_GDN_BUILD_REV 2026081901
+#define MEGA_CHUNK_GDN_A5_SOFT_SYNC
 #if !defined(__NPU_ARCH__) || (__NPU_ARCH__ != 3510)
 // These schedules were added after the A2/A3 implementation.  Their flag
 // allocation and solve hand-off assume the legacy FFTS model, so keep the
@@ -36,6 +37,7 @@ struct MegaGdnPrefillOpKernelTilingData {
 #endif
 // The included helpers keep the public BF16 boundary and cast into FP16 on A2.
 #include "../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
+#undef MEGA_CHUNK_GDN_A5_SOFT_SYNC
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #undef MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
@@ -54,6 +56,7 @@ constexpr uint64_t kDtypeBytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 constexpr uint64_t kHeadDim = 128;
 constexpr uint64_t kChunkSize = 128;
+constexpr uint64_t kSoftSyncBytesPerParticipant = 32;
 
 AICORE inline uint64_t AlignWorkspace(uint64_t bytes)
 {
@@ -88,6 +91,21 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     const uint64_t key_heads = num_key_heads;
     const uint64_t matrices = tiling_data.num_matrices;
     uint64_t offset = 0;
+
+#if defined(PTO_NPU_ARCH_A5)
+    GM_ADDR soft_sync_workspace = user_workspace + offset;
+    const int32_t soft_sync_aiv_cores = static_cast<int32_t>(block_dim * 2);
+    // Preserve the established workspace layout (one reserved slot per MIX
+    // participant), although only the two AIV siblings own generation slots.
+    const int32_t soft_sync_reserved_slots = static_cast<int32_t>(block_dim * 3);
+    offset += AlignWorkspace(static_cast<uint64_t>(soft_sync_reserved_slots) *
+                             kSoftSyncBytesPerParticipant);
+    // The launcher clears this prefix on the same stream before enqueueing the
+    // kernel. Never initialize counters from device code: an early AIV could
+    // otherwise enter a different generation from its peers.
+    qwen35_e2e_pto::SyncAllImpl<false>(soft_sync_workspace,
+                                      soft_sync_aiv_cores);
+#endif
 
     GM_ADDR compact_conv_state_snapshot_ptr = user_workspace + offset;
     offset += AlignWorkspace(
@@ -190,7 +208,12 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
             minus_identity_compute_ptr),
         static_cast<int64_t>(kChunkSize * kChunkSize));
 
+#if defined(PTO_NPU_ARCH_A5)
+    qwen35_e2e_pto::SyncAllImpl<false>(soft_sync_workspace,
+                                       soft_sync_aiv_cores);
+#else
     qwen35_e2e_pto::SyncAllImpl<false>();
+#endif
 
 #ifdef E2E_STOP_AFTER_FRONTEND
     return;
@@ -204,7 +227,14 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     GM_ADDR q_ptr = packed_qkv_compute_ptr;
     GM_ADDR k_ptr = q_ptr + q_bytes;
     GM_ADDR v_ptr = k_ptr + q_bytes;
+#if defined(PTO_NPU_ARCH_A5)
+    // Recycling one of four KKT-to-Solve slots while the fifth producer wave
+    // is still live can deadlock at 16 chunks. A5 uses the existing full
+    // stage rendezvous instead of the pipelined slot protocol.
+    qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, false>(
+#else
     qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
+#endif
         q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
         mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
         norm_output_ptr, g_sum_ptr,
@@ -218,8 +248,25 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         tiling_data.ffts_addr, z_ptr,
         norm_weight_ptr, ssm_cache_ptr, ssm_state_write_indices_ptr, 1,
         ssm_cache_ptr, ssm_state_read_indices_ptr,
-        static_cast<int64_t>(tiling_data.ssm_state_slots));
+        static_cast<int64_t>(tiling_data.ssm_state_slots)
+#if defined(PTO_NPU_ARCH_A5)
+        , soft_sync_workspace, soft_sync_aiv_cores
+#endif
+        );
     pipe_barrier(PIPE_ALL);
+#if defined(PTO_NPU_ARCH_A5) && defined(__DAV_VEC__)
+    // Prefill publishes conv/SSM state that later decode graph replays consume
+    // in place, so those cache tensors are not represented by a returned
+    // tensor dependency.  Cleaning only the producer-owned lines makes the
+    // writes visible in DDR, but an AIV reused by a later graph can still hit
+    // a private D-cache line left by the previous request.  Every A5 AIV
+    // participates in this MIX launch; invalidate each private cache after
+    // all state stores have drained so the next decode graph acquires the
+    // freshly published state.  Keep this strictly A5/vector-only: A2/A3 keep
+    // their existing FFTS/coherency path byte-for-byte.
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_ALL);
+#endif
 #endif
 }
 

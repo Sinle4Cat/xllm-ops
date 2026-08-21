@@ -2012,16 +2012,28 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       // A5 MIX Vector GM writes are cached per Vector core and are not
-      // snooped by the host DMA once the kernel completes.  Every other GM
-      // store in this kernel is followed by an ffts alias that issues
-      // dsb(DSB_ALL); the final-state store ends the work item, so actively
-      // clean its lines to the coherence point and drain, or the reader can
-      // observe stale data when the framework reuses GM addresses from a
-      // previous launch.
-      for (int32_t r = 0; r < HalfC * D; r += 16) {
-        dcci(static_cast<__gm__ void *>(FS_handle + fs_offset +
-                                        vid * HalfC * D + r),
-             SINGLE_CACHE_LINE);
+      // snooped by the next kernel.  Clean the address that was actually
+      // written above.  Prefill stores directly into final_state_cache,
+      // whereas the standalone operator stores into FS_handle; cleaning
+      // FS_handle unconditionally leaves Prefill's cache slot stale.
+      if constexpr (StoreFinalStateCache) {
+        const int32_t state_index =
+            state_indices[seq_idx] * state_index_stride;
+        if (state_index >= 0 && state_index < state_cache_slots) {
+          const int64_t cache_offset =
+              (static_cast<int64_t>(state_index) * H + head) * DD +
+              vid * HalfC * D;
+          for (int32_t r = 0; r < HalfC * D; r += 16) {
+            dcci(static_cast<__gm__ void *>(final_state_cache + cache_offset + r),
+                 SINGLE_CACHE_LINE);
+          }
+        }
+      } else {
+        for (int32_t r = 0; r < HalfC * D; r += 16) {
+          dcci(static_cast<__gm__ void *>(FS_handle + fs_offset +
+                                          vid * HalfC * D + r),
+               SINGLE_CACHE_LINE);
+        }
       }
       dsb(DSB_ALL);
 #endif

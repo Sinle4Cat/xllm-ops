@@ -21,6 +21,25 @@ constexpr int32_t kMaxConvDim =
     (2 * kMaxNumKHeads + kMaxNumVHeads) * kHeadDim;
 constexpr int32_t kQkGroupCacheSequenceLength = 9;
 
+#if defined(PTO_NPU_ARCH_A5)
+// A5 does not expose the FFTS control address used by PTO's hardware
+// AIV-only SYNCALL. The largest MTP UB layout ends at 187936 bytes, leaving a
+// 32-byte counter tile at 188 KiB inside the 192-KiB UB.
+constexpr uint32_t kSoftSyncUbAddress = 188 * 1024;
+
+AICORE PTO_INLINE void SyncAllAivSoft(GM_ADDR sync_workspace,
+                                      int32_t used_aiv_cores,
+                                      int32_t aiv_index) {
+  pipe_barrier(PIPE_ALL);
+  pto::SYNCALL_SOFT_AIV_BARRIER(
+      reinterpret_cast<__gm__ int32_t*>(sync_workspace),
+      reinterpret_cast<__ubuf__ int32_t*>(kSoftSyncUbAddress),
+      used_aiv_cores,
+      aiv_index);
+  pipe_barrier(PIPE_ALL);
+}
+#endif
+
 namespace ub_layout {
 
 // All values are byte offsets in UB. The regions are intentionally reused
@@ -1197,7 +1216,11 @@ AICORE PTO_INLINE void Run(
     int32_t num_k_heads,
     int32_t num_v_heads,
     int32_t batch_size,
-    int32_t runtime_sequence_length) {
+    int32_t runtime_sequence_length
+#if defined(PTO_NPU_ARCH_A5)
+    , GM_ADDR soft_sync_workspace
+#endif
+    ) {
   constexpr bool kIsDynamic = SpeculativeTokens == 0;
   static_assert(!UseDeferredNorm || !kIsDynamic);
 #if defined(PTO_NPU_ARCH_A5)
@@ -1308,7 +1331,12 @@ AICORE PTO_INLINE void Run(
       vector_core_count);
 
   // Conv output is a GM hand-off between different channel/head owners.
+#if defined(PTO_NPU_ARCH_A5)
+  SyncAllAivSoft(
+      soft_sync_workspace, vector_core_count, vector_core_idx);
+#else
   mega_gdn_decode_pto::SyncAllAiv();
+#endif
 
 #if defined(PTO_NPU_ARCH_A5)
   // Phase 2: each owner keeps one complete FP32 state in UB for all S steps.

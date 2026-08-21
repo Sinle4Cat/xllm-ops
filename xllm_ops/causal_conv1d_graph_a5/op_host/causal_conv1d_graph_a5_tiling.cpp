@@ -164,8 +164,13 @@ ge::graphStatus TilingFunc(gert::TilingContext* context) {
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                       context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-  context->SetBlockDim(static_cast<uint32_t>(
-      std::min<int64_t>(choice.grid_size, core_num)));
+  // This A5-only graph kernel is also the acquire fence for persistent Conv
+  // and SSM state published by MegaGdnPrefillOp.  The following recurrent
+  // graph may run on any AIV, so launching only the causal-conv work grid
+  // leaves idle AIVs with stale private cache lines.  Launch every AIV: the
+  // existing grid-stride loop keeps the causal-conv work unchanged, while
+  // otherwise-idle blocks execute the entry DCCI and then return.
+  context->SetBlockDim(core_num);
   context->SetTilingKey(0);
   context->GetWorkspaceSizes(1)[0] = 0;
   return ge::GRAPH_SUCCESS;

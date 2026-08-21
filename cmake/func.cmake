@@ -619,6 +619,12 @@ function(add_bin_compile_target)
             list(APPEND _BUILD_COMMAND export TILINGKEY_PAR_COMPILE=1 &&)
             list(APPEND _BUILD_COMMAND export BIN_FILENAME_HASHED=1 &&)
             list(APPEND _BUILD_COMMAND bash ${bin_script} ${OP_SRC_OUT_DIR}/${op_type}.py ${OP_BIN_OUT_DIR})
+            if (BINARY_COMPUTE_UNIT STREQUAL "ascend950" AND
+                op_file IN_LIST A5_SOFT_SYNC_MIX_OPS)
+                list(APPEND _BUILD_COMMAND && ${HI_PYTHON}
+                    ${CMAKE_SOURCE_DIR}/../cmake/scripts/patch_a5_soft_sync_metadata.py
+                    --kernel-dir ${OP_BIN_OUT_DIR})
+            endif()
             if(CMAKE_GENERATOR MATCHES "Unix Makefiles")
                 list(APPEND _BUILD_COMMAND && echo $(MAKE))
             endif()

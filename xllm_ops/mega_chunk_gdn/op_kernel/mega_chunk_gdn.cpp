@@ -107,6 +107,62 @@ AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
     return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) + ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
 }
 
+// A5 does not expose the FFTS hardware-sync address used by the default MIX
+// SyncAll implementation. Synchronize the two AIV siblings globally with
+// generation counters in GM, and hold the paired AIC at the same stage with
+// the framework-reserved MIX flags 12/13. Do not use PTO's generic soft-MIX
+// proxy here: it reserves intra-block flags 7/8, which MegaChunkGdn also uses
+// for its solve hand-offs. Sharing those flags makes later stages race even
+// though the global rendezvous itself completes.
+//
+// Keep this opt-in scoped to Prefill so standalone MegaChunkGdn and every
+// A2/A3 build retain their existing path.
+#if defined(GDN_A5_KERNEL) && defined(MEGA_CHUNK_GDN_A5_SOFT_SYNC)
+// Keep an 8-KiB tail for the largest supported 1:2 MIX launch.  The software
+// barrier only needs one 32-byte vector tile, so 184 KiB remains in-bounds on
+// an Ascend950 device with 192 KiB of UB.
+constexpr uint32_t GDN_SOFT_SYNC_UB_ADDRESS = 184 * 1024;
+
+template <bool isAIVOnly = true>
+AICORE inline void SyncAllImpl(GM_ADDR sync_workspace,
+                               int32_t used_aiv_cores)
+{
+    static_assert(!isAIVOnly,
+                  "Prefill MIX software sync must include both AIV siblings.");
+    pipe_barrier(PIPE_ALL);
+#if defined(__DAV_C310_CUBE__)
+    // Wait for both sibling AIVs to publish local stores and then finish their
+    // global generation barrier. Flags 12/13 and their sibling aliases are
+    // reserved by the framework and do not overlap MegaChunkGdn's 0..10
+    // producer/consumer protocol.
+    wait_intra_block(PIPE_S, pto::SYNC_AIV_FLAG);
+    wait_intra_block(PIPE_S,
+                     pto::SYNC_AIV_FLAG + pto::SYNC_FLAG_ID_MAX);
+    wait_intra_block(PIPE_S, pto::SYNC_AIC_AIV_FLAG);
+    wait_intra_block(PIPE_S,
+                     pto::SYNC_AIC_AIV_FLAG + pto::SYNC_FLAG_ID_MAX);
+    set_intra_block(PIPE_S, pto::SYNC_AIV_FLAG);
+    set_intra_block(PIPE_S,
+                    pto::SYNC_AIV_FLAG + pto::SYNC_FLAG_ID_MAX);
+#elif defined(__DAV_C310_VEC__)
+    set_intra_block(PIPE_MTE3, pto::SYNC_AIV_FLAG);
+
+    // A 1:2 MIX launch gives both siblings the same raw block index. Flatten
+    // it explicitly so the AIV generation slots remain disjoint.
+    const int32_t aiv_index =
+        static_cast<int32_t>(get_block_idx() * 2 + get_subblockid());
+    pto::SYNCALL_SOFT_AIV_BARRIER(
+        reinterpret_cast<__gm__ int32_t *>(sync_workspace),
+        reinterpret_cast<__ubuf__ int32_t *>(GDN_SOFT_SYNC_UB_ADDRESS),
+        used_aiv_cores, aiv_index);
+
+    set_intra_block(PIPE_MTE3, pto::SYNC_AIC_AIV_FLAG);
+    wait_intra_block(PIPE_S, pto::SYNC_AIV_FLAG);
+#endif
+    pipe_barrier(PIPE_ALL);
+}
+
+#else
 template <bool isAIVOnly = true>
 AICORE inline void SyncAllImpl()
 {
@@ -134,6 +190,7 @@ AICORE inline void SyncAllImpl()
 #endif
 #endif
 }
+#endif
 
 #if defined(GDN_A5_KERNEL)
 // Scalar conversions between a 2-byte compute type and float.  The C310
@@ -741,7 +798,12 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                                     int32_t state_index_stride,
                                     GM_ADDR initial_state_cache_ptr,
                                     GM_ADDR initial_state_indices_ptr,
-                                    int64_t state_cache_slots)
+                                    int64_t state_cache_slots
+#if defined(GDN_A5_KERNEL) && defined(MEGA_CHUNK_GDN_A5_SOFT_SYNC)
+                                    , GM_ADDR soft_sync_workspace,
+                                    int32_t soft_sync_aiv_cores
+#endif
+                                    )
 {
     constexpr int32_t D = GDN_D;
     constexpr int32_t C = GDN_C;
@@ -750,6 +812,12 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         return;
     }
 
+#if defined(GDN_A5_KERNEL) && defined(MEGA_CHUNK_GDN_A5_SOFT_SYNC)
+#define GDN_STAGE_SYNC() \
+    SyncAllImpl<false>(soft_sync_workspace, soft_sync_aiv_cores)
+#else
+#define GDN_STAGE_SYNC() SyncAllImpl<false>()
+#endif
 
     mk_cumsum::cumsum_kernel<C>(reinterpret_cast<__gm__ float *>(g_in_ptr),
                                 reinterpret_cast<__gm__ float *>(g_sum_ptr),
@@ -760,7 +828,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     return;
 #endif
 
-    SyncAllImpl<false>();
+    GDN_STAGE_SYNC();
 
 
     const bool reuse_group_kk =
@@ -792,7 +860,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
             num_key_heads);
     }
 
-    SyncAllImpl<false>();
+    GDN_STAGE_SYNC();
 
 #ifdef MEGA_CHUNK_GDN_PRECOMPUTED_M_NEG
     const bool use_precomputed_m_neg = !reuse_group_kk;
@@ -821,7 +889,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
 
     if (!use_kkt_solve_pipeline) {
-        SyncAllImpl<false>();
+        GDN_STAGE_SYNC();
     }
 
 #if defined(GDN_A5_KERNEL)
@@ -902,10 +970,10 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 #endif
 
 
-    SyncAllImpl<false>();
+    GDN_STAGE_SYNC();
 
 
-    SyncAllImpl<false>();
+    GDN_STAGE_SYNC();
 #ifdef MEGA_STOP_AFTER_SYNC_BEFORE_WY
     return;
 #endif
@@ -970,7 +1038,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         }
     }
 #endif
-    SyncAllImpl<false>();
+    GDN_STAGE_SYNC();
 
     mk_h::chunk_h_kernel<D, C, StoreFinalStateCache,
                          LoadInitialStateCache>(
@@ -997,7 +1065,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     if (use_h_o_pipeline && EnableHoOverlap) {
         pipe_barrier(PIPE_ALL);
     } else {
-        SyncAllImpl<false>();
+        GDN_STAGE_SYNC();
     }
 
     mk_o::GDN_CHUNK_O_CALL<D, C, FuseGatedRmsNorm>(
@@ -1018,6 +1086,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ int32_t *>(kkt_ws_ptr), ffts_addr,
         reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(z_ptr),
         reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(norm_weight_ptr));
+
+#undef GDN_STAGE_SYNC
 
 #if defined(__DAV_C220_CUBE__)
     if (get_block_idx() < num_matrices) {
