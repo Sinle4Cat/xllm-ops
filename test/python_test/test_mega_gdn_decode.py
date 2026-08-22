@@ -146,6 +146,7 @@ def _run_case(num_k_heads, num_v_heads, batch_size):
         state_indices,
         state_indices,
         norm_weight,
+        True,
     )
     torch.npu.synchronize()
 
