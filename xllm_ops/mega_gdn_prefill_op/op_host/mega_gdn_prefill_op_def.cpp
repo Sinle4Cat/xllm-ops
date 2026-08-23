@@ -34,6 +34,8 @@ public:
         this->Input("norm_weight").ParamType(REQUIRED).DataType(bf16).Format(nd).AutoContiguous();
 
         this->Output("norm_output").ParamType(REQUIRED).DataType(bf16).Format(nd);
+        this->Output("conv_state_out").ParamType(REQUIRED).DataType(bf16).Format(nd);
+        this->Output("ssm_cache_out").ParamType(REQUIRED).DataType(fp32).Format(nd);
         this->Attr("ffts_addr").AttrType(REQUIRED).Int();
         this->Attr("num_matrices").AttrType(REQUIRED).Int();
 

@@ -46,17 +46,6 @@ __global__ __aicore__ void causal_conv1d(GM_ADDR x, GM_ADDR weight, GM_ADDR bias
     REGISTER_TILING_DEFAULT(CausalConv1dTilingData);
     GET_TILING_DATA(tilingData, tiling);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && defined(__DAV_VEC__)
-    // MegaGdnPrefillOp publishes persistent Conv and SSM state in place.
-    // Under ACL graph replay those cache tensors are not represented by an
-    // output dependency, and an A5 AIV can retain a private D-cache line from
-    // the preceding request.  The A5 update tiling launches every AIV, so this
-    // entry acquire invalidates all possible decode consumers before either
-    // causal-conv or the following recurrent kernel reads persistent state.
-    // Keep A2/A3 byte-for-byte on their existing coherent/FFTS path.
-    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
-    dsb(DSB_ALL);
-#endif
     GM_ADDR userWorkspace = workspace;
     if (workspace != nullptr) {
         userWorkspace = AscendC::GetUserWorkspace(workspace);

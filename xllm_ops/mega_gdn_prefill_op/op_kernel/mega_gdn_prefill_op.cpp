@@ -72,6 +72,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     GM_ADDR ssm_state_write_indices_ptr, GM_ADDR ssm_cache_ptr,
     GM_ADDR mask_lower_ptr, GM_ADDR mask_full_ptr, GM_ADDR minus_identity_ptr,
     GM_ADDR cu_seqlens_ptr, GM_ADDR norm_weight_ptr, GM_ADDR norm_output_ptr,
+    GM_ADDR conv_state_out_ptr, GM_ADDR ssm_cache_out_ptr,
     GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -178,7 +179,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     frontend_tiling.total_tokens = total_tokens;
 
     gdn_prefill_frontend::RunConv(
-        mixed_qkv_ptr, conv_weight_ptr, conv_state_ptr, conv_state_ptr,
+        mixed_qkv_ptr, conv_weight_ptr, conv_state_ptr, conv_state_out_ptr,
         conv_state_read_indices_ptr, conv_state_write_indices_ptr,
         cu_seqlens_ptr, packed_qkv_compute_ptr,
         compact_conv_state_snapshot_ptr, frontend_tiling,
@@ -246,7 +247,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         static_cast<int32_t>(heads), num_key_heads, batch_size, total_tokens,
         total_tokens, static_cast<uint32_t>(matrices),
         tiling_data.ffts_addr, z_ptr,
-        norm_weight_ptr, ssm_cache_ptr, ssm_state_write_indices_ptr, 1,
+        norm_weight_ptr, ssm_cache_out_ptr, ssm_state_write_indices_ptr, 1,
         ssm_cache_ptr, ssm_state_read_indices_ptr,
         static_cast<int64_t>(tiling_data.ssm_state_slots)
 #if defined(PTO_NPU_ARCH_A5)
@@ -255,11 +256,13 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         );
     pipe_barrier(PIPE_ALL);
 #if defined(PTO_NPU_ARCH_A5) && defined(__DAV_VEC__)
-    // Prefill publishes conv/SSM state that later decode graph replays consume
-    // in place, so those cache tensors are not represented by a returned
-    // tensor dependency.  Cleaning only the producer-owned lines makes the
-    // writes visible in DDR, but an AIV reused by a later graph can still hit
-    // a private D-cache line left by the previous request.  Every A5 AIV
+    // Prefill publishes conv/SSM state that later decode graph replays consume.
+    // The OpDef exposes separate input/output tensors so graph dataflow records
+    // the mutation even when the caller aliases output storage to the caches.
+    // That dependency does not invalidate an AIV's private D-cache. Cleaning
+    // only the producer-owned lines makes the writes
+    // visible in DDR, while an AIV reused by a later graph can still hit a
+    // private cache line left by the previous request. Every A5 AIV
     // participates in this MIX launch; invalidate each private cache after
     // all state stores have drained so the next decode graph acquires the
     // freshly published state.  Keep this strictly A5/vector-only: A2/A3 keep

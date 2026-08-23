@@ -185,17 +185,6 @@ ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext *context)
         blockDim = static_cast<uint32_t>(mappedBlockDim);
     }
 
-    platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-    const bool isAscend950 =
-        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
-    if (isAscend950 && !isFn) {
-        // The matching A5 device entry performs a full-cache acquire.  Launch
-        // every AIV so the subsequent graph-replayed recurrent kernel cannot
-        // be scheduled on a consumer core that retained stale Prefill state.
-        // Idle causal-conv blocks are already handled by the update kernel.
-        blockDim = coreNum;
-    }
-
     OP_LOGD(context,
             "Tiling result: mode[%s], batch[%ld], dim[%ld], baseDim[%ld], baseDimCnt[%ld], gridSize[%ld], "
             "effectiveGrid[%ld], blockDim[%u], coreNum[%u], tokenTiling[%ld,%ld], hasActivation[%d], hasBias[%d], "

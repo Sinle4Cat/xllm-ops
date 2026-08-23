@@ -593,6 +593,49 @@ def test_mega_gdn_prefill_op_multi_batch(
     )
 
 
+@pytest.mark.parametrize("state_mode", ("no_initial", "inplace"))
+def test_mega_gdn_prefill_op_batch32_qwen35_tp2_geometry(
+    state_mode: str,
+) -> None:
+    value_heads = 24
+    key_heads = 8
+    seq_lens = (32,) * 32
+    device = torch.device("npu:0")
+    torch_npu.npu.set_device(device)
+    cpu_inputs = _make_cpu_inputs(
+        value_heads,
+        key_heads,
+        state_mode=state_mode,
+        seq_lens=seq_lens,
+    )
+    baseline_tensors = _to_device(cpu_inputs, device)
+    e2e_tensors = _to_device(cpu_inputs, device)
+    constants = _make_constants(
+        device,
+        tokens=sum(seq_lens),
+        seq_lens=seq_lens,
+    )
+
+    baseline = _run_baseline(
+        baseline_tensors,
+        constants,
+        value_heads,
+        key_heads,
+        state_mode,
+    )
+    e2e = _run_e2e(e2e_tensors, constants)
+    torch_npu.npu.synchronize()
+
+    write_state_indices = cpu_inputs[
+        "ssm_state_write_indices"
+    ].tolist()
+    _assert_multi_batch_results(
+        e2e,
+        baseline,
+        write_state_indices,
+    )
+
+
 def test_mega_gdn_prefill_op_group_qk_underfilled_grid_regression():
     value_heads = 12
     key_heads = 4
