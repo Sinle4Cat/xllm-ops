@@ -44,11 +44,6 @@
 
 #include "acl/acl.h"
 #include "kernel_operator.h"
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
-// The pinned PTO-ISA release only maps 3101 to the A5 implementation.
-// Ascend950 uses 3510, so select the same implementation explicitly.
-#define PTO_NPU_ARCH_A5
-#endif
 #include <pto/pto-inst.hpp>
 #include "gdn_sync.h"
 #include <type_traits>
@@ -841,11 +836,28 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 #else
     constexpr bool CanPipelineKktSolve = true;
 #endif
+    const uint32_t kkt_solve_group_size =
+        static_cast<uint32_t>(H) / num_key_heads;
+#if defined(PTO_NPU_ARCH_A2A3)
+    const uint32_t kkt_solve_group_count =
+        num_matrices / kkt_solve_group_size;
+    const uint32_t kkt_solve_producer_waves =
+        (kkt_solve_group_count + get_block_num() - 1) / get_block_num();
+    // A2/A3 use the four-slot FFTS ready/free protocol. Its eighth producer
+    // wave can expose stale KKT tiles, so long sequences use the stage barrier.
+    const bool kkt_solve_wave_count_supported =
+        kkt_solve_producer_waves <= 7;
+#else
+    // A5 has a separate intra-block/software-sync contract and must never enter
+    // the A2/A3 four-slot FFTS protocol.
+    constexpr bool kkt_solve_wave_count_supported = false;
+#endif
     const bool use_kkt_solve_pipeline =
         EnableKktSolvePipeline && CanPipelineKktSolve && reuse_group_kk &&
         (static_cast<uint32_t>(H) == 2u * num_key_heads ||
          static_cast<uint32_t>(H) == 3u * num_key_heads) &&
-        (num_matrices % (static_cast<uint32_t>(H) / num_key_heads)) == 0;
+        (num_matrices % kkt_solve_group_size) == 0 &&
+        kkt_solve_wave_count_supported;
 
     mega_transpose_TH_to_HT<float>(reinterpret_cast<__gm__ float *>(g_sum_ptr),
                                    reinterpret_cast<__gm__ float *>(g_t_ptr), total_tokens, H);

@@ -23,6 +23,36 @@ constexpr uint64_t kHWorkspaceMaxPhaseBytes = 8 * 1024 * 1024;
 constexpr uint32_t kVectorCoreCount = 40;
 constexpr uint32_t kPreferredBaseDim = 3072;
 
+enum class GdnTargetArch : uint32_t {
+    A2A3 = 0,
+    A5 = 1,
+};
+
+struct GdnArchPolicy {
+    GdnTargetArch target;
+    bool uses_soft_sync;
+    bool supports_edge_head_counts;
+};
+
+bool ResolveArchPolicy(platform_ascendc::SocVersion soc_version,
+                       GdnArchPolicy *policy)
+{
+    if (policy == nullptr) {
+        return false;
+    }
+    switch (soc_version) {
+        case platform_ascendc::SocVersion::ASCEND910B:
+        case platform_ascendc::SocVersion::ASCEND910_93:
+            *policy = {GdnTargetArch::A2A3, false, true};
+            return true;
+        case platform_ascendc::SocVersion::ASCEND950:
+            *policy = {GdnTargetArch::A5, true, false};
+            return true;
+        default:
+            return false;
+    }
+}
+
 enum InputIndex {
     MIXED_QKV_INDEX = 0,
     B_INDEX,
@@ -111,7 +141,7 @@ uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
                             kDtypeBytes);
     bytes += AlignWorkspace(static_cast<uint64_t>(tokens) * heads *
                             kDtypeBytes);
-    bytes += AlignWorkspace(kChunkSize * kChunkSize * kDtypeBytes);
+    bytes += AlignWorkspace(3 * kChunkSize * kChunkSize * kDtypeBytes);
     bytes += AlignWorkspace(static_cast<uint64_t>(tokens) * heads *
                             kFloatBytes);
     bytes += AlignWorkspace(static_cast<uint64_t>(tokens) * heads *
@@ -139,6 +169,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     auto platform =
         platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    GdnArchPolicy arch_policy{};
+    if (!ResolveArchPolicy(platform.GetSocVersion(), &arch_policy)) {
+        return ge::GRAPH_FAILED;
+    }
     uint32_t block_dim = platform.GetCoreNumAic();
     if (block_dim == 0) {
         block_dim = platform.GetCoreNumAiv();
@@ -181,12 +215,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
-    const bool is_ascend950 =
-        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     // Keep A5 on the head shapes that pass the prefill accuracy matrix.  The
     // excluded shapes remain available on A2/A3 and use xLLM's unfused path
     // on A5.
-    if (is_ascend950 && (heads == 1 || heads == 3 || heads == 64)) {
+    if (!arch_policy.supports_edge_head_counts &&
+        (heads == 1 || heads == 3 || heads == 64)) {
         return ge::GRAPH_FAILED;
     }
     // A5's MIX SYNCALL contract requires the complete physical MIX block set.
@@ -299,6 +332,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     MegaGdnPrefillOpTilingData tiling;
     tiling.set_block_dim(block_dim);
+    tiling.set_target_arch(static_cast<uint32_t>(arch_policy.target));
     tiling.set_num_matrices(num_matrices);
     tiling.set_batch_size(batch_size);
     tiling.set_num_heads(heads);
@@ -334,7 +368,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         CalcUserWorkspaceBytes(block_dim, num_matrices, batch_size, tokens,
                                heads, conv_dim,
                                static_cast<uint32_t>(conv_state.GetDim(1)));
-    if (is_ascend950) {
+    if (arch_policy.uses_soft_sync) {
         user_workspace_bytes +=
             AlignWorkspace(static_cast<uint64_t>(block_dim) * 3 *
                            kSoftSyncBytesPerParticipant);

@@ -1,7 +1,10 @@
 // Qwen3.5 prefill Conv-to-gated-RMSNorm single-launch PTO kernel.
 
+#include "gdn_prefill_arch.h"
+
 struct MegaGdnPrefillOpKernelTilingData {
     uint32_t block_dim;
+    uint32_t target_arch;
     uint32_t num_matrices;
     uint32_t batch_size;
     uint32_t num_heads;
@@ -26,21 +29,25 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define MEGA_CHUNK_GDN_HELPERS_ONLY
 #define MEGA_CHUNK_GDN_HELPER_NAMESPACE qwen35_e2e_pto
 #define MEGA_GDN_BUILD_REV 2026081901
-#define MEGA_CHUNK_GDN_A5_SOFT_SYNC
-#if !defined(__NPU_ARCH__) || (__NPU_ARCH__ != 3510)
-// These schedules were added after the A2/A3 implementation.  Their flag
-// allocation and solve hand-off assume the legacy FFTS model, so keep the
-// Ascend950 path on the PR #41-compatible schedule.
+#if defined(GDN_PREFILL_ARCH_A2A3)
 #define MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
+#else
+// A5 uses GM-backed all-core synchronization and the conservative solve
+// hand-off. Its intra-block event allocation is independent of A2/A3 FFTS.
+#define MEGA_CHUNK_GDN_A5_SOFT_SYNC
 #endif
-// The included helpers keep the public BF16 boundary and cast into FP16 on A2.
+// The included helpers keep the public BF16 boundary and cast into FP16 on
+// A2/A3.
 #include "../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
+#if defined(GDN_PREFILL_ARCH_A5)
 #undef MEGA_CHUNK_GDN_A5_SOFT_SYNC
+#else
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #undef MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
+#endif
 #undef MEGA_CHUNK_GDN_HELPER_NAMESPACE
 #undef MEGA_CHUNK_GDN_HELPERS_ONLY
 #undef GDN_PUBLIC_DTYPE
@@ -81,6 +88,9 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
                                 tiling_data, tiling);
 
 #ifdef __CCE_AICORE__
+    if (tiling_data.target_arch != GDN_PREFILL_ARCH_ID) {
+        return;
+    }
     GM_ADDR user_workspace = AscendC::GetUserWorkspace(workspace);
     const uint32_t block_dim = tiling_data.block_dim;
     const uint32_t batch_size = tiling_data.batch_size;
@@ -93,7 +103,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     const uint64_t matrices = tiling_data.num_matrices;
     uint64_t offset = 0;
 
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
     GM_ADDR soft_sync_workspace = user_workspace + offset;
     const int32_t soft_sync_aiv_cores = static_cast<int32_t>(block_dim * 2);
     // Preserve the established workspace layout (one reserved slot per MIX
@@ -185,7 +195,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         compact_conv_state_snapshot_ptr, frontend_tiling,
         batch_size, tiling_data.conv_state_len);
 
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
     // RunConv owns a temporary TPipe and publishes both packed QKV and the
     // final convolution state through MTE3.  Drain those stores before the
     // same AIV initializes the gate stage and reuses pipe/event resources.
@@ -209,7 +219,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
             minus_identity_compute_ptr),
         static_cast<int64_t>(kChunkSize * kChunkSize));
 
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
     qwen35_e2e_pto::SyncAllImpl<false>(soft_sync_workspace,
                                        soft_sync_aiv_cores);
 #else
@@ -228,7 +238,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     GM_ADDR q_ptr = packed_qkv_compute_ptr;
     GM_ADDR k_ptr = q_ptr + q_bytes;
     GM_ADDR v_ptr = k_ptr + q_bytes;
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
     // Recycling one of four KKT-to-Solve slots while the fifth producer wave
     // is still live can deadlock at 16 chunks. A5 uses the existing full
     // stage rendezvous instead of the pipelined slot protocol.
@@ -250,12 +260,12 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         norm_weight_ptr, ssm_cache_out_ptr, ssm_state_write_indices_ptr, 1,
         ssm_cache_ptr, ssm_state_read_indices_ptr,
         static_cast<int64_t>(tiling_data.ssm_state_slots)
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
         , soft_sync_workspace, soft_sync_aiv_cores
 #endif
         );
     pipe_barrier(PIPE_ALL);
-#if defined(PTO_NPU_ARCH_A5) && defined(__DAV_VEC__)
+#if defined(GDN_PREFILL_ARCH_A5) && defined(__DAV_VEC__)
     // Prefill publishes conv/SSM state that later decode graph replays consume.
     // The OpDef exposes separate input/output tensors so graph dataflow records
     // the mutation even when the caller aliases output storage to the caches.

@@ -99,7 +99,7 @@ public:
                                               int32_t channelStart,
                                               int32_t baseDim)
     {
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
         if (writeCacheIndex < 0 ||
             writeCacheIndex >=
                 static_cast<int32_t>(this->tilingData_->numCacheLines) ||
@@ -443,7 +443,7 @@ __aicore__ inline void RunConv(GM_ADDR mixedQkv, GM_ADDR convWeight,
         if (useCompactSnapshot) {
             op.SnapshotInitialStates(compactConvStateSnapshot, readIndices,
                                      static_cast<int32_t>(batchSize));
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(GDN_PREFILL_ARCH_A5)
             pto::SYNCALL<pto::SyncCoreType::AIVOnly>();
 #else
             AscendC::SyncAll();

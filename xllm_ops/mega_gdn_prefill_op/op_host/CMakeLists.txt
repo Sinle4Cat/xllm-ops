@@ -11,6 +11,17 @@ set(A5_SOFT_SYNC_MIX_OPS
     mega_gdn_prefill_op
     CACHE INTERNAL "A5 MIX operators using only software global sync" FORCE)
 
+add_ops_compile_options(
+    OP_NAME MegaGdnPrefillOp
+    COMPUTE_UNIT "ascend910b1;ascend910b2;ascend910b2c;ascend910b3;ascend910b4;ascend910b4-1;ascend910_9391;ascend910_9381;ascend910_9372;ascend910_9392;ascend910_9382;ascend910_9362"
+    OPTIONS -DGDN_PREFILL_TARGET_A2A3=1
+)
+add_ops_compile_options(
+    OP_NAME MegaGdnPrefillOp
+    COMPUTE_UNIT ascend950
+    OPTIONS -DGDN_PREFILL_TARGET_A5=1
+)
+
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnn PRIVATE
         mega_gdn_prefill_op_def.cpp
