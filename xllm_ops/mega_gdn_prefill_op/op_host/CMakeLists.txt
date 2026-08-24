@@ -2,14 +2,36 @@
 
 add_op_to_compiled_list()
 
-# Ascend950 does not provide the FFTS hardware-sync address attached by CANN
-# to MIX 1:2 metadata.  The A5 kernel uses PTO's GM-backed MIX software
-# rendezvous instead, so register it for the guarded metadata post-processing
-# step in cmake/func.cmake.  A2/A3 builds are not modified.
-set(A5_SOFT_SYNC_MIX_OPS
-    ${A5_SOFT_SYNC_MIX_OPS}
-    mega_gdn_prefill_op
-    CACHE INTERNAL "A5 MIX operators using only software global sync" FORCE)
+if("ascend950" IN_LIST ASCEND_COMPUTE_UNIT)
+    set(MEGA_GDN_PREFILL_MIN_CANN_VERSION "9.1.0")
+    set(MEGA_GDN_PREFILL_CANN_VERSION_FILE
+        "${ASCEND_CANN_PACKAGE_PATH}/opp/version.info")
+    if(NOT EXISTS "${MEGA_GDN_PREFILL_CANN_VERSION_FILE}")
+        message(FATAL_ERROR
+            "MegaGdnPrefillOp on Ascend950 requires CANN "
+            "${MEGA_GDN_PREFILL_MIN_CANN_VERSION} or newer, but "
+            "${MEGA_GDN_PREFILL_CANN_VERSION_FILE} is missing")
+    endif()
+    file(STRINGS "${MEGA_GDN_PREFILL_CANN_VERSION_FILE}"
+        MEGA_GDN_PREFILL_CANN_VERSION_LINE
+        REGEX "^Version="
+        LIMIT_COUNT 1)
+    if(NOT MEGA_GDN_PREFILL_CANN_VERSION_LINE)
+        message(FATAL_ERROR
+            "MegaGdnPrefillOp cannot determine the CANN version from "
+            "${MEGA_GDN_PREFILL_CANN_VERSION_FILE}")
+    endif()
+    string(REGEX REPLACE "^Version=" ""
+        MEGA_GDN_PREFILL_CANN_VERSION
+        "${MEGA_GDN_PREFILL_CANN_VERSION_LINE}")
+    if("${MEGA_GDN_PREFILL_CANN_VERSION}" VERSION_LESS
+       "${MEGA_GDN_PREFILL_MIN_CANN_VERSION}")
+        message(FATAL_ERROR
+            "MegaGdnPrefillOp on Ascend950 requires CANN "
+            "${MEGA_GDN_PREFILL_MIN_CANN_VERSION} or newer; found "
+            "${MEGA_GDN_PREFILL_CANN_VERSION}")
+    endif()
+endif()
 
 add_ops_compile_options(
     OP_NAME MegaGdnPrefillOp

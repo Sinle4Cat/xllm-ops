@@ -287,11 +287,15 @@ AICORE inline void mega_transpose_TH_to_HT(__gm__ T *src, __gm__ T *dst, int64_t
             UBSrcDyn load(valid, tile_heads);
             TASSIGN(load, SRC_UB);
             TLOAD(load, src_gm);
+            // A partial tile must not be padded on the Vector pipe until the
+            // preceding MTE2 load has finished writing SRC_UB.  Without this
+            // dependency, odd head counts can race in TFILLPAD_INPLACE and
+            // make beta_t (and every downstream solve output) nondeterministic.
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             if (valid != BLOCK || tile_heads != HEAD_TILE) {
                 TFILLPAD_INPLACE(ub_src, load);
             }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             TTRANS(ub_dst, ub_src, ub_tmp);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -306,8 +310,15 @@ AICORE inline void mega_transpose_TH_to_HT(__gm__ T *src, __gm__ T *dst, int64_t
                 TASSIGN(store, DST_UB + (h - head_base) * BLOCK * ES);
                 TSTORE(dst_gm, store);
             }
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            // TSTORE still reads DST_UB while the next TTRANS would overwrite
+            // it, so order MTE3 before the next Vector operation.
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            // TTRANS reads SRC_UB on the Vector pipe.  Keep the next TLOAD
+            // (including the following beta transpose call) from overwriting
+            // SRC_UB until that read is complete.
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
         }
     }
     dsb(DSB_ALL);

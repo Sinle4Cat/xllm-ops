@@ -518,6 +518,14 @@ __aicore__ inline void PrepareGate(GM_ADDR aPtr, GM_ADDR bPtr, GM_ADDR aLogPtr, 
     AscendC::Duplicate(aLog, 0.0f, kVectorWidth);
     AscendC::Duplicate(dtBias, 0.0f, kVectorWidth);
     AscendC::PipeBarrier<PIPE_V>();
+#if defined(GDN_PREFILL_ARCH_A5)
+    // For a full 64-head row CopyGmToUb does not enter its padding path, so
+    // it does not emit the V->MTE2 dependency used by partial rows.  Order
+    // these loads after the initialization writes explicitly; otherwise the
+    // MTE2 load can race the Vector duplicate only at numHeads == 64.
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(7);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(7);
+#endif
     CopyGmToUb<float, kVectorWidth>(aLog[0], aLogGm[0], numHeads, 1, numHeads, 0.0f);
     CopyGmToUb<float, kVectorWidth>(dtBias[0], dtBiasGm[0], numHeads, 1, numHeads, 0.0f);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);

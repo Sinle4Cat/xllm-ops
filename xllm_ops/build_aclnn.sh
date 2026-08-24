@@ -355,6 +355,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "pp_matmul_opt"
         "replace_token"
         "mtp_prepare_next_draft"
+        "reshape_and_cache_a5"
         "select_unshared_kv"
         # "x_attention_tl"  # A5 kernel not adapted
         "x_flash_attention_infer"

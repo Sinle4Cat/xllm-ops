@@ -753,6 +753,23 @@ at::Tensor& scatter_nd_update_v2_impl_npu(
   return var;
 }
 
+std::tuple<at::Tensor&, at::Tensor&> reshape_and_cache_a5_impl_npu(
+    const at::Tensor& key,
+    const at::Tensor& value,
+    at::Tensor& key_cache,
+    at::Tensor& value_cache,
+    const at::Tensor& slot_mapping) {
+  EXEC_NPU_CMD(aclnnReshapeAndCacheA5,
+               key,
+               value,
+               key_cache,
+               value_cache,
+               slot_mapping,
+               key_cache,
+               value_cache);
+  return {key_cache, value_cache};
+}
+
 at::Tensor hc_post_impl_npu(const at::Tensor& x,
                             const at::Tensor& residual,
                             const at::Tensor& post,
@@ -1998,25 +2015,10 @@ at::Tensor mega_gdn_prefill_op(
   const bool is_ascend950 =
       soc_name != nullptr &&
       std::string(soc_name).find("Ascend950") != std::string::npos;
-  if (is_ascend950) {
-    void* hardware_sync_addr = nullptr;
-    using GetHardwareSyncAddrFn = aclError (*)(void**);
-    auto* get_hardware_sync_addr = reinterpret_cast<GetHardwareSyncAddrFn>(
-        dlsym(RTLD_DEFAULT, "aclrtGetHardwareSyncAddr"));
-    TORCH_CHECK(get_hardware_sync_addr != nullptr,
-                "aclrtGetHardwareSyncAddr is unavailable in the runtime");
-    const aclError sync_status = get_hardware_sync_addr(&hardware_sync_addr);
-    const bool address_not_required =
-        sync_status == ACL_ERROR_RT_FEATURE_NOT_SUPPORT;
-    TORCH_CHECK(
-        address_not_required ||
-            (sync_status == ACL_SUCCESS && hardware_sync_addr != nullptr),
-        "aclrtGetHardwareSyncAddr failed, status=", sync_status);
-    if (!address_not_required) {
-      ffts_addr = static_cast<uint64_t>(
-          reinterpret_cast<uintptr_t>(hardware_sync_addr));
-    }
-  } else {
+  // Ascend950 uses the operator's GM-based software synchronization and does
+  // not consume an FFTS address. Keep the required ACLNN attribute at zero.
+  // A2/A3 retain the hardware FFTS address path used by their kernel.
+  if (!is_ascend950) {
     using RtGetC2cCtrlAddr = int32_t (*)(uint64_t*, uint32_t*);
     static RtGetC2cCtrlAddr get_c2c_ctrl_addr = [] {
       void* runtime = dlopen("libruntime.so", RTLD_LAZY | RTLD_LOCAL);
@@ -2131,6 +2133,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "mtp_prepare_next_draft");
   m.def("convert_kv_cache_format", &convert_kv_cache_format_impl_npu, "convert_kv_cache_format");
   m.def("scatter_nd_update_v2", &scatter_nd_update_v2_impl_npu, "scatter_nd_update_v2");
+  m.def("reshape_and_cache_a5",
+        &reshape_and_cache_a5_impl_npu,
+        "reshape_and_cache_a5");
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");

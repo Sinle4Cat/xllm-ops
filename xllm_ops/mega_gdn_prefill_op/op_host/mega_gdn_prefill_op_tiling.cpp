@@ -31,7 +31,6 @@ enum class GdnTargetArch : uint32_t {
 struct GdnArchPolicy {
     GdnTargetArch target;
     bool uses_soft_sync;
-    bool supports_edge_head_counts;
 };
 
 bool ResolveArchPolicy(platform_ascendc::SocVersion soc_version,
@@ -43,10 +42,10 @@ bool ResolveArchPolicy(platform_ascendc::SocVersion soc_version,
     switch (soc_version) {
         case platform_ascendc::SocVersion::ASCEND910B:
         case platform_ascendc::SocVersion::ASCEND910_93:
-            *policy = {GdnTargetArch::A2A3, false, true};
+            *policy = {GdnTargetArch::A2A3, false};
             return true;
         case platform_ascendc::SocVersion::ASCEND950:
-            *policy = {GdnTargetArch::A5, true, false};
+            *policy = {GdnTargetArch::A5, true};
             return true;
         default:
             return false;
@@ -215,13 +214,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
-    // Keep A5 on the head shapes that pass the prefill accuracy matrix.  The
-    // excluded shapes remain available on A2/A3 and use xLLM's unfused path
-    // on A5.
-    if (!arch_policy.supports_edge_head_counts &&
-        (heads == 1 || heads == 3 || heads == 64)) {
-        return ge::GRAPH_FAILED;
-    }
     // A5's MIX SYNCALL contract requires the complete physical MIX block set.
     // Stage kernels already use grid-stride ownership, so blocks without a
     // head task still participate in every barrier and safely remain idle.

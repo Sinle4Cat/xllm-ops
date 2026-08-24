@@ -265,21 +265,6 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
 #endif
         );
     pipe_barrier(PIPE_ALL);
-#if defined(GDN_PREFILL_ARCH_A5) && defined(__DAV_VEC__)
-    // Prefill publishes conv/SSM state that later decode graph replays consume.
-    // The OpDef exposes separate input/output tensors so graph dataflow records
-    // the mutation even when the caller aliases output storage to the caches.
-    // That dependency does not invalidate an AIV's private D-cache. Cleaning
-    // only the producer-owned lines makes the writes
-    // visible in DDR, while an AIV reused by a later graph can still hit a
-    // private cache line left by the previous request. Every A5 AIV
-    // participates in this MIX launch; invalidate each private cache after
-    // all state stores have drained so the next decode graph acquires the
-    // freshly published state.  Keep this strictly A5/vector-only: A2/A3 keep
-    // their existing FFTS/coherency path byte-for-byte.
-    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
-    dsb(DSB_ALL);
-#endif
 #endif
 }
 
