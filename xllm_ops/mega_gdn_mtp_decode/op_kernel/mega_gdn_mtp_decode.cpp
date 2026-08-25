@@ -43,11 +43,7 @@ AICORE PTO_INLINE void RunMegaGdnMtpDecode(
     int32_t num_k_heads,
     int32_t num_v_heads,
     int32_t batch_size,
-    int32_t runtime_sequence_length
-#if defined(PTO_NPU_ARCH_A5)
-    , GM_ADDR soft_sync_workspace
-#endif
-    ) {
+    int32_t runtime_sequence_length) {
 #if defined(PTO_NPU_ARCH_A5)
   mega_gdn_mtp_decode_pto::Run<
       SpeculativeTokens,
@@ -82,11 +78,7 @@ AICORE PTO_INLINE void RunMegaGdnMtpDecode(
       num_k_heads,
       num_v_heads,
       batch_size,
-      runtime_sequence_length
-#if defined(PTO_NPU_ARCH_A5)
-      , soft_sync_workspace
-#endif
-      );
+      runtime_sequence_length);
 }
 
 extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
@@ -110,26 +102,13 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
     GM_ADDR workspace,
     GM_ADDR tiling) {
 #if defined(PTO_NPU_ARCH_A5)
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 #else
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 #endif
   REGISTER_TILING_DEFAULT(MegaGdnMtpDecodeTilingData);
   GET_TILING_DATA_WITH_STRUCT(MegaGdnMtpDecodeTilingData, tiling_data, tiling);
-#if defined(PTO_NPU_ARCH_A5)
-  // ACLNN keeps the library workspace at the beginning of the host
-  // allocation and passes this kernel pointer at the start of the user
-  // workspace. Do not add the library-workspace offset a second time.
-  GM_ADDR soft_sync_workspace = workspace;
-#else
   (void)workspace;
-#endif
-
-#if defined(PTO_NPU_ARCH_A5)
-#define A5_SOFT_SYNC_ARG , soft_sync_workspace
-#else
-#define A5_SOFT_SYNC_ARG
-#endif
 
 #if defined(PTO_NPU_ARCH_A5)
 #define RUN_MTP_IMPL(                                                       \
@@ -190,7 +169,7 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
       static_cast<int32_t>(tiling_data.num_k_heads),                         \
       static_cast<int32_t>(tiling_data.num_v_heads),                         \
       static_cast<int32_t>(tiling_data.batch_size),                          \
-      static_cast<int32_t>(tiling_data.sequence_length) A5_SOFT_SYNC_ARG)
+      static_cast<int32_t>(tiling_data.sequence_length))
 
   if constexpr (TILING_KEY_IS(101)) {
     RUN_MTP(1, false, false, false, true);
@@ -243,7 +222,6 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
   }
 #undef RUN_MTP
 #undef RUN_MTP_IMPL
-#undef A5_SOFT_SYNC_ARG
 }
 
 // Keep this include last; generated mixed-kernel wrappers call

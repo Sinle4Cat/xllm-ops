@@ -222,7 +222,7 @@ AICORE inline bool ResolveHoGlobalChunk(
   return false;
 }
 
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+#if defined(PTO_NPU_ARCH_A2A3)
 template <int32_t Rows, typename TileDataOut, typename TileDataIn>
 __tf__ PTO_INTERNAL void ReduceRowsFp32Normal(TileDataOut &dst,
                                               TileDataIn &src)
@@ -269,7 +269,7 @@ AICORE inline void NormalizeRmsRows()
     TASSIGN(reduced_halves, ReduceTmpAddr);
     TADD(reduced_halves, square_low, square_high);
     pipe_barrier(PIPE_V);
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+#if defined(PTO_NPU_ARCH_A2A3)
     // PTO's 64-wide TROWSUM selects count mode on A2/A3. LayerNormFwd uses
     // normal mode with one explicit repeat per row, so issue the same vcadd
     // form to preserve its reduction tree bit for bit.

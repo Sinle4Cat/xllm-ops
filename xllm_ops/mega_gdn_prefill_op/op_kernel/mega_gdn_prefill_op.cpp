@@ -33,17 +33,11 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
-#else
-// A5 uses GM-backed all-core synchronization and the conservative solve
-// hand-off. Its intra-block event allocation is independent of A2/A3 FFTS.
-#define MEGA_CHUNK_GDN_A5_SOFT_SYNC
 #endif
 // The included helpers keep the public BF16 boundary and cast into FP16 on
 // A2/A3.
 #include "../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
-#if defined(GDN_PREFILL_ARCH_A5)
-#undef MEGA_CHUNK_GDN_A5_SOFT_SYNC
-#else
+#if defined(GDN_PREFILL_ARCH_A2A3)
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #undef MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
@@ -63,7 +57,6 @@ constexpr uint64_t kDtypeBytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 constexpr uint64_t kHeadDim = 128;
 constexpr uint64_t kChunkSize = 128;
-constexpr uint64_t kSoftSyncBytesPerParticipant = 32;
 
 AICORE inline uint64_t AlignWorkspace(uint64_t bytes)
 {
@@ -102,21 +95,6 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     const uint64_t key_heads = num_key_heads;
     const uint64_t matrices = tiling_data.num_matrices;
     uint64_t offset = 0;
-
-#if defined(GDN_PREFILL_ARCH_A5)
-    GM_ADDR soft_sync_workspace = user_workspace + offset;
-    const int32_t soft_sync_aiv_cores = static_cast<int32_t>(block_dim * 2);
-    // Preserve the established workspace layout (one reserved slot per MIX
-    // participant), although only the two AIV siblings own generation slots.
-    const int32_t soft_sync_reserved_slots = static_cast<int32_t>(block_dim * 3);
-    offset += AlignWorkspace(static_cast<uint64_t>(soft_sync_reserved_slots) *
-                             kSoftSyncBytesPerParticipant);
-    // The launcher clears this prefix on the same stream before enqueueing the
-    // kernel. Never initialize counters from device code: an early AIV could
-    // otherwise enter a different generation from its peers.
-    qwen35_e2e_pto::SyncAllImpl<false>(soft_sync_workspace,
-                                      soft_sync_aiv_cores);
-#endif
 
     GM_ADDR compact_conv_state_snapshot_ptr = user_workspace + offset;
     offset += AlignWorkspace(
@@ -225,12 +203,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
             minus_identity_compute_ptr),
         static_cast<int64_t>(kChunkSize * kChunkSize));
 
-#if defined(GDN_PREFILL_ARCH_A5)
-    qwen35_e2e_pto::SyncAllImpl<false>(soft_sync_workspace,
-                                       soft_sync_aiv_cores);
-#else
     qwen35_e2e_pto::SyncAllImpl<false>();
-#endif
 
 #ifdef E2E_STOP_AFTER_FRONTEND
     return;
@@ -248,23 +221,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     // Recycling one of four KKT-to-Solve slots while the fifth producer wave
     // is still live can deadlock at 16 chunks. A5 uses the existing full
     // stage rendezvous instead of the pipelined slot protocol.
-    qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
-        q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
-        mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
-        norm_output_ptr, g_sum_ptr,
-        g_t_ptr, beta_t_ptr, a_matrix_ptr, a_matrix_ptr, a_inv_ptr, w_ptr,
-        u_ptr, s_ptr, v_new_ptr, s_ptr, s_ptr,
-        1, kkt_workspace_ptr,
-        wy_workspace_a1_ptr, wy_workspace_a2_ptr, h_workspace_ptr,
-        o_workspace_qk_ptr, o_workspace_qs_ptr, o_workspace_gated_ptr,
-        static_cast<int32_t>(heads), num_key_heads, batch_size, total_tokens,
-        total_tokens, static_cast<uint32_t>(matrices),
-        tiling_data.ffts_addr, z_ptr,
-        norm_weight_ptr, ssm_cache_out_ptr, ssm_state_write_indices_ptr, 1,
-        ssm_cache_ptr, ssm_state_read_indices_ptr,
-        static_cast<int64_t>(tiling_data.ssm_state_slots),
-        soft_sync_workspace, soft_sync_aiv_cores);
-#else
+#endif
     qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
         q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
         mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
@@ -280,7 +237,6 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         ssm_state_write_indices_ptr, 1, ssm_cache_ptr,
         ssm_state_read_indices_ptr,
         static_cast<int64_t>(tiling_data.ssm_state_slots));
-#endif
 #if defined(GDN_PREFILL_ARCH_A2A3) && defined(__DAV_C220_VEC__)
     // A PIPE_ALL barrier orders issued work but does not acknowledge the final
     // GM stores. Drain MTE3 once before kernel completion so output and state

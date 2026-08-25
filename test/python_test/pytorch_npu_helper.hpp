@@ -703,7 +703,6 @@ limitations under the License.
                  "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
      void *workspace_addr = nullptr;                                           \
      at::Tensor workspace_tensor;                                              \
-     bool initialize_a5_gdn_soft_sync = false;                                 \
      if (workspace_size != 0) {                                                \
        at::TensorOptions options =                                             \
            at::TensorOptions(torch_npu::utils::get_npu_device_type());         \
@@ -711,44 +710,13 @@ limitations under the License.
            at::empty({static_cast<int64_t>(workspace_size)},                   \
                      options.dtype(at::kByte));                                \
        workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
-       if (std::strcmp(#aclnn_api, "aclnnMegaGdnPrefillOp") == 0 ||           \
-           std::strcmp(#aclnn_api, "aclnnMegaGdnMtpDecode") == 0) {           \
-         const char *workspace_soc_name = aclrtGetSocName();                   \
-         initialize_a5_gdn_soft_sync =                                         \
-             workspace_soc_name != nullptr &&                                 \
-             std::strstr(workspace_soc_name, "Ascend950") != nullptr;         \
-       }                                                                       \
-       if (initialize_a5_gdn_soft_sync) {                                      \
-         constexpr int64_t kReservedWorkspaceBytes = 16 * 1024 * 1024;         \
-         constexpr int64_t kSoftSyncWorkspaceBytes = 4 * 1024;                \
-         TORCH_CHECK(                                                         \
-             workspace_size >= static_cast<uint64_t>(                         \
-                                   kReservedWorkspaceBytes +                   \
-                                   kSoftSyncWorkspaceBytes),                   \
-             #aclnn_api " workspace is too small for A5 software sync");      \
-       }                                                                       \
      }                                                                         \
      auto acl_call = [converted_params, workspace_addr, workspace_size,        \
-                      acl_stream, executor, initialize_a5_gdn_soft_sync,       \
+                      acl_stream, executor,                                    \
                       workspace_lifetime = workspace_tensor]() -> int {        \
        /* OpCommand may execute this handler on its asynchronous task queue. */ \
        /* Keep the backing storage alive until the ACL kernel is submitted. */  \
        (void)workspace_lifetime;                                                \
-       if (initialize_a5_gdn_soft_sync) {                                      \
-         constexpr int64_t kReservedWorkspaceBytes = 16 * 1024 * 1024;         \
-         constexpr int64_t kSoftSyncWorkspaceBytes = 4 * 1024;                \
-         void *soft_sync_workspace =                                           \
-             static_cast<uint8_t *>(workspace_addr) +                          \
-             kReservedWorkspaceBytes;                                          \
-         /* Keep the counter reset adjacent to its kernel in task-queue */      \
-         /* order; otherwise later layers can reset an earlier launch. */       \
-         const aclError memset_status = aclrtMemsetAsync(                      \
-             soft_sync_workspace, kSoftSyncWorkspaceBytes, 0,                  \
-             kSoftSyncWorkspaceBytes, acl_stream);                             \
-         TORCH_CHECK(memset_status == ACL_SUCCESS,                             \
-                     "failed to clear " #aclnn_api                            \
-                     " A5 software-sync workspace");                          \
-       }                                                                       \
        typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
                                 const aclrtStream);                            \
        OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \

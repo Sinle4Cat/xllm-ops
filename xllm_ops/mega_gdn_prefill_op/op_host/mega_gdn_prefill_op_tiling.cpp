@@ -15,7 +15,6 @@ constexpr uint64_t kHeadDim = 128;
 constexpr uint64_t kChunkSize = 128;
 constexpr uint64_t kDtypeBytes = 2;
 constexpr uint64_t kFloatBytes = 4;
-constexpr uint64_t kSoftSyncBytesPerParticipant = 32;
 // Reserve the largest per-core H-workspace skew used by the compiled kernel.
 constexpr uint64_t kHWorkspacePadBytes = 8192;
 constexpr uint64_t kHWorkspaceAlignmentBytes = 16 * 1024 * 1024;
@@ -30,7 +29,6 @@ enum class GdnTargetArch : uint32_t {
 
 struct GdnArchPolicy {
     GdnTargetArch target;
-    bool uses_soft_sync;
 };
 
 bool ResolveArchPolicy(platform_ascendc::SocVersion soc_version,
@@ -42,10 +40,10 @@ bool ResolveArchPolicy(platform_ascendc::SocVersion soc_version,
     switch (soc_version) {
         case platform_ascendc::SocVersion::ASCEND910B:
         case platform_ascendc::SocVersion::ASCEND910_93:
-            *policy = {GdnTargetArch::A2A3, false};
+            *policy = {GdnTargetArch::A2A3};
             return true;
         case platform_ascendc::SocVersion::ASCEND950:
-            *policy = {GdnTargetArch::A5, true};
+            *policy = {GdnTargetArch::A5};
             return true;
         default:
             return false;
@@ -356,15 +354,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (workspace_sizes == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    uint64_t user_workspace_bytes =
+    const uint64_t user_workspace_bytes =
         CalcUserWorkspaceBytes(block_dim, num_matrices, batch_size, tokens,
                                heads, conv_dim,
                                static_cast<uint32_t>(conv_state.GetDim(1)));
-    if (arch_policy.uses_soft_sync) {
-        user_workspace_bytes +=
-            AlignWorkspace(static_cast<uint64_t>(block_dim) * 3 *
-                           kSoftSyncBytesPerParticipant);
-    }
     workspace_sizes[0] =
         user_workspace_bytes + platform.GetLibApiWorkSpaceSize();
     return ge::GRAPH_SUCCESS;
