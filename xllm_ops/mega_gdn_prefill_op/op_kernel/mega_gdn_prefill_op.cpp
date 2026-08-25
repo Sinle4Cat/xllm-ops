@@ -28,7 +28,7 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define GDN_PUBLIC_DTYPE DTYPE_MIXED_QKV
 #define MEGA_CHUNK_GDN_HELPERS_ONLY
 #define MEGA_CHUNK_GDN_HELPER_NAMESPACE qwen35_e2e_pto
-#define MEGA_GDN_BUILD_REV 2026081901
+#define MEGA_GDN_BUILD_REV 2026082515
 #if defined(GDN_PREFILL_ARCH_A2A3)
 #define MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
@@ -209,9 +209,15 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     return;
 #endif
 
+    const bool round_g_to_bf16 =
+#if defined(GDN_PREFILL_ARCH_A5)
+        true;
+#else
+        tiling_data.checkpoint_stride > 1;
+#endif
     gdn_prefill_frontend::PrepareGate<GDN_PREFILL_COMPUTE_DTYPE>(
         a_ptr, b_ptr, a_log_ptr, dt_bias_ptr, g_ptr, beta_compute_ptr,
-        total_tokens, static_cast<int32_t>(num_heads));
+        total_tokens, static_cast<int32_t>(num_heads), round_g_to_bf16);
     qwen35_e2e_pto::mega_prepare_solve_constants<
         bfloat16_t, GDN_PREFILL_COMPUTE_DTYPE>(
         reinterpret_cast<__gm__ bfloat16_t *>(minus_identity_ptr),
@@ -242,10 +248,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     // Recycling one of four KKT-to-Solve slots while the fifth producer wave
     // is still live can deadlock at 16 chunks. A5 uses the existing full
     // stage rendezvous instead of the pipelined slot protocol.
-    qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, false>(
-#else
     qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
-#endif
         q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
         mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
         norm_output_ptr, g_sum_ptr,
@@ -259,11 +262,32 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
         tiling_data.ffts_addr, z_ptr,
         norm_weight_ptr, ssm_cache_out_ptr, ssm_state_write_indices_ptr, 1,
         ssm_cache_ptr, ssm_state_read_indices_ptr,
-        static_cast<int64_t>(tiling_data.ssm_state_slots)
-#if defined(GDN_PREFILL_ARCH_A5)
-        , soft_sync_workspace, soft_sync_aiv_cores
+        static_cast<int64_t>(tiling_data.ssm_state_slots),
+        soft_sync_workspace, soft_sync_aiv_cores);
+#else
+    qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
+        q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
+        mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
+        norm_output_ptr, g_sum_ptr,
+        g_t_ptr, beta_t_ptr, a_matrix_ptr, a_matrix_ptr, a_inv_ptr, w_ptr,
+        u_ptr, s_ptr, v_new_ptr, s_ptr, s_ptr,
+        1, kkt_workspace_ptr,
+        wy_workspace_a1_ptr, wy_workspace_a2_ptr, h_workspace_ptr,
+        o_workspace_qk_ptr, o_workspace_qs_ptr, o_workspace_gated_ptr,
+        static_cast<int32_t>(heads), num_key_heads, batch_size, total_tokens,
+        total_tokens, static_cast<uint32_t>(matrices), tiling_data.ffts_addr,
+        z_ptr, norm_weight_ptr, ssm_cache_out_ptr,
+        ssm_state_write_indices_ptr, 1, ssm_cache_ptr,
+        ssm_state_read_indices_ptr,
+        static_cast<int64_t>(tiling_data.ssm_state_slots));
 #endif
-        );
+#if defined(GDN_PREFILL_ARCH_A2A3) && defined(__DAV_C220_VEC__)
+    // A PIPE_ALL barrier orders issued work but does not acknowledge the final
+    // GM stores. Drain MTE3 once before kernel completion so output and state
+    // cache writes are visible to the following op and to host-side checks.
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+#endif
     pipe_barrier(PIPE_ALL);
 #endif
 }

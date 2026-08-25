@@ -288,6 +288,8 @@ def _run_baseline(
         beta=1.0,
         threshold=20.0,
     )
+    if checkpoint_stride > 1:
+        g = g.to(tensors["a"].dtype).float()
     beta = (
         torch.sigmoid(tensors["b"].float())
         .to(torch.bfloat16)
@@ -536,6 +538,38 @@ def test_mega_gdn_prefill_op_state_modes(state_mode):
     torch_npu.npu.synchronize()
 
     _assert_results(e2e, baseline, WRITE_SLOT)
+
+
+@pytest.mark.parametrize("tokens", (2047, 2048, 2049, 4097))
+def test_mega_gdn_prefill_op_gate_bf16_midpoint_regression(tokens):
+    value_heads = 24
+    key_heads = 8
+    checkpoint_stride = 5
+    device = torch.device("npu:0")
+    torch_npu.npu.set_device(device)
+    cpu_inputs = _make_cpu_inputs(
+        value_heads,
+        key_heads,
+        checkpoint_stride=checkpoint_stride,
+        tokens=tokens,
+        state_mode="no_initial",
+    )
+    baseline_tensors = _to_device(cpu_inputs, device)
+    e2e_tensors = _to_device(cpu_inputs, device)
+    constants = _make_constants(device, tokens=tokens)
+
+    baseline = _run_baseline(
+        baseline_tensors,
+        constants,
+        value_heads,
+        key_heads,
+        "no_initial",
+        checkpoint_stride=checkpoint_stride,
+    )
+    e2e = _run_e2e(e2e_tensors, constants)
+    torch_npu.npu.synchronize()
+
+    _assert_results(e2e, baseline, WRITE_SLOT * checkpoint_stride)
 
 
 @pytest.mark.parametrize(

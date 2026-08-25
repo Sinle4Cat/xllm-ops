@@ -469,7 +469,7 @@ __aicore__ inline int32_t VectorTaskId()
 template <typename BetaT = bfloat16_t>
 __aicore__ inline void PrepareGate(GM_ADDR aPtr, GM_ADDR bPtr, GM_ADDR aLogPtr, GM_ADDR dtBiasPtr,
                                    GM_ADDR gPtr, GM_ADDR betaPtr, int64_t totalTokens,
-                                   int32_t numHeads)
+                                   int32_t numHeads, bool roundGToBf16)
 {
 #if defined(__DAV_C220_VEC__) || defined(__DAV_VEC__)
     static_assert(AscendC::IsSameType<BetaT, half>::value ||
@@ -562,17 +562,28 @@ __aicore__ inline void PrepareGate(GM_ADDR aPtr, GM_ADDR bPtr, GM_ADDR aLogPtr, 
         AscendC::Add(x[0], x[0], dtBiasRows[0], elements);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Abs(absX[0], x[0], elements);
-        AscendC::Muls(tmp[0], absX[0], -1.0f, elements);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Exp(betaFp32[0], tmp[0], elements);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(betaFp32[0], betaFp32[0], 1.0f, elements);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Ln(tmp[0], betaFp32[0], elements);
-        AscendC::CompareScalar(cmpMask[0], x[0], 20.0f, AscendC::CMPMODE::GT, elements);
         AscendC::Add(betaX[0], x[0], absX[0], elements);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(betaX[0], betaX[0], 0.5f, elements);
+        AscendC::Muls(tmp[0], absX[0], -1.0f, elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp(absX[0], tmp[0], elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(betaFp32[0], absX[0], 1.0f, elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        // Compensated log1p(y) = log(1 + y) + (y - ((1 + y) - 1)) / (1 + y).
+        // The correction preserves the low bits used by the unfused softplus
+        // before its BF16 gate rounding.
+        AscendC::Adds(tmp[0], betaFp32[0], -1.0f, elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(tmp[0], absX[0], tmp[0], elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div(tmp[0], tmp[0], betaFp32[0], elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Ln(absX[0], betaFp32[0], elements);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(tmp[0], absX[0], tmp[0], elements);
+        AscendC::CompareScalar(cmpMask[0], x[0], 20.0f, AscendC::CMPMODE::GT, elements);
         AscendC::Add(betaX[0], betaX[0], tmp[0], elements);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Select(betaX[0], cmpMask[0], x[0], betaX[0],
@@ -590,6 +601,14 @@ __aicore__ inline void PrepareGate(GM_ADDR aPtr, GM_ADDR bPtr, GM_ADDR aLogPtr, 
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(betaRounded[0].template ReinterpretCast<half>(), betaFp32[0],
                           AscendC::RoundMode::CAST_RINT, elements);
+        }
+        if (roundGToBf16) {
+            // Match paths that materialize g in the BF16 dtype of a before
+            // MegaChunkGdn converts it back to FP32.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(aBf16[0], x[0], AscendC::RoundMode::CAST_RINT, elements);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(x[0], aBf16[0], AscendC::RoundMode::CAST_NONE, elements);
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(2);

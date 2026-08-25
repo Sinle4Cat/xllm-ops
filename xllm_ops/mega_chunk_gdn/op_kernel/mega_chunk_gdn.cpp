@@ -572,6 +572,7 @@ AICORE inline void mega_prepare_solve_constants(
             AscendC::Cast(identity_local, fp32_local,
                           AscendC::RoundMode::CAST_RINT, valid);
         }
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(identity_local, identity_local, DstT(-1), valid);
         output_queue.EnQue(identity_local);
         identity_local = output_queue.DeQue<DstT>();
@@ -1037,7 +1038,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     const bool use_h_o_pipeline =
         EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
         cu_seqlens_ptr != nullptr && h_o_chunk_count >= 4 &&
-        h_o_chunk_count <= 64 && num_matrices == expected_h_o_matrices;
+        h_o_chunk_count <= 64 &&
+        num_matrices == expected_h_o_matrices;
 #endif
 #if defined(__DAV_C220_VEC__)
     if (use_h_o_pipeline && get_subblockid() == 0) {
@@ -1088,6 +1090,13 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     if (use_h_o_pipeline && EnableHoOverlap) {
         pipe_barrier(PIPE_ALL);
     } else {
+#if defined(__DAV_C220_VEC__)
+        // O consumes H's GM state/workspace. Cross-core rendezvous alone does
+        // not acknowledge outstanding MTE3 stores, so drain them before any
+        // consumer is released into chunk O.
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+#endif
         GDN_STAGE_SYNC();
     }
 

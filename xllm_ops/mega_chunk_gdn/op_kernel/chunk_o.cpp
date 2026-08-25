@@ -222,6 +222,19 @@ AICORE inline bool ResolveHoGlobalChunk(
   return false;
 }
 
+#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+template <int32_t Rows, typename TileDataOut, typename TileDataIn>
+__tf__ PTO_INTERNAL void ReduceRowsFp32Normal(TileDataOut &dst,
+                                              TileDataIn &src)
+{
+  __ubuf__ float *dst_ptr = reinterpret_cast<__ubuf__ float *>(
+      __cce_get_tile_ptr(dst.data()));
+  __ubuf__ float *src_ptr = reinterpret_cast<__ubuf__ float *>(
+      __cce_get_tile_ptr(src.data()));
+  vcadd(dst_ptr, src_ptr, Rows, 1, 1, 8, false);
+}
+#endif
+
 template <int32_t HiddenSize, int32_t Rows, int32_t OutputAddr,
           int32_t SquareAddr, int32_t ReduceTmpAddr, int32_t RowSumAddr,
           int32_t RowScaleAddr>
@@ -243,7 +256,32 @@ AICORE inline void NormalizeRmsRows()
 
   TMUL(square, output_fp32, output_fp32);
   pipe_barrier(PIPE_V);
-  TROWSUM(row_sum_col, square, reduce_tmp);
+  if constexpr (HiddenSize == 128) {
+    // Match LayerNormFwd's N=128 reduction tree: add the two 64-wide
+    // halves elementwise, then reduce the resulting 64 values.  The source
+    // tiles retain a physical row stride of 128 while exposing 64 valid
+    // columns, so PTO emits one strided vector add for all rows.
+    UbND<float, Rows, HiddenSize, Rows, HiddenSize / 2> square_low;
+    TASSIGN(square_low, SquareAddr);
+    UbND<float, Rows, HiddenSize, Rows, HiddenSize / 2> square_high;
+    TASSIGN(square_high, SquareAddr + HiddenSize / 2 * sizeof(float));
+    UbND<float, Rows, HiddenSize / 2> reduced_halves;
+    TASSIGN(reduced_halves, ReduceTmpAddr);
+    TADD(reduced_halves, square_low, square_high);
+    pipe_barrier(PIPE_V);
+#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+    // PTO's 64-wide TROWSUM selects count mode on A2/A3. LayerNormFwd uses
+    // normal mode with one explicit repeat per row, so issue the same vcadd
+    // form to preserve its reduction tree bit for bit.
+    set_mask_norm();
+    set_vector_mask(-1, -1);
+    ReduceRowsFp32Normal<Rows>(row_sum_col, reduced_halves);
+#else
+    TROWSUM(row_sum_col, reduced_halves, square);
+#endif
+  } else {
+    TROWSUM(row_sum_col, square, reduce_tmp);
+  }
   pipe_barrier(PIPE_V);
   TRESHAPE(row_sum_vec, row_sum_col);
   TMULS(row_sum_vec, row_sum_vec,
@@ -251,7 +289,15 @@ AICORE inline void NormalizeRmsRows()
   pipe_barrier(PIPE_V);
   TADDS(row_sum_vec, row_sum_vec, 1.0e-6f);
   pipe_barrier(PIPE_V);
-  TRSQRT(row_sum_vec, row_sum_vec);
+  TSQRT(row_sum_vec, row_sum_vec);
+  pipe_barrier(PIPE_V);
+  UbND<float, 1, Rows> reciprocal_numerator;
+  TASSIGN(reciprocal_numerator, ReduceTmpAddr);
+  TMULS(reciprocal_numerator, row_sum_vec, 0.0f);
+  pipe_barrier(PIPE_V);
+  TADDS(reciprocal_numerator, reciprocal_numerator, 1.0f);
+  pipe_barrier(PIPE_V);
+  TDIV(row_sum_vec, reciprocal_numerator, row_sum_vec);
   pipe_barrier(PIPE_V);
   TRESHAPE(row_sum_col, row_sum_vec);
   TROWEXPAND(row_scale_blocks, row_sum_col);
@@ -285,7 +331,8 @@ AICORE inline void StoreChunkOutput(
           ? OutputComputeAddr
           : 164608;
   constexpr int32_t NormWeightFp32Addr = 181504;
-  constexpr float OutputScale = 0.08838834764831845f;
+  // torch FP16 tensor-scalar Mul converts 1/sqrt(128) to FP16 first.
+  constexpr float OutputScale = 0.08837890625f;
 
   UbND<float, HalfChunk, HiddenSize> output_fp32;
   TASSIGN(output_fp32, OutputFp32Addr);
@@ -308,7 +355,6 @@ AICORE inline void StoreChunkOutput(
   TCVT(output_compute, output_fp32, pto::RoundMode::CAST_NONE);
 
   if constexpr (FuseGatedRmsNorm) {
-#ifndef MEGA_DIAG_SKIP_GATED_RMS
     {
       Shape<1, 1, 1, DYNAMIC, DYNAMIC> shape;
       shape.shape[3] = local_rows;
@@ -340,6 +386,14 @@ AICORE inline void StoreChunkOutput(
     TCVT(output_compute, output_fp32, pto::RoundMode::CAST_NONE);
     pipe_barrier(PIPE_V);
     TCVT(output_fp32, output_compute, pto::RoundMode::CAST_NONE);
+    if constexpr (!std::is_same_v<DTYPE_Q, GDN_PUBLIC_DTYPE>) {
+      // The standalone path returns the scaled FP16 result as BF16 before
+      // the model converts it back to FP32 for gated RMSNorm.
+      pipe_barrier(PIPE_V);
+      TCVT(output_public, output_fp32, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      TCVT(output_fp32, output_public, pto::RoundMode::CAST_NONE);
+    }
 
     NormalizeRmsRows<HiddenSize, HalfChunk, OutputFp32Addr, SquareAddr,
                      ReduceTmpAddr, RowSumAddr, RowRstdAddr>();
@@ -383,8 +437,7 @@ AICORE inline void StoreChunkOutput(
 #if defined(PTO_NPU_ARCH_A5)
     pipe_barrier(PIPE_V);
 #endif
-    TCVT(output_public, output_fp32, pto::RoundMode::CAST_NONE);
-#endif
+    TCVT(output_public, output_fp32, pto::RoundMode::CAST_ROUND);
   } else if constexpr (!std::is_same_v<DTYPE_Q, GDN_PUBLIC_DTYPE>) {
     pipe_barrier(PIPE_V);
     TCVT(output_fp32, output_compute, pto::RoundMode::CAST_NONE);
@@ -392,7 +445,6 @@ AICORE inline void StoreChunkOutput(
     TCVT(output_public, output_fp32, pto::RoundMode::CAST_NONE);
   }
 
-#ifndef MEGA_DIAG_SKIP_OUTPUT_STORE
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
   {
@@ -407,7 +459,6 @@ AICORE inline void StoreChunkOutput(
     TASSIGN(output_store, OutputPublicAddr);
     TSTORE(output_global, output_store);
   }
-#endif
 #endif
 }
 
@@ -2564,6 +2615,7 @@ AICORE void GDN_CHUNK_O_KERNEL(
     TASSIGN(norm_weight_fp32, NormWeightFp32Addr);
     TCVT(norm_weight_fp32, norm_weight_public,
          pto::RoundMode::CAST_NONE);
+    pipe_barrier(PIPE_V);
   }
 
   if (cu_seqlens == nullptr) {
