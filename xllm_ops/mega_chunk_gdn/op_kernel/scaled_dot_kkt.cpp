@@ -312,7 +312,8 @@ AICORE PTO_INLINE void kkt_kernel(
     uint64_t ffts_addr,
     uint32_t use_group_kk_cache,
     uint32_t enable_solve_pipeline = 0,
-    uint32_t emit_precomputed_m_neg = 0)
+    uint32_t emit_precomputed_m_neg = 0,
+    __gm__ int32_t *pipeline_ready_handle = nullptr)
 {
   constexpr int32_t HalfChunk = ChunkSize / 2;
   constexpr int32_t ChunkSquare = ChunkSize * ChunkSize;
@@ -454,7 +455,7 @@ AICORE PTO_INLINE void kkt_kernel(
       const int32_t solve_wave =
           static_cast<int32_t>(group_matrix_id / block_num);
       const int32_t solve_slot = solve_wave & 3;
-      if (enable_solve_pipeline != 0 && solve_wave >= 4) {
+      if (enable_solve_pipeline == 1 && solve_wave >= 4) {
 #if defined(PTO_NPU_ARCH_A5)
         gdn_sync::Wait<PIPE_MTE2>(4 + solve_slot);
 #else
@@ -490,8 +491,22 @@ AICORE PTO_INLINE void kkt_kernel(
           gdn_sync::Signal<PIPE_MTE3>(
               1 | (2 << 4) | (solve_slot << 8));
 #else
-          ffts_cross_core_sync(
-              PIPE_MTE3, 1 | (2 << 4) | (solve_slot << 8));
+          if (enable_solve_pipeline == 1) {
+            ffts_cross_core_sync(
+                PIPE_MTE3, 1 | (2 << 4) | (solve_slot << 8));
+          } else {
+            constexpr int64_t ReadyStride = 16;
+            const int64_t ready_offset =
+                (static_cast<int64_t>(cid) * 2 + vid) * ReadyStride + 1;
+            AscendC::GlobalTensor<int32_t> ready_global;
+            ready_global.SetGlobalBuffer(pipeline_ready_handle);
+            ready_global.SetValue(ready_offset, solve_wave + 1);
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<
+                int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                AscendC::DcciDst::CACHELINE_ALL>(ready_global[ready_offset]);
+            __asm__ __volatile__("");
+          }
 #endif
         }
         continue;
@@ -638,7 +653,12 @@ AICORE PTO_INLINE void kkt_kernel(
           TASSIGN(output_tile, GroupKkOutUbAddr);
           TSTORE(output_global, output_tile);
         }
+#ifdef MEGA_CHUNK_GDN_DEFER_GROUP_KKT_STORE_WAIT
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+#else
         pipe_barrier(PIPE_ALL);
+#endif
 
       }
       if (enable_solve_pipeline != 0) {
@@ -646,8 +666,24 @@ AICORE PTO_INLINE void kkt_kernel(
         gdn_sync::Signal<PIPE_MTE3>(
             1 | (2 << 4) | (solve_slot << 8));
 #else
-        ffts_cross_core_sync(
-            PIPE_MTE3, 1 | (2 << 4) | (solve_slot << 8));
+        if (enable_solve_pipeline == 1) {
+          ffts_cross_core_sync(
+              PIPE_MTE3, 1 | (2 << 4) | (solve_slot << 8));
+        } else {
+          constexpr int64_t ReadyStride = 16;
+          const int64_t ready_offset =
+              (static_cast<int64_t>(cid) * 2 + vid) * ReadyStride + 1;
+          set_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+          wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+          AscendC::GlobalTensor<int32_t> ready_global;
+          ready_global.SetGlobalBuffer(pipeline_ready_handle);
+          ready_global.SetValue(ready_offset, solve_wave + 1);
+          __asm__ __volatile__("");
+          AscendC::DataCacheCleanAndInvalid<
+              int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+              AscendC::DcciDst::CACHELINE_ALL>(ready_global[ready_offset]);
+          __asm__ __volatile__("");
+        }
 #endif
       }
     }

@@ -65,7 +65,9 @@ uint32_t CeilDiv(uint32_t value, uint32_t divisor)
 uint64_t CalcUserWorkspaceBytes(uint32_t blockDim)
 {
     const uint64_t tileBytes = static_cast<uint64_t>(kChunkSize) * kChunkSize * kHalfBytes;
-    constexpr uint64_t kWorkspaceTileCount = 11;
+    // KKT/WY(4) + H(4) + primary O mailboxes(3) + independent O ping
+    // mailboxes(4). Keeping O separate preserves async producer lifetimes.
+    constexpr uint64_t kWorkspaceTileCount = 15;
     return static_cast<uint64_t>(blockDim) *
                (kWorkspaceTileCount * tileBytes +
                 4 * kHWorkspacePadBytes) +
