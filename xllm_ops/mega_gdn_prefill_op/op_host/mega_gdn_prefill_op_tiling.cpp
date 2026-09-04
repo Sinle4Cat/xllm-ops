@@ -19,8 +19,15 @@ constexpr uint64_t kFloatBytes = 4;
 constexpr uint64_t kHWorkspacePadBytes = 8192;
 constexpr uint64_t kHWorkspaceAlignmentBytes = 16 * 1024 * 1024;
 constexpr uint64_t kHWorkspaceMaxPhaseBytes = 8 * 1024 * 1024;
-constexpr uint32_t kVectorCoreCount = 40;
+constexpr uint64_t kSolveWyReadyStride = 16;
+constexpr uint64_t kWyHFreeStride = 16;
+constexpr uint64_t kHoReadyStride = 16;
+constexpr uint32_t kSolveWyMinChunks = 8;
+// KKT(2) + H(8) + primary O mailboxes(3) + independent O ping
+// mailboxes(4). WY contributes two dynamically sized slot groups below.
+constexpr uint64_t kFixedWorkspaceTileCount = 17;
 constexpr uint32_t kPreferredBaseDim = 3072;
+constexpr uint32_t kPackedHeadDim = 128;
 
 enum class GdnTargetArch : uint32_t {
     A2A3 = 0,
@@ -76,9 +83,67 @@ uint32_t CeilDiv(uint32_t value, uint32_t divisor)
     return divisor == 0 ? 0 : (value + divisor - 1) / divisor;
 }
 
+struct ConvChannelTiling {
+    uint32_t base_dim;
+    uint32_t base_dim_count;
+};
+
+ConvChannelTiling ResolveConvChannelTiling(uint32_t conv_dim,
+                                           const GdnArchPolicy &policy,
+                                           uint32_t vector_task_count)
+{
+    if (policy.target != GdnTargetArch::A5) {
+        const uint32_t base_dim =
+            std::min<uint32_t>(conv_dim, kPreferredBaseDim);
+        return {base_dim, CeilDiv(conv_dim, base_dim)};
+    }
+
+    // Keep the A5 channel grid complete for every physical-core SKU while
+    // preserving packed-head boundaries and the causal-conv UB limit.
+    for (uint32_t channel_count = 1;
+         channel_count <= vector_task_count; ++channel_count) {
+        if (vector_task_count % channel_count != 0) {
+            continue;
+        }
+        uint32_t base_dim = CeilDiv(conv_dim, channel_count);
+        base_dim = CeilDiv(base_dim, kPackedHeadDim) * kPackedHeadDim;
+        if (base_dim > kPreferredBaseDim ||
+            CeilDiv(conv_dim, base_dim) != channel_count) {
+            continue;
+        }
+        return {base_dim, channel_count};
+    }
+
+    const uint32_t base_dim =
+        std::min<uint32_t>(conv_dim, kPreferredBaseDim);
+    return {base_dim, CeilDiv(conv_dim, base_dim)};
+}
+
 uint64_t AlignWorkspace(uint64_t bytes)
 {
     return (bytes + kAlignBytes - 1) / kAlignBytes * kAlignBytes;
+}
+
+uint64_t CalcSolveWyWorkspaceSlots(uint32_t block_dim, uint32_t matrices,
+                                   uint32_t batch_size, uint32_t tokens,
+                                   uint32_t heads, uint32_t key_heads,
+                                   GdnTargetArch target)
+{
+    if (target != GdnTargetArch::A2A3 || block_dim == 0 || batch_size != 1 ||
+        tokens < kSolveWyMinChunks * kChunkSize ||
+        tokens % kChunkSize != 0 || key_heads == 0 ||
+        heads % key_heads != 0 ||
+        matrices != tokens / kChunkSize * heads) {
+        return 1;
+    }
+    const uint64_t group_size = heads / key_heads;
+    if (group_size < 1 || group_size > 4) {
+        return 1;
+    }
+    const uint64_t group_count = matrices / group_size;
+    const uint64_t producer_waves =
+        (group_count + block_dim - 1) / block_dim;
+    return std::max<uint64_t>(producer_waves * group_size, 1);
 }
 
 bool IsSupportedHeadCount(uint32_t heads)
@@ -124,8 +189,9 @@ bool HasShape(const gert::StorageShape *storage_shape,
 
 uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
                                 uint32_t batch_size, uint32_t tokens,
-                                uint32_t heads, uint32_t conv_dim,
-                                uint32_t conv_state_len)
+                                uint32_t heads, uint32_t key_heads,
+                                uint32_t conv_dim, uint32_t conv_state_len,
+                                GdnTargetArch target)
 {
     uint64_t bytes = 0;
     bytes += AlignWorkspace(static_cast<uint64_t>(batch_size) *
@@ -154,8 +220,22 @@ uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
     bytes += AlignWorkspace(static_cast<uint64_t>(tokens) * heads *
                             kHeadDim * kDtypeBytes);
     const uint64_t tile_bytes = kChunkSize * kChunkSize * kDtypeBytes;
+    const uint64_t solve_wy_workspace_slots =
+        CalcSolveWyWorkspaceSlots(block_dim, matrices, batch_size, tokens,
+                                  heads, key_heads, target);
     bytes += static_cast<uint64_t>(block_dim) *
-             (15 * tile_bytes + 8 * kHWorkspacePadBytes);
+             ((kFixedWorkspaceTileCount + 2 * solve_wy_workspace_slots) *
+                  tile_bytes +
+              8 * kHWorkspacePadBytes);
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(block_dim) * 2 * kSolveWyReadyStride *
+        sizeof(int32_t));
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(block_dim) * kWyHFreeStride *
+        sizeof(int32_t));
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(batch_size) * heads * kHoReadyStride *
+        sizeof(int32_t));
     bytes += kHWorkspaceAlignmentBytes + kHWorkspaceMaxPhaseBytes;
     return bytes;
 }
@@ -170,11 +250,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (!ResolveArchPolicy(platform.GetSocVersion(), &arch_policy)) {
         return ge::GRAPH_FAILED;
     }
-    uint32_t block_dim = platform.GetCoreNumAic();
-    if (block_dim == 0) {
-        block_dim = platform.GetCoreNumAiv();
+    const uint32_t aic_core_count = platform.GetCoreNumAic();
+    const uint32_t aiv_core_count = platform.GetCoreNumAiv();
+    if (aic_core_count == 0 || aiv_core_count == 0) {
+        return ge::GRAPH_FAILED;
     }
-    block_dim = std::max<uint32_t>(block_dim, 1);
+    const uint32_t block_dim = aic_core_count;
+    // A5 schedules one vector sub-block per mixed block. A2/A3 exposes both
+    // vector siblings, so its schedulable task count is the physical AIV count.
+    const uint32_t vector_task_count =
+        arch_policy.target == GdnTargetArch::A5
+            ? std::min(aiv_core_count, aic_core_count)
+            : aiv_core_count;
+    if (vector_task_count == 0) {
+        return ge::GRAPH_FAILED;
+    }
 
     const auto *mixed_storage = context->GetInputShape(MIXED_QKV_INDEX);
     const auto *b_storage = context->GetInputShape(B_INDEX);
@@ -291,11 +381,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
-    const uint32_t base_dim =
-        std::min<uint32_t>(conv_dim, kPreferredBaseDim);
-    const uint32_t base_dim_count = CeilDiv(conv_dim, base_dim);
+    const ConvChannelTiling conv_channel_tiling =
+        ResolveConvChannelTiling(conv_dim, arch_policy, vector_task_count);
+    const uint32_t base_dim = conv_channel_tiling.base_dim;
+    const uint32_t base_dim_count = conv_channel_tiling.base_dim_count;
     const uint32_t token_core_budget =
-        std::max<uint32_t>(kVectorCoreCount / base_dim_count, 1);
+        std::max<uint32_t>(vector_task_count / base_dim_count, 1);
     const uint32_t token_block_size =
         CeilDiv(tokens, token_core_budget);
     const uint32_t token_block_count =
@@ -322,6 +413,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     MegaGdnPrefillOpTilingData tiling;
     tiling.set_block_dim(block_dim);
+    tiling.set_vector_task_count(vector_task_count);
     tiling.set_target_arch(static_cast<uint32_t>(arch_policy.target));
     tiling.set_num_matrices(num_matrices);
     tiling.set_batch_size(batch_size);
@@ -356,8 +448,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     const uint64_t user_workspace_bytes =
         CalcUserWorkspaceBytes(block_dim, num_matrices, batch_size, tokens,
-                               heads, conv_dim,
-                               static_cast<uint32_t>(conv_state.GetDim(1)));
+                               heads, key_heads, conv_dim,
+                               static_cast<uint32_t>(conv_state.GetDim(1)),
+                               arch_policy.target);
     workspace_sizes[0] =
         user_workspace_bytes + platform.GetLibApiWorkSpaceSize();
     return ge::GRAPH_SUCCESS;

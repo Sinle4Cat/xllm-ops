@@ -4642,6 +4642,55 @@ AICORE inline void BlockedSolveFullMatrix64ResidentInplace(
 }
 
 template <typename T>
+AICORE inline void BlockedSolveFullMatrix32ResidentInplace(
+    __gm__ T *matrix_gm, int64_t base_offset, int32_t row_stride,
+    BlockedSolveL1<T, 32> &identity32,
+    BlockedSolveL1<T, 32> &minus_identity32,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    constexpr uint32_t Tile32Bytes = 32 * 32 * sizeof(T);
+    constexpr uint32_t Tile64Bytes = 64 * 64 * sizeof(T);
+    constexpr uint32_t ScratchAddr = 2 * Tile32Bytes + Tile64Bytes;
+
+    BlockedSolveL1<T, 32> matrix;
+    BlockedSolveL1<T, 32> inverse;
+    BlockedSolveL1<T, 32> power;
+    TASSIGN(matrix, ScratchAddr);
+    TASSIGN(inverse, ScratchAddr + Tile32Bytes);
+    TASSIGN(power, ScratchAddr + 2 * Tile32Bytes);
+
+    BlockedSolveL0A<T, 32> l0a;
+    BlockedSolveL0B<T, 32> l0b;
+    BlockedSolveL0C<32> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+
+    for (uint32_t block = 0; block < 128; block += 32) {
+        BlockedSolveLoad<T, 32>(
+            matrix_gm, base_offset, row_stride, block, block, matrix);
+        BlockedSolveInvPower<T, 32, 4>(
+            matrix, identity32, minus_identity32, inverse, power,
+            l0a, l0b, l0c);
+        BlockedSolveStore<T, 32>(
+            matrix_gm, base_offset, row_stride, block, block, l0c);
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+    }
+
+    for (uint32_t block = 0; block < 128; block += 64) {
+        BlockedSolveCombine<T, 32>(
+            matrix_gm, matrix_gm, base_offset, row_stride, block,
+            minus_identity32, ScratchAddr);
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+    }
+    BlockedSolveCombine<T, 64>(
+        matrix_gm, matrix_gm, base_offset, row_stride, 0,
+        minus_identity64, ScratchAddr);
+}
+
+template <typename T>
 AICORE inline void BlockedSolveTail64ResidentInplace(
     __gm__ T *matrix_gm, int64_t base_offset, int32_t row_stride,
     uint32_t valid_size, BlockedSolveL1<T, 64> &identity64,
@@ -4861,7 +4910,8 @@ AICORE inline void BlockedSolveTail16(
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 }
 
-template <typename T>
+template <typename T, uint32_t ReadyGroupSize = 1,
+          bool PublishWyReady = false>
 AICORE inline void runKernelTriInvBlocked16BSND(
     __gm__ T *out, __gm__ T *in, __gm__ T *minus_identity,
     uint32_t total_matrices, uint32_t num_heads, int64_t total_tokens)
@@ -4924,33 +4974,90 @@ AICORE inline void runKernelTriInvBlocked16BSND(
         static_cast<uint32_t>(total_tokens / 128);
     const uint32_t tail_size =
         static_cast<uint32_t>(total_tokens % 128);
-    const uint32_t block_num = get_block_num();
-    for (uint32_t matrix_id = get_block_idx();
-         matrix_id < total_matrices; matrix_id += block_num) {
-        const uint32_t chunk = matrix_id / num_heads;
-        const uint32_t head = matrix_id - chunk * num_heads;
-        const int64_t base_offset =
-            static_cast<int64_t>(chunk) * 128 * row_stride +
-            static_cast<int64_t>(head) * 128;
-        if (chunk < full_chunks) {
-            BlockedSolveFullMatrix16<T>(
-                out, in, base_offset, row_stride, identity16,
-                minus_identity16, zero16, minus_identity32, zero32,
-                minus_identity64, zero64);
-        } else if (tail_size != 0 && tail_size <= 16) {
-            BlockedSolveTail16<T>(
-                out, in, base_offset, row_stride, tail_size, identity16,
-                minus_identity16);
+    const uint32_t core_id = get_block_idx();
+    const uint32_t core_count = get_block_num();
+    if constexpr (PublishWyReady) {
+        static_assert(ReadyGroupSize >= 1 && ReadyGroupSize <= 4,
+                      "Solve-WY publication requires GQA group 1..4.");
+        if (total_matrices % ReadyGroupSize != 0) return;
+        const uint32_t total_groups = total_matrices / ReadyGroupSize;
+        for (uint32_t group_id = core_id; group_id < total_groups;
+             group_id += core_count) {
+#pragma unroll
+            for (uint32_t lane = 0; lane < ReadyGroupSize; ++lane) {
+                const uint32_t matrix_id =
+                    group_id * ReadyGroupSize + lane;
+                const uint32_t chunk = matrix_id / num_heads;
+                const uint32_t head = matrix_id - chunk * num_heads;
+                const int64_t base_offset =
+                    static_cast<int64_t>(chunk) * 128 * row_stride +
+                    static_cast<int64_t>(head) * 128;
+                if (chunk >= full_chunks) return;
+                BlockedSolveFullMatrix16<T>(
+                    out, in, base_offset, row_stride, identity16,
+                    minus_identity16, zero16, minus_identity32, zero32,
+                    minus_identity64, zero64);
+                ffts_cross_core_sync(
+                    PIPE_FIX, 1 | (2 << 4) | (8 << 8));
+            }
+        }
+    } else {
+        for (uint32_t matrix_id = core_id; matrix_id < total_matrices;
+             matrix_id += core_count) {
+            const uint32_t chunk = matrix_id / num_heads;
+            const uint32_t head = matrix_id - chunk * num_heads;
+            const int64_t base_offset =
+                static_cast<int64_t>(chunk) * 128 * row_stride +
+                static_cast<int64_t>(head) * 128;
+            if (chunk < full_chunks) {
+                BlockedSolveFullMatrix16<T>(
+                    out, in, base_offset, row_stride, identity16,
+                    minus_identity16, zero16, minus_identity32, zero32,
+                    minus_identity64, zero64);
+            } else if (tail_size != 0 && tail_size <= 16) {
+                BlockedSolveTail16<T>(
+                    out, in, base_offset, row_stride, tail_size, identity16,
+                    minus_identity16);
+            }
         }
     }
 #endif
 }
 
 template <typename T>
+AICORE inline void RunBlocked64ResidentInplaceMatrix(
+    __gm__ T *matrix_gm, uint32_t matrix_id, uint32_t num_heads,
+    __gm__ int32_t *cu_seqlens, BlockedSolveL1<T, 64> &identity64,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    const BSNDVarlenTileInfo tile_info =
+        GetBSNDVarlenTileInfoFromCuSeqlens(
+            matrix_id, num_heads, 128, cu_seqlens);
+    const int32_t row_stride =
+        static_cast<int32_t>(num_heads * 128u);
+    if (tile_info.valid_size <= 64) {
+        BlockedSolveTail64ResidentInplace<T>(
+            matrix_gm, tile_info.bsnd_offset, row_stride,
+            tile_info.valid_size, identity64, minus_identity64);
+    } else if (tile_info.valid_size < 128) {
+        BlockedSolveDynamic128ResidentInplace<T>(
+            matrix_gm, tile_info.bsnd_offset, row_stride,
+            tile_info.valid_size, identity64, minus_identity64);
+    } else {
+        BlockedSolveFullMatrix64ResidentInplace<T>(
+            matrix_gm, tile_info.bsnd_offset, row_stride, identity64,
+            minus_identity64);
+    }
+}
+
+template <typename T, bool WaitForKktReady = false,
+          uint32_t ReadyGroupSize = 1, bool PublishWyReady = false>
 AICORE inline void runKernelTriInvBlocked64ResidentInplaceBSND(
     __gm__ T *matrix_gm, __gm__ T *minus_identity,
     uint32_t total_matrices, uint32_t num_heads,
-    __gm__ int32_t *cu_seqlens)
+    __gm__ int32_t *cu_seqlens,
+    __gm__ int32_t *pipeline_ready_handle = nullptr,
+    uint32_t use_gm_kkt_ready = 0)
 {
 #if (__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
@@ -4970,30 +5077,199 @@ AICORE inline void runKernelTriInvBlocked64ResidentInplaceBSND(
     BlockedSolveLoad<T, 64>(
         minus_identity, 128 * 128, ConstStride, 0, 0, identity64);
 
-    const uint32_t block_idx = get_block_idx();
-    const uint32_t block_num = get_block_num();
-    const int32_t row_stride =
-        static_cast<int32_t>(num_heads * 128u);
-    for (uint32_t matrix_id = block_idx; matrix_id < total_matrices;
-         matrix_id += block_num) {
-        const BSNDVarlenTileInfo tile_info =
-            GetBSNDVarlenTileInfoFromCuSeqlens(
-                matrix_id, num_heads, 128, cu_seqlens);
-        if (tile_info.valid_size <= 64) {
-            BlockedSolveTail64ResidentInplace<T>(
-                matrix_gm, tile_info.bsnd_offset, row_stride,
-                tile_info.valid_size, identity64, minus_identity64);
-        } else if (tile_info.valid_size < 128) {
-            BlockedSolveDynamic128ResidentInplace<T>(
-                matrix_gm, tile_info.bsnd_offset, row_stride,
-                tile_info.valid_size, identity64, minus_identity64);
-        } else {
-            BlockedSolveFullMatrix64ResidentInplace<T>(
-                matrix_gm, tile_info.bsnd_offset, row_stride, identity64,
+    const uint32_t core_id = get_block_idx();
+    const uint32_t core_count = get_block_num();
+    if constexpr (WaitForKktReady) {
+        static_assert(ReadyGroupSize >= 1 && ReadyGroupSize <= 4,
+                      "Blocked KKT-Solve pipeline requires GQA group 1..4.");
+        if (total_matrices % ReadyGroupSize != 0) return;
+        const uint32_t total_groups = total_matrices / ReadyGroupSize;
+        if (core_id >= total_groups) return;
+        const uint32_t producer_group_count =
+            1 + (total_groups - 1 - core_id) / core_count;
+        for (uint32_t wave = 0; wave < producer_group_count; ++wave) {
+            const uint32_t slot = wave & 3u;
+            if (use_gm_kkt_ready != 0) {
+                constexpr int64_t ReadyStride = 16;
+                for (int32_t vid = 0; vid < 2; ++vid) {
+                    const int64_t ready_offset =
+                        (static_cast<int64_t>(core_id) * 2 + vid) *
+                            ReadyStride +
+                        1;
+                    AscendC::GlobalTensor<int32_t> ready_global;
+                    ready_global.SetGlobalBuffer(pipeline_ready_handle);
+                    while (true) {
+                        __asm__ __volatile__("");
+                        AscendC::DataCacheCleanAndInvalid<
+                            int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                            AscendC::DcciDst::CACHELINE_OUT>(
+                            ready_global[ready_offset]);
+                        __asm__ __volatile__("");
+                        if (ready_global.GetValue(ready_offset) >=
+                            static_cast<int32_t>(wave + 1)) {
+                            break;
+                        }
+                    }
+                }
+                set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+                wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+            } else {
+                wait_flag_dev(slot);
+                if (wave + 4 < producer_group_count) {
+                    ffts_cross_core_sync(
+                        PIPE_FIX, 1 | (2 << 4) | ((4 + slot) << 8));
+                }
+            }
+            const uint32_t group_id = wave * core_count + core_id;
+#pragma unroll
+            for (uint32_t lane = 0; lane < ReadyGroupSize; ++lane) {
+                RunBlocked64ResidentInplaceMatrix<T>(
+                    matrix_gm, group_id * ReadyGroupSize + lane,
+                    num_heads, cu_seqlens, identity64,
+                    minus_identity64);
+                if constexpr (PublishWyReady) {
+                    ffts_cross_core_sync(
+                        PIPE_FIX, 1 | (2 << 4) | (8 << 8));
+                }
+            }
+        }
+    } else if constexpr (PublishWyReady) {
+        static_assert(ReadyGroupSize >= 1 && ReadyGroupSize <= 4,
+                      "Solve-WY publication requires GQA group 1..4.");
+        if (total_matrices % ReadyGroupSize != 0) return;
+        const uint32_t total_groups = total_matrices / ReadyGroupSize;
+        for (uint32_t group_id = core_id; group_id < total_groups;
+             group_id += core_count) {
+#pragma unroll
+            for (uint32_t lane = 0; lane < ReadyGroupSize; ++lane) {
+                RunBlocked64ResidentInplaceMatrix<T>(
+                    matrix_gm, group_id * ReadyGroupSize + lane,
+                    num_heads, cu_seqlens, identity64,
+                    minus_identity64);
+                ffts_cross_core_sync(
+                    PIPE_FIX, 1 | (2 << 4) | (8 << 8));
+            }
+        }
+    } else {
+        for (uint32_t matrix_id = core_id; matrix_id < total_matrices;
+             matrix_id += core_count) {
+            RunBlocked64ResidentInplaceMatrix<T>(
+                matrix_gm, matrix_id, num_heads, cu_seqlens, identity64,
                 minus_identity64);
         }
     }
 #endif
 }
+
+#ifdef MEGA_CHUNK_GDN_BLOCKED32_SOLVE
+
+template <typename T>
+AICORE inline void RunBlocked32ResidentInplaceMatrix(
+    __gm__ T *matrix_gm, uint32_t matrix_id, uint32_t num_heads,
+    __gm__ int32_t *cu_seqlens, BlockedSolveL1<T, 32> &identity32,
+    BlockedSolveL1<T, 32> &minus_identity32,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    const BSNDVarlenTileInfo tile_info =
+        GetBSNDVarlenTileInfoFromCuSeqlens(
+            matrix_id, num_heads, 128, cu_seqlens);
+    if (tile_info.valid_size != 128) return;
+
+    const int32_t row_stride =
+        static_cast<int32_t>(num_heads * 128u);
+    BlockedSolveFullMatrix32ResidentInplace<T>(
+        matrix_gm, tile_info.bsnd_offset, row_stride, identity32,
+        minus_identity32, minus_identity64);
+}
+
+template <typename T, bool WaitForKktReady = false,
+          uint32_t ReadyGroupSize = 1, bool PublishWyReady = false>
+AICORE inline void runKernelTriInvBlocked32ResidentInplaceBSND(
+    __gm__ T *matrix_gm, __gm__ T *minus_identity,
+    uint32_t total_matrices, uint32_t num_heads,
+    __gm__ int32_t *cu_seqlens)
+{
+#if (__CHECK_FEATURE_AT_PRECOMPILE) || \
+    (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
+    if (num_heads == 0 || total_matrices == 0 || cu_seqlens == nullptr) return;
+
+    constexpr uint32_t Tile32Bytes = 32 * 32 * sizeof(T);
+    constexpr uint32_t Identity32Addr = 0;
+    constexpr uint32_t MinusIdentity32Addr = Tile32Bytes;
+    constexpr uint32_t MinusIdentity64Addr = 2 * Tile32Bytes;
+    constexpr int32_t ConstStride = 128;
+
+    BlockedSolveL1<T, 32> identity32;
+    BlockedSolveL1<T, 32> minus_identity32;
+    BlockedSolveL1<T, 64> minus_identity64;
+    TASSIGN(identity32, Identity32Addr);
+    TASSIGN(minus_identity32, MinusIdentity32Addr);
+    TASSIGN(minus_identity64, MinusIdentity64Addr);
+    BlockedSolveLoad<T, 32>(
+        minus_identity, 128 * 128, ConstStride, 0, 0, identity32);
+    BlockedSolveLoad<T, 32>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity32);
+    BlockedSolveLoad<T, 64>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity64);
+
+    const uint32_t core_id = get_block_idx();
+    const uint32_t core_count = get_block_num();
+    if constexpr (WaitForKktReady) {
+        static_assert(ReadyGroupSize == 2 || ReadyGroupSize == 3,
+                      "Blocked KKT-Solve pipeline requires GQA group 2 or 3.");
+        if (total_matrices % ReadyGroupSize != 0) return;
+        const uint32_t total_groups = total_matrices / ReadyGroupSize;
+        if (core_id >= total_groups) return;
+        const uint32_t producer_group_count =
+            1 + (total_groups - 1 - core_id) / core_count;
+        for (uint32_t wave = 0; wave < producer_group_count; ++wave) {
+            const uint32_t slot = wave & 3u;
+            wait_flag_dev(slot);
+            const uint32_t group_id = wave * core_count + core_id;
+#pragma unroll
+            for (uint32_t lane = 0; lane < ReadyGroupSize; ++lane) {
+                RunBlocked32ResidentInplaceMatrix<T>(
+                    matrix_gm, group_id * ReadyGroupSize + lane,
+                    num_heads, cu_seqlens, identity32,
+                    minus_identity32, minus_identity64);
+                if constexpr (PublishWyReady) {
+                    ffts_cross_core_sync(
+                        PIPE_FIX, 1 | (2 << 4) | (8 << 8));
+                }
+            }
+            if (wave + 4 < producer_group_count) {
+                ffts_cross_core_sync(
+                    PIPE_FIX, 1 | (2 << 4) | ((4 + slot) << 8));
+            }
+        }
+    } else if constexpr (PublishWyReady) {
+        static_assert(ReadyGroupSize >= 1 && ReadyGroupSize <= 4,
+                      "Solve-WY publication requires GQA group 1..4.");
+        if (total_matrices % ReadyGroupSize != 0) return;
+        const uint32_t total_groups = total_matrices / ReadyGroupSize;
+        for (uint32_t group_id = core_id; group_id < total_groups;
+             group_id += core_count) {
+#pragma unroll
+            for (uint32_t lane = 0; lane < ReadyGroupSize; ++lane) {
+                RunBlocked32ResidentInplaceMatrix<T>(
+                    matrix_gm, group_id * ReadyGroupSize + lane,
+                    num_heads, cu_seqlens, identity32,
+                    minus_identity32, minus_identity64);
+                ffts_cross_core_sync(
+                    PIPE_FIX, 1 | (2 << 4) | (8 << 8));
+            }
+        }
+    } else {
+        for (uint32_t matrix_id = core_id; matrix_id < total_matrices;
+             matrix_id += core_count) {
+            RunBlocked32ResidentInplaceMatrix<T>(
+                matrix_gm, matrix_id, num_heads, cu_seqlens, identity32,
+                minus_identity32, minus_identity64);
+        }
+    }
+#endif
+}
+
+#endif
 
 #endif

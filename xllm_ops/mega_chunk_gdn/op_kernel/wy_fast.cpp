@@ -257,7 +257,96 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 #define GDN_WY_FAST_KERNEL wy_fast_kernel
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+constexpr int32_t GDN_SOLVE_WY_READY_STRIDE = 16;
+
+AICORE PTO_INLINE void solve_wy_reset_ready(
+    __gm__ int32_t *ready_handle, int64_t cid, int32_t vid)
+{
+  const int64_t offset =
+      (cid * 2 + static_cast<int64_t>(vid)) *
+      GDN_SOLVE_WY_READY_STRIDE;
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(ready_handle);
+  ready_global.SetValue(offset, 0);
+  // Field 0 is WY-to-H readiness. Field 1 is reused by the long-shape
+  // KKT-to-Solve pipeline; both fields share this cache line and lifecycle.
+  ready_global.SetValue(offset + 1, 0);
+  __asm__ __volatile__("");
+  AscendC::DataCacheCleanAndInvalid<
+      int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+      AscendC::DcciDst::CACHELINE_ALL>(ready_global[offset]);
+  __asm__ __volatile__("");
+}
+
+AICORE PTO_INLINE void solve_wy_publish_ready(
+    __gm__ int32_t *ready_handle, int64_t cid, int32_t vid,
+    int32_t ready_count)
+{
+  const int64_t offset =
+      (cid * 2 + static_cast<int64_t>(vid)) *
+      GDN_SOLVE_WY_READY_STRIDE;
+  set_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+  wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(ready_handle);
+  ready_global.SetValue(offset, ready_count);
+  __asm__ __volatile__("");
+  AscendC::DataCacheCleanAndInvalid<
+      int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+      AscendC::DcciDst::CACHELINE_ALL>(ready_global[offset]);
+  __asm__ __volatile__("");
+}
+
+AICORE PTO_INLINE void solve_wy_wait_ready(
+    __gm__ int32_t *ready_handle, int64_t cid, int32_t vid,
+    int32_t expected_count)
+{
+  const int64_t offset =
+      (cid * 2 + static_cast<int64_t>(vid)) *
+      GDN_SOLVE_WY_READY_STRIDE;
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(ready_handle);
+  while (true) {
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<
+        int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(ready_global[offset]);
+    __asm__ __volatile__("");
+    if (ready_global.GetValue(offset) >= expected_count) {
+      break;
+    }
+  }
+  set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+  wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+}
+
+template <bool PipelineSolveWy>
+AICORE PTO_INLINE bool wy_owns_work(
+    int64_t work_index, int64_t cid, int64_t block_num,
+    uint32_t pipeline_group_size)
+{
+  if constexpr (PipelineSolveWy) {
+    return ((work_index / pipeline_group_size) % block_num) == cid;
+  }
+  return (work_index % block_num) == cid;
+}
+
+template <bool PipelineSolveWy>
+AICORE PTO_INLINE int64_t wy_workspace_slot(
+    int64_t work_index, int64_t block_num, uint32_t pipeline_group_size)
+{
+  if constexpr (PipelineSolveWy) {
+    const int64_t group = work_index / pipeline_group_size;
+    const int64_t lane = work_index % pipeline_group_size;
+    return (group / block_num) * pipeline_group_size + lane;
+  }
+  return 0;
+}
+
+template <int32_t HiddenSize, int32_t ChunkSize,
+          bool PipelineSolveWy = false,
+          bool DeferCubeOutputs = false,
+          bool MaterializeDeferredU = false>
 AICORE void GDN_WY_FAST_KERNEL(
     __gm__ ComputeT *K_handle, __gm__ ComputeT *V_handle,
     __gm__ ComputeT *Beta_handle, __gm__ float *G_handle,
@@ -268,8 +357,15 @@ AICORE void GDN_WY_FAST_KERNEL(
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint32_t num_heads,
     uint32_t num_key_heads,
-    uint64_t ffts_addr)
+    uint64_t ffts_addr,
+    __gm__ int32_t *solve_wy_ready_handle = nullptr,
+    uint32_t solve_wy_workspace_slots = 1,
+    uint32_t solve_wy_group_size = 1,
+    uint32_t solve_wy_total_work = 0,
+    bool wait_solve_ready = true)
 {
+  static_assert(!MaterializeDeferredU || DeferCubeOutputs,
+                "Deferred U materialization requires deferred W output.");
   // WY recompute materializes two diagonal reweightings of the same A tile:
   //   A2[:, j] = A[:, j] * beta_j
   //   A1[:, j] = A[:, j] * exp(g_j) * beta_j
@@ -325,6 +421,14 @@ AICORE void GDN_WY_FAST_KERNEL(
   auto cid = get_block_idx();
   auto block_num = get_block_num();
   auto vid = get_subblockid();
+
+  if constexpr (PipelineSolveWy) {
+    if (solve_wy_ready_handle == nullptr ||
+        solve_wy_workspace_slots == 0 || solve_wy_group_size == 0 ||
+        solve_wy_total_work == 0) {
+      return;
+    }
+  }
 
   int64_t num_seqs = batch_size;
 
@@ -779,8 +883,14 @@ AICORE void GDN_WY_FAST_KERNEL(
 
       for (int64_t ci = 0; ci < nc; ++ci) {
         for (int32_t head_idx = 0; head_idx < H; ++head_idx) {
-          if (gi % static_cast<int64_t>(block_num) ==
-              static_cast<int64_t>(cid)) {
+          if (wy_owns_work<PipelineSolveWy>(
+                  gi, static_cast<int64_t>(cid),
+                  static_cast<int64_t>(block_num),
+                  solve_wy_group_size)) {
+            const int64_t workspace_slot =
+                wy_workspace_slot<PipelineSolveWy>(
+                    gi, static_cast<int64_t>(block_num),
+                    solve_wy_group_size);
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
             int32_t valid_rows = static_cast<int32_t>(
@@ -796,6 +906,9 @@ AICORE void GDN_WY_FAST_KERNEL(
             if (local_rows < 0) local_rows = 0;
             if (local_rows > HalfChunk) local_rows = HalfChunk;
             if (local_rows == 0) {
+              if constexpr (PipelineSolveWy) {
+                if (wait_solve_ready) wait_flag_dev(8);
+              }
 #if defined(PTO_NPU_ARCH_A5)
               if (!first_iter) gdn_sync::AllocateVecGm(3);
               gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
@@ -831,6 +944,10 @@ AICORE void GDN_WY_FAST_KERNEL(
               if (valid_rows != ChunkSize) {
                 TFILLPAD_INPLACE(beta_ub_half, beta_load);
               }
+            }
+
+            if constexpr (PipelineSolveWy) {
+              if (wait_solve_ready) wait_flag_dev(8);
             }
 
             // Load only the live rows for this sub-block, then zero-pad the
@@ -880,11 +997,13 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a2_ub, a1_ub, beta_2d_ub);
             TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            if (!first_iter) gdn_sync::AllocateVecGm(3);
+              if (!first_iter) gdn_sync::AllocateVecGm(3);
 #else
-            if (!first_iter) wait_flag_dev(3);
+              if (!first_iter) wait_flag_dev(3);
 #endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -892,17 +1011,22 @@ AICORE void GDN_WY_FAST_KERNEL(
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle +
-                      static_cast<int64_t>(cid) * WsA2Size +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a2_shape, a2_stride);
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
+              gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
 #else
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+              ffts_cross_core_sync(
+                  PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
 #endif
+            }
 
             // G is pre-transposed to [H, total_tokens] for contiguous loads.
             {
@@ -939,11 +1063,13 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a1_ub, a1_ub, g_2d_ub);
             TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            if (!first_iter) gdn_sync::AllocateVecGm(4);
+              if (!first_iter) gdn_sync::AllocateVecGm(4);
 #else
-            if (!first_iter) wait_flag_dev(4);
+              if (!first_iter) wait_flag_dev(4);
 #endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -951,17 +1077,27 @@ AICORE void GDN_WY_FAST_KERNEL(
               GmStride2D a1_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle +
-                      static_cast<int64_t>(cid) * WsA1Size +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA1Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a1_shape, a1_stride);
               TSTORE(workspace_a1_global, a1_ub_half);
             }
             pipe_barrier(PIPE_ALL);
+            if constexpr (PipelineSolveWy) {
+              solve_wy_publish_ready(
+                  solve_wy_ready_handle, static_cast<int64_t>(cid),
+                  static_cast<int32_t>(vid),
+                  static_cast<int32_t>(workspace_slot + 1));
+            } else {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::RecordVecGm(1 | (2 << 4) | (1 << 8));
+              gdn_sync::RecordVecGm(1 | (2 << 4) | (1 << 8));
 #else
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              ffts_cross_core_sync(
+                  PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
 #endif
+            }
             first_iter = false;
           }
           gi++;
@@ -980,8 +1116,14 @@ AICORE void GDN_WY_FAST_KERNEL(
 
       for (int64_t ci = 0; ci < nc; ++ci) {
         for (int32_t h = 0; h < H; ++h) {
-          if (gi % static_cast<int64_t>(block_num) ==
-              static_cast<int64_t>(cid)) {
+          if (wy_owns_work<PipelineSolveWy>(
+                  gi, static_cast<int64_t>(cid),
+                  static_cast<int64_t>(block_num),
+                  solve_wy_group_size)) {
+            const int64_t workspace_slot =
+                wy_workspace_slot<PipelineSolveWy>(
+                    gi, static_cast<int64_t>(block_num),
+                    solve_wy_group_size);
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
             int32_t valid_rows = static_cast<int32_t>(
@@ -996,6 +1138,9 @@ AICORE void GDN_WY_FAST_KERNEL(
             if (local_rows > HalfChunk) local_rows = HalfChunk;
             int32_t head_idx = h;
             if (local_rows == 0) {
+              if constexpr (PipelineSolveWy) {
+                if (wait_solve_ready) wait_flag_dev(8);
+              }
 #if defined(PTO_NPU_ARCH_A5)
               if (!first_iter_v) gdn_sync::AllocateVecGm(3);
               gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
@@ -1031,6 +1176,10 @@ AICORE void GDN_WY_FAST_KERNEL(
               if (valid_rows != ChunkSize) {
                 TFILLPAD_INPLACE(beta_ub_half, beta_load);
               }
+            }
+
+            if constexpr (PipelineSolveWy) {
+              if (wait_solve_ready) wait_flag_dev(8);
             }
 
             // Tail-safe A loading is especially important in varlen mode because
@@ -1075,11 +1224,13 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a2_ub, a1_ub, beta_2d_ub);
             TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            if (!first_iter_v) gdn_sync::AllocateVecGm(3);
+              if (!first_iter_v) gdn_sync::AllocateVecGm(3);
 #else
-            if (!first_iter_v) wait_flag_dev(3);
+              if (!first_iter_v) wait_flag_dev(3);
 #endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -1087,17 +1238,22 @@ AICORE void GDN_WY_FAST_KERNEL(
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a2_global(
                   workspace_a2_handle +
-                      static_cast<int64_t>(cid) * WsA2Size +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a2_shape, a2_stride);
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
+              gdn_sync::RecordVecGm(1 | (2 << 4) | (2 << 8));
 #else
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+              ffts_cross_core_sync(
+                  PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
 #endif
+            }
 
             // G is pre-transposed to [H, total_tokens] for contiguous loads.
             {
@@ -1130,11 +1286,13 @@ AICORE void GDN_WY_FAST_KERNEL(
             TMUL(a1_ub, a1_ub, g_2d_ub);
             TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            if (!first_iter_v) gdn_sync::AllocateVecGm(4);
+              if (!first_iter_v) gdn_sync::AllocateVecGm(4);
 #else
-            if (!first_iter_v) wait_flag_dev(4);
+              if (!first_iter_v) wait_flag_dev(4);
 #endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -1142,17 +1300,27 @@ AICORE void GDN_WY_FAST_KERNEL(
               GmStride2D a1_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a1_global(
                   workspace_a1_handle +
-                      static_cast<int64_t>(cid) * WsA1Size +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA1Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a1_shape, a1_stride);
               TSTORE(workspace_a1_global, a1_ub_half);
             }
             pipe_barrier(PIPE_ALL);
+            if constexpr (PipelineSolveWy) {
+              solve_wy_publish_ready(
+                  solve_wy_ready_handle, static_cast<int64_t>(cid),
+                  static_cast<int32_t>(vid),
+                  static_cast<int32_t>(workspace_slot + 1));
+            } else {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::RecordVecGm(1 | (2 << 4) | (1 << 8));
+              gdn_sync::RecordVecGm(1 | (2 << 4) | (1 << 8));
 #else
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+              ffts_cross_core_sync(
+                  PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
 #endif
+            }
             first_iter_v = false;
           }
           gi++;
@@ -1165,6 +1333,40 @@ AICORE void GDN_WY_FAST_KERNEL(
 #if defined(__DAV_C220_CUBE__)
   // Cube consumes the two Vec-generated workspaces and turns them into the
   // branch outputs U and W.
+  // The fused WY->H path keeps the Vector preparation above, but moves these
+  // two GEMMs into the head-chain owner so W can stay on chip for W @ S.
+  if constexpr (PipelineSolveWy) {
+    const uint32_t total_groups =
+        (solve_wy_total_work + solve_wy_group_size - 1) /
+        solve_wy_group_size;
+    uint32_t local_group_count = 0;
+    if (static_cast<uint32_t>(cid) < total_groups) {
+      local_group_count =
+          1 + (total_groups - 1 - static_cast<uint32_t>(cid)) /
+                  static_cast<uint32_t>(block_num);
+    }
+    uint32_t expected_count = local_group_count * solve_wy_group_size;
+    const uint32_t tail_lanes =
+        solve_wy_total_work % solve_wy_group_size;
+    if (tail_lanes != 0 && total_groups != 0 &&
+        ((total_groups - 1) % static_cast<uint32_t>(block_num)) ==
+            static_cast<uint32_t>(cid)) {
+      expected_count -= solve_wy_group_size - tail_lanes;
+    }
+    if (expected_count == 0 ||
+        expected_count > solve_wy_workspace_slots) {
+      return;
+    }
+    solve_wy_wait_ready(
+        solve_wy_ready_handle, static_cast<int64_t>(cid), 0,
+        static_cast<int32_t>(expected_count));
+    solve_wy_wait_ready(
+        solve_wy_ready_handle, static_cast<int64_t>(cid), 1,
+        static_cast<int32_t>(expected_count));
+  }
+  if constexpr (DeferCubeOutputs && !MaterializeDeferredU) {
+    return;
+  }
   if (cu_seqlens == nullptr) {
     int64_t gi = 0;
     for (int64_t seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
@@ -1174,8 +1376,14 @@ AICORE void GDN_WY_FAST_KERNEL(
 
       for (int64_t ci = 0; ci < nc; ++ci) {
         for (int32_t head_idx = 0; head_idx < H; ++head_idx) {
-          if (gi % static_cast<int64_t>(block_num) ==
-              static_cast<int64_t>(cid)) {
+          if (wy_owns_work<PipelineSolveWy>(
+                  gi, static_cast<int64_t>(cid),
+                  static_cast<int64_t>(block_num),
+                  solve_wy_group_size)) {
+            const int64_t workspace_slot =
+                wy_workspace_slot<PipelineSolveWy>(
+                    gi, static_cast<int64_t>(block_num),
+                    solve_wy_group_size);
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
             int32_t valid_rows = static_cast<int32_t>(
@@ -1217,16 +1425,21 @@ AICORE void GDN_WY_FAST_KERNEL(
               }
             }
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::WaitVecGm(2);
+              gdn_sync::WaitVecGm(2);
 #else
-            wait_flag_dev(2);
+              wait_flag_dev(2);
 #endif
+            }
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a2_global(
-                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size,
+                  workspace_a2_handle +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA2Size,
                   a2_shape, a2_stride);
               // Load the Vec-prepared A2 tile:
               //   A2 = A * beta[None, :]
@@ -1252,22 +1465,31 @@ AICORE void GDN_WY_FAST_KERNEL(
               // physically ChunkSize x HiddenSize.
               TSTORE(u_global, u_store);
             }
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::FreeVecGm(1 | (2 << 4) | (3 << 8));
+              gdn_sync::FreeVecGm(1 | (2 << 4) | (3 << 8));
 #else
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (3 << 8));
+              ffts_cross_core_sync(
+                  PIPE_FIX, 1 | (2 << 4) | (3 << 8));
 #endif
+            }
 
+            if constexpr (!DeferCubeOutputs) {
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::WaitVecGm(1);
+              gdn_sync::WaitVecGm(1);
 #else
-            wait_flag_dev(1);
+              wait_flag_dev(1);
 #endif
+            }
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a1_global(
-                  workspace_a1_handle + static_cast<int64_t>(cid) * WsA1Size,
+                  workspace_a1_handle +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA1Size,
                   a1_shape, a1_stride);
               // Load the Vec-prepared A1 tile:
               //   A1 = A * (exp(g) * beta)[None, :]
@@ -1291,11 +1513,15 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::FreeVecGm(1 | (2 << 4) | (4 << 8));
+              gdn_sync::FreeVecGm(1 | (2 << 4) | (4 << 8));
 #else
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
+              ffts_cross_core_sync(
+                  PIPE_FIX, 1 | (2 << 4) | (4 << 8));
 #endif
+            }
+            }
           }
           gi++;
         }
@@ -1311,8 +1537,14 @@ AICORE void GDN_WY_FAST_KERNEL(
 
       for (int64_t ci = 0; ci < nc; ++ci) {
         for (int32_t h = 0; h < H; ++h) {
-          if (gi % static_cast<int64_t>(block_num) ==
-              static_cast<int64_t>(cid)) {
+          if (wy_owns_work<PipelineSolveWy>(
+                  gi, static_cast<int64_t>(cid),
+                  static_cast<int64_t>(block_num),
+                  solve_wy_group_size)) {
+            const int64_t workspace_slot =
+                wy_workspace_slot<PipelineSolveWy>(
+                    gi, static_cast<int64_t>(block_num),
+                    solve_wy_group_size);
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
             int32_t valid_rows = static_cast<int32_t>(
@@ -1357,16 +1589,21 @@ AICORE void GDN_WY_FAST_KERNEL(
               }
             }
 
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::WaitVecGm(2);
+              gdn_sync::WaitVecGm(2);
 #else
-            wait_flag_dev(2);
+              wait_flag_dev(2);
 #endif
+            }
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a2_global(
-                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size,
+                  workspace_a2_handle +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA2Size,
                   a2_shape, a2_stride);
               TLOAD(a2_l1, workspace_a2_global);
             }
@@ -1389,22 +1626,31 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::FreeVecGm(1 | (2 << 4) | (3 << 8));
+              gdn_sync::FreeVecGm(1 | (2 << 4) | (3 << 8));
 #else
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (3 << 8));
+              ffts_cross_core_sync(
+                  PIPE_FIX, 1 | (2 << 4) | (3 << 8));
 #endif
+            }
 
+            if constexpr (!DeferCubeOutputs) {
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::WaitVecGm(1);
+              gdn_sync::WaitVecGm(1);
 #else
-            wait_flag_dev(1);
+              wait_flag_dev(1);
 #endif
+            }
             {
               GmShape2D a1_shape(ChunkSize, ChunkSize);
               GmStride2D a1_stride(ChunkSize);
               GmTensor2D<ComputeT> workspace_a1_global(
-                  workspace_a1_handle + static_cast<int64_t>(cid) * WsA1Size,
+                  workspace_a1_handle +
+                      (static_cast<int64_t>(cid) *
+                           solve_wy_workspace_slots +
+                       workspace_slot) * WsA1Size,
                   a1_shape, a1_stride);
               TLOAD(a1_l1, workspace_a1_global);
             }
@@ -1427,11 +1673,15 @@ AICORE void GDN_WY_FAST_KERNEL(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
+            if constexpr (!PipelineSolveWy) {
 #if defined(PTO_NPU_ARCH_A5)
-            gdn_sync::FreeVecGm(1 | (2 << 4) | (4 << 8));
+              gdn_sync::FreeVecGm(1 | (2 << 4) | (4 << 8));
 #else
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
+              ffts_cross_core_sync(
+                  PIPE_FIX, 1 | (2 << 4) | (4 << 8));
 #endif
+            }
+            }
           }
           gi++;
         }
