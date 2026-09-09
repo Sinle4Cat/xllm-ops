@@ -1572,6 +1572,9 @@ AICORE PTO_INLINE void Run(
             kUbQkNormReduceTmp,
             kUbQkNorm,
             kUbQkNormSqrt);
+        // Q/K normalization scratch aliases the incoming SSM state buffer.
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
       }
     }
 #endif
