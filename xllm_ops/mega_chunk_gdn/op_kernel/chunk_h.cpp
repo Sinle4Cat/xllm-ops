@@ -293,9 +293,10 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 template <int32_t D, int32_t C, int32_t FlagBase,
           bool WaitStateReady = true, bool PublishReady = true>
 AICORE PTO_INLINE void paired_cube_ws(
-    __gm__ ComputeT *W_handle, __gm__ ComputeT *workspace_handle,
-    int64_t head, int64_t chunk_start, int32_t valid, int32_t H,
-    int64_t ws_ws_base, int64_t ws_s_base,
+    __gm__ ComputeT *W_handle, __gm__ ComputeT *S_handle,
+    __gm__ ComputeT *workspace_handle, int64_t head,
+    int64_t chunk_start, int64_t chunk_offset, int32_t ci,
+    int32_t valid, int32_t H, int64_t ws_ws_base,
     TileMatL1<ComputeT, D, D, D, D> &s_l1,
     TileMatL1<ComputeT, C, D, C, D> &w_l1,
     TileAcc<float, C, D, C, D> &ws_l0)
@@ -317,10 +318,12 @@ AICORE PTO_INLINE void paired_cube_ws(
   set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
   wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
   {
+    constexpr int32_t DD = D * D;
+    const int64_t state_offset =
+        ((chunk_offset + ci) * H + head) * DD;
     GmShape2D s_shape(D, D);
     GmStride2D s_stride(D);
-    GmTensor2D<ComputeT> s_global(workspace_handle + ws_s_base, s_shape,
-                                 s_stride);
+    GmTensor2D<ComputeT> s_global(S_handle + state_offset, s_shape, s_stride);
     TLOAD(s_l1, s_global);
   }
 #ifdef MEGA_STOP_AFTER_H
@@ -479,15 +482,289 @@ AICORE PTO_INLINE void paired_cube_kv(
         PIPE_FIX, 1 | (2 << 4) | ((FlagBase + 2) << 8));
   }
 }
+
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+template <int32_t HiddenSize, int32_t ChunkSize>
+AICORE inline void ResidentHoCubeOutput(
+    __gm__ ComputeT *combined_mailbox,
+    __gm__ ComputeT *gated_qk_mailbox,
+    int64_t core_id, bool wait_for_previous_output,
+    TileMatL1<ComputeT, HiddenSize, HiddenSize,
+              HiddenSize, HiddenSize> &state_l1,
+    TileMatL1<ComputeT, ChunkSize, HiddenSize,
+              ChunkSize, HiddenSize> &work_l1,
+    TileMatL1<ComputeT, ChunkSize, HiddenSize,
+              ChunkSize, HiddenSize> &v_new_l1,
+    TileAcc<float, ChunkSize, HiddenSize,
+            ChunkSize, HiddenSize> &combined_l0);
+#endif
+
+AICORE PTO_INLINE void wait_wy_tile_ready(
+    __gm__ int32_t *ready_handle, int64_t owner, int64_t slot)
+{
+  constexpr int64_t ReadyStride = 16;
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(ready_handle);
+  for (int32_t vid = 0; vid < 2; ++vid) {
+    const int64_t offset = (owner * 2 + vid) * ReadyStride;
+    while (true) {
+      __asm__ __volatile__("");
+      AscendC::DataCacheCleanAndInvalid<
+          int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+          AscendC::DcciDst::CACHELINE_OUT>(ready_global[offset]);
+      __asm__ __volatile__("");
+      if (ready_global.GetValue(offset) >= slot + 1) {
+        break;
+      }
+    }
+  }
+  set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+  wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase,
+          bool FuseResidentOutput = false>
+AICORE PTO_INLINE void fused_wy_h_cube_chunk(
+    __gm__ ComputeT *Q_handle, __gm__ ComputeT *K_handle,
+    __gm__ ComputeT *WyV_handle, __gm__ ComputeT *A1_handle,
+    __gm__ ComputeT *A2_handle, __gm__ int32_t *WyReady_handle,
+    __gm__ ComputeT *S_handle,
+    __gm__ ComputeT *V_handle, __gm__ ComputeT *workspace_handle,
+    int64_t head, int64_t head_g, int32_t ci, int32_t H, int32_t Hg,
+    int64_t ws_ws_base, int64_t ws_u_base, int64_t ws_k_base,
+    int64_t ws_kv_base, int64_t v_head_base, int64_t v_chunk_stride,
+    uint32_t wy_workspace_slots, uint32_t wy_group_size,
+    TileMatL1<ComputeT, D, D, D, D> &s_l1,
+    TileMatL1<ComputeT, C, D, C, D> &w_l1,
+    TileMatL1<ComputeT, C, D, C, D> &q_l1,
+    TileMatL1<ComputeT, D, C, D, C> &k_l1,
+    TileMatL1<ComputeT, C, D, C, D> &v_l1,
+    TileAcc<float, C, D, C, D> &ws_l0,
+    TileAcc<float, D, D, D, D> &kv_l0,
+    int32_t output_v_stride = D,
+    bool emit_precomputed_qs = true,
+    bool use_public_u = false
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    ,
+    __gm__ ComputeT *resident_raw_qk_mailbox = nullptr,
+    __gm__ ComputeT *resident_combined_mailbox = nullptr,
+    __gm__ ComputeT *resident_gated_qk_mailbox = nullptr,
+    int64_t resident_core_id = 0,
+    bool resident_output_in_flight = false
+#endif
+    )
+{
+  static_assert(D == C, "The fused WY->H path requires D == C.");
+  constexpr int64_t TileElements = static_cast<int64_t>(C) * C;
+  const int64_t block_num = static_cast<int64_t>(get_block_num());
+  const int64_t matrix_id = static_cast<int64_t>(ci) * H + head;
+  const int64_t group = matrix_id / static_cast<int64_t>(wy_group_size);
+  const int64_t owner = group % block_num;
+  const int64_t slot =
+      (group / block_num) * static_cast<int64_t>(wy_group_size) +
+      matrix_id % static_cast<int64_t>(wy_group_size);
+  const int64_t wy_offset =
+      (owner * static_cast<int64_t>(wy_workspace_slots) + slot) *
+      TileElements;
+  const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+  wait_wy_tile_ready(WyReady_handle, owner, slot);
+
+  if (!use_public_u) {
+    // U = A2 @ V. Keep the public FP16 rounding boundary, but write the result
+    // into the head-chain owner's contiguous mailbox instead of BSND GM.
+    {
+      GmShape2D a2_shape(C, C);
+      GmStride2D a2_stride(C);
+      GmTensor2D<ComputeT> a2_global(A2_handle + wy_offset, a2_shape,
+                                     a2_stride);
+      TLOAD(s_l1, a2_global);
+
+      const int64_t input_v_offset = (chunk_start * H + head) * D;
+      GmShape2D input_v_shape(C, D);
+      GmStride2D input_v_stride(H * D);
+      GmTensor2D<ComputeT> input_v_global(
+          WyV_handle + input_v_offset, input_v_shape, input_v_stride);
+      TLOAD(v_l1, input_v_global);
+    }
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    gemm_v0<ComputeT, float, C, D, C, C, D, C, C, false, false>(
+        s_l1, v_l1, ws_l0, true);
+    {
+      GmShape2D u_shape(C, D);
+      GmStride2D u_stride(D);
+      GmTensor2D<ComputeT> u_global(workspace_handle + ws_u_base, u_shape,
+                                    u_stride);
+      DynAccTile<float, C, D> u_store(C, D);
+      TASSIGN(u_store, 0);
+      TSTORE(u_global, u_store);
+    }
+  }
+
+  // W = A1 @ K, then round directly from L0C into L1. This preserves the
+  // original FP32->FP16 boundary while eliminating W's GM store and reload.
+  {
+    GmShape2D a1_shape(C, C);
+    GmStride2D a1_stride(C);
+    GmTensor2D<ComputeT> a1_global(A1_handle + wy_offset, a1_shape,
+                                   a1_stride);
+    TLOAD(s_l1, a1_global);
+
+    const int64_t input_k_offset = (chunk_start * Hg + head_g) * D;
+    GmShape2D input_k_shape(C, D);
+    GmStride2D input_k_stride(Hg * D);
+    GmTensor2D<ComputeT> input_k_global(
+        K_handle + input_k_offset, input_k_shape, input_k_stride);
+    TLOAD(v_l1, input_k_global);
+  }
+  set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  gemm_v0<ComputeT, float, C, D, C, C, D, C, C, false, false>(
+      s_l1, v_l1, ws_l0, true);
+
+  {
+    GmShape2D w_shape(C, D);
+    GmStride2D w_stride(D);
+    GmTensor2D<ComputeT> w_global(
+        workspace_handle + ws_ws_base, w_shape, w_stride);
+    DynAccTile<float, C, D> w_store(C, D);
+    TASSIGN(w_store, 0);
+    TSTORE(w_global, w_store);
+  }
+  set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID2);
+  wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID2);
+  {
+    GmShape2D w_shape(C, D);
+    GmStride2D w_stride(D);
+    GmTensor2D<ComputeT> w_global(
+        workspace_handle + ws_ws_base, w_shape, w_stride);
+    TLOAD(w_l1, w_global);
+  }
+
+  wait_flag_dev(FlagBase + 3);
+  {
+    constexpr int32_t DD = D * D;
+    const int64_t state_offset =
+        (static_cast<int64_t>(ci) * H + head) * DD;
+    GmShape2D s_shape(D, D);
+    GmStride2D s_stride(D);
+    GmTensor2D<ComputeT> s_global(S_handle + state_offset, s_shape,
+                                  s_stride);
+    TLOAD(s_l1, s_global);
+  }
+  set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  gemm_v0<ComputeT, float, C, D, D, C, D, D, D, false, false>(
+      w_l1, s_l1, ws_l0, true);
+  {
+    GmShape2D ws_shape(C, D);
+    GmStride2D ws_stride(D);
+    GmTensor2D<ComputeT> ws_global(workspace_handle + ws_ws_base, ws_shape,
+                                   ws_stride);
+    DynAccTile<float, C, D> ws_store(C, D);
+    TASSIGN(ws_store, 0);
+    TSTORE(ws_global, ws_store);
+  }
+  ffts_cross_core_sync(
+      PIPE_FIX, 1 | (2 << 4) | (FlagBase << 8));
+
+  if (emit_precomputed_qs) {
+    paired_cube_qs<D, C>(Q_handle, S_handle, head, head_g, chunk_start, 0, ci,
+                         C, H, Hg, s_l1, q_l1, ws_l0);
+  }
+  paired_cube_kv<D, C, FlagBase, true, true>(
+      V_handle, workspace_handle, C, output_v_stride,
+      v_head_base + static_cast<int64_t>(ci) * v_chunk_stride, ws_k_base,
+      ws_kv_base, k_l1, v_l1, kv_l0);
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+  if constexpr (FuseResidentOutput) {
+    ResidentHoCubeOutput<D, C>(
+        resident_combined_mailbox, resident_gated_qk_mailbox,
+        resident_core_id, resident_output_in_flight, s_l1, q_l1, v_l1,
+        ws_l0);
+  }
+#endif
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase>
+AICORE PTO_INLINE void fused_wy_h_cube_head_range(
+    __gm__ ComputeT *Q_handle, __gm__ ComputeT *K_handle,
+    __gm__ ComputeT *WyV_handle, __gm__ ComputeT *A1_handle,
+    __gm__ ComputeT *A2_handle, __gm__ int32_t *WyReady_handle,
+    __gm__ ComputeT *S_handle, __gm__ ComputeT *V_handle,
+    __gm__ ComputeT *workspace_handle, int64_t head,
+    int32_t chunk_begin, int32_t chunk_end, int32_t H, int32_t Hg,
+    uint32_t wy_workspace_slots, uint32_t wy_group_size,
+    TileMatL1<ComputeT, D, D, D, D> &s_l1,
+    TileMatL1<ComputeT, C, D, C, D> &w_l1,
+    TileMatL1<ComputeT, C, D, C, D> &q_l1,
+    TileMatL1<ComputeT, D, C, D, C> &k_l1,
+    TileMatL1<ComputeT, C, D, C, D> &v_l1,
+    TileAcc<float, C, D, C, D> &ws_l0,
+    TileAcc<float, D, D, D, D> &kv_l0)
+{
+  constexpr int32_t DD = D * D;
+  constexpr int32_t WS_FIELD_STRIDE =
+      DD + GDN_H_WORKSPACE_PAD_BYTES / sizeof(ComputeT);
+  const int64_t cid = static_cast<int64_t>(get_block_idx());
+  const int64_t block_num = static_cast<int64_t>(get_block_num());
+  const int64_t ws_core_offset = cid * WS_FIELD_STRIDE;
+  const int64_t ws_field_span = block_num * WS_FIELD_STRIDE;
+  const int64_t ws_ws_base = ws_core_offset;
+  const int64_t ws_k_base = ws_field_span + ws_core_offset;
+  const int64_t ws_u_base = 2 * ws_field_span + ws_core_offset;
+  const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+  const int64_t head_g = head / (H / Hg);
+  const int64_t v_head_base = head * static_cast<int64_t>(C) * D;
+  const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+  for (int32_t ci = chunk_begin; ci < chunk_end; ++ci) {
+    fused_wy_h_cube_chunk<D, C, FlagBase>(
+        Q_handle, K_handle, WyV_handle, A1_handle, A2_handle,
+        WyReady_handle, S_handle, V_handle, workspace_handle, head, head_g,
+        ci, H, Hg, ws_ws_base, ws_u_base, ws_k_base, ws_kv_base,
+        v_head_base, v_chunk_stride, wy_workspace_slots, wy_group_size,
+        s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0);
+  }
+}
+#endif
+
+template <int32_t D, int32_t C, int32_t FlagBase>
+AICORE PTO_INLINE void paired_cube_chunk(
+    __gm__ ComputeT *Q_handle, __gm__ ComputeT *W_handle,
+    __gm__ ComputeT *S_handle, __gm__ ComputeT *V_handle,
+    __gm__ ComputeT *workspace_handle, int64_t head, int64_t head_g,
+    int32_t ci, int32_t H, int32_t Hg, int64_t ws_ws_base,
+    int64_t ws_k_base, int64_t ws_kv_base, int64_t v_head_base,
+    int64_t v_chunk_stride,
+    TileMatL1<ComputeT, D, D, D, D> &s_l1,
+    TileMatL1<ComputeT, C, D, C, D> &w_l1,
+    TileMatL1<ComputeT, C, D, C, D> &q_l1,
+    TileMatL1<ComputeT, D, C, D, C> &k_l1,
+    TileMatL1<ComputeT, C, D, C, D> &v_l1,
+    TileAcc<float, C, D, C, D> &ws_l0,
+    TileAcc<float, D, D, D, D> &kv_l0)
+{
+  const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+  paired_cube_ws<D, C, FlagBase, true, true>(
+      W_handle, S_handle, workspace_handle, head, chunk_start, 0, ci, C, H,
+      ws_ws_base, s_l1, w_l1, ws_l0);
+  paired_cube_qs<D, C>(Q_handle, S_handle, head, head_g, chunk_start, 0, ci,
+                       C, H, Hg, s_l1, q_l1, ws_l0);
+  paired_cube_kv<D, C, FlagBase, true, true>(
+      V_handle, workspace_handle, C, D,
+      v_head_base + static_cast<int64_t>(ci) * v_chunk_stride, ws_k_base,
+      ws_kv_base, k_l1, v_l1, kv_l0);
+}
 #endif
 
 #if defined(__DAV_C220_VEC__)
 template <int32_t D, int32_t C, int32_t FlagBase,
           bool PublishReady = true>
 AICORE PTO_INLINE void paired_vec_init_zero(
-    __gm__ ComputeT *S_handle, __gm__ ComputeT *workspace_handle,
-    int64_t head, int64_t chunk_offset, int32_t H, int32_t vid,
-    int64_t ws_s_base,
+    __gm__ ComputeT *S_handle, int64_t head, int64_t chunk_offset,
+    int32_t H, int32_t vid,
     TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
     TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half)
 {
@@ -497,13 +774,6 @@ AICORE PTO_INLINE void paired_vec_init_zero(
   TCVT(state_half, state_ub, pto::RoundMode::CAST_NONE);
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-  {
-    GmShape2D s_shape(HalfC, D);
-    GmStride2D s_stride(D);
-    GmTensor2D<ComputeT> s_global(
-        workspace_handle + ws_s_base + vid * HalfC * D, s_shape, s_stride);
-    TSTORE(s_global, state_half);
-  }
   {
     const int64_t s_out_offset = (chunk_offset * H + head) * DD;
     GmShape2D s_out_shape(HalfC, D);
@@ -522,8 +792,77 @@ AICORE PTO_INLINE void paired_vec_init_zero(
   }
 }
 
+template <int32_t D, int32_t C, int32_t FlagBase>
+AICORE PTO_INLINE void paired_vec_load_state(
+    __gm__ ComputeT *S_handle, int64_t head, int64_t chunk_offset,
+    int32_t chunk_idx, int32_t H, int32_t vid,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half)
+{
+  constexpr int32_t HalfC = C / 2;
+  constexpr int32_t DD = D * D;
+  const int64_t state_offset =
+      ((chunk_offset + chunk_idx) * H + head) * DD + vid * HalfC * D;
+  GmShape2D state_shape(HalfC, D);
+  GmStride2D state_stride(D);
+  GmTensor2D<ComputeT> state_global(S_handle + state_offset, state_shape,
+                                    state_stride);
+  TLOAD(state_half, state_global);
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  TCVT(state_ub, state_half, pto::RoundMode::CAST_NONE);
+
+  ffts_cross_core_sync(
+      PIPE_V, 1 | (2 << 4) | ((FlagBase + 3) << 8));
+}
+
+template <int32_t C>
+AICORE PTO_INLINE void publish_segment_state(
+    __gm__ int32_t *h_o_ready_handle, int64_t head,
+    int32_t ready_chunk, int32_t vid)
+{
+  constexpr int64_t H_O_READY_STRIDE = 16;
+  set_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+  wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID1);
+
+  const int64_t ready_offset =
+      head * H_O_READY_STRIDE + 1 + vid;
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(h_o_ready_handle);
+  ready_global.SetValue(ready_offset, ready_chunk);
+  __asm__ __volatile__("");
+  AscendC::DataCacheCleanAndInvalid<
+      int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+      AscendC::DcciDst::CACHELINE_ALL>(ready_global[ready_offset]);
+  __asm__ __volatile__("");
+}
+
+template <int32_t C>
+AICORE PTO_INLINE void wait_segment_state(
+    __gm__ int32_t *h_o_ready_handle, int64_t head,
+    int32_t ready_chunk, int32_t vid)
+{
+  constexpr int64_t H_O_READY_STRIDE = 16;
+  const int64_t ready_offset =
+      head * H_O_READY_STRIDE + 1 + vid;
+  AscendC::GlobalTensor<int32_t> ready_global;
+  ready_global.SetGlobalBuffer(h_o_ready_handle);
+  while (true) {
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<
+        int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(ready_global[ready_offset]);
+    __asm__ __volatile__("");
+    if (ready_global.GetValue(ready_offset) >= ready_chunk) {
+      break;
+    }
+  }
+  set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+  wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+}
+
 template <int32_t D, int32_t C, int32_t FlagBase, int32_t GUbAddr,
-          int32_t CoeffUbAddr, int32_t UUbAddr>
+          int32_t CoeffUbAddr, int32_t UUbAddr, bool FusedWyH = false>
 AICORE PTO_INLINE void paired_vec_front(
     __gm__ ComputeT *K_handle, __gm__ ComputeT *U_handle,
     __gm__ float *G_handle, __gm__ ComputeT *V_handle,
@@ -542,7 +881,8 @@ AICORE PTO_INLINE void paired_vec_front(
     TileUbDataND<float, 1, 8, 1, 8> &g_last_tail_ub,
     TileUbDataND<float, 1, 64, 1, 64> &coeff_ub,
     TileUbDataND<float, C / 2, D, C / 2, D> &u_ub,
-    TileUbDataND<float, C / 2, D, C / 2, D> &ws_ub)
+    TileUbDataND<float, C / 2, D, C / 2, D> &ws_ub,
+    int64_t ws_u_base = 0, bool use_public_u = false)
 {
   constexpr int32_t HalfC = C / 2;
   constexpr int32_t ExpTailElements = 8;
@@ -552,17 +892,22 @@ AICORE PTO_INLINE void paired_vec_front(
       static_cast<int32_t>(valid - static_cast<int64_t>(vid) * HalfC);
   if (valid_rows < 0) valid_rows = 0;
   if (valid_rows > HalfC) valid_rows = HalfC;
+  const int64_t v_offset =
+      v_head_base + static_cast<int64_t>(ci) * v_chunk_stride +
+      static_cast<int64_t>(vid) * HalfC * v_stride;
 
-  const int64_t u_offset =
-      (chunk_start * H + head) * D + vid * HalfC * qkv_stride;
-  if (valid_rows > 0) {
-    GmShape2D u_shape(valid_rows, D);
-    GmStride2D u_stride(qkv_stride);
-    GmTensor2D<ComputeT> u_global(U_handle + u_offset, u_shape, u_stride);
-    TLOAD(u_ub_half, u_global);
-  } else {
-    TEXPANDS(u_ub, 0.0f);
-    TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
+  if (!FusedWyH || use_public_u) {
+    const int64_t u_offset =
+        (chunk_start * H + head) * D + vid * HalfC * qkv_stride;
+    if (valid_rows > 0) {
+      GmShape2D u_shape(valid_rows, D);
+      GmStride2D u_stride(qkv_stride);
+      GmTensor2D<ComputeT> u_global(U_handle + u_offset, u_shape, u_stride);
+      TLOAD(u_ub_half, u_global);
+    } else {
+      TEXPANDS(u_ub, 0.0f);
+      TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
+    }
   }
 
   const int64_t k_offset =
@@ -617,9 +962,26 @@ AICORE PTO_INLINE void paired_vec_front(
   TMUL(k_ub, k_ub, coeff_2d_ub);
   pipe_barrier(PIPE_V);
   TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
-  TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+  if (!FusedWyH || use_public_u) {
+    TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+  }
 
   wait_flag_dev(FlagBase);
+  if constexpr (FusedWyH) {
+    if (!use_public_u) {
+      GmShape2D u_shape(HalfC, D);
+      GmStride2D u_stride(D);
+      GmTensor2D<ComputeT> u_global(
+          workspace_handle + ws_u_base + vid * HalfC * D, u_shape,
+          u_stride);
+      TLOAD(u_ub_half, u_global);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    }
+  }
   {
     GmShape2D ws_shape(HalfC, D);
     GmStride2D ws_stride(D);
@@ -636,9 +998,6 @@ AICORE PTO_INLINE void paired_vec_front(
 
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-  const int64_t v_offset =
-      v_head_base + static_cast<int64_t>(ci) * v_chunk_stride +
-      static_cast<int64_t>(vid) * HalfC * v_stride;
   if (valid_rows > 0) {
     GmShape2D v_shape(valid_rows, D);
     GmStride2D v_gm_stride(v_stride);
@@ -656,7 +1015,6 @@ AICORE PTO_INLINE void paired_vec_front(
   }
   ffts_cross_core_sync(
       PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 1) << 8));
-
   set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
   const float exp_g_last =
@@ -672,30 +1030,27 @@ AICORE PTO_INLINE void paired_vec_finish(
     __gm__ ComputeT *S_handle, __gm__ ComputeT *workspace_handle,
     __gm__ int32_t *h_o_ready_handle, int64_t head,
     int64_t chunk_offset, int32_t ci, int32_t num_chunks, int32_t H,
-    int32_t vid, int64_t ws_s_base, int64_t ws_kv_base,
+    int32_t vid, int64_t ws_kv_base,
     bool emit_precomputed_qs,
     TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
     TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half,
-    TileUbDataND<float, C / 2, D, C / 2, D> &kv_ub,
-    TileUbDataND<int32_t, 1, 8, 1, 8> &h_o_ready_ub)
+    TileUbDataND<float, C / 2, D, C / 2, D> &kv_ub)
 {
   constexpr int32_t HalfC = C / 2;
   constexpr int32_t DD = D * D;
   constexpr int64_t H_O_READY_STRIDE = 16;
   wait_flag_dev(FlagBase + 2);
-#ifndef MEGA_CHUNK_GDN_A5_GROUP_QK_SKIP_HO_READY
   if (emit_precomputed_qs && vid == 0) {
     const int64_t ready_offset = head * H_O_READY_STRIDE;
-    h_o_ready_ub.SetValue(0, ci + 1);
-    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
-    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
-    GmShape2D ready_shape(1, 8);
-    GmStride2D ready_stride(8);
-    GmTensor2D<int32_t> ready_global(h_o_ready_handle + ready_offset,
-                                     ready_shape, ready_stride);
-    TSTORE(ready_global, h_o_ready_ub);
+    AscendC::GlobalTensor<int32_t> ready_global;
+    ready_global.SetGlobalBuffer(h_o_ready_handle);
+    ready_global.SetValue(ready_offset, ci + 1);
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<
+        int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_ALL>(ready_global[ready_offset]);
+    __asm__ __volatile__("");
   }
-#endif
   {
     GmShape2D kv_shape(HalfC, D);
     GmStride2D kv_stride(D);
@@ -714,14 +1069,6 @@ AICORE PTO_INLINE void paired_vec_finish(
   if (ci + 1 < num_chunks) {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    {
-      GmShape2D s_shape(HalfC, D);
-      GmStride2D s_stride(D);
-      GmTensor2D<ComputeT> s_global(
-          workspace_handle + ws_s_base + vid * HalfC * D, s_shape,
-          s_stride);
-      TSTORE(s_global, state_half);
-    }
     const int64_t s_out_offset = ((chunk_offset + ci + 1) * H + head) * DD;
     {
       GmShape2D s_out_shape(HalfC, D);
@@ -734,6 +1081,46 @@ AICORE PTO_INLINE void paired_vec_finish(
     ffts_cross_core_sync(
         PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 3) << 8));
   }
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase, int32_t GUbAddr,
+          int32_t CoeffUbAddr, int32_t UUbAddr, bool FusedWyH = false>
+AICORE PTO_INLINE void paired_vec_chunk(
+    __gm__ ComputeT *K_handle, __gm__ ComputeT *U_handle,
+    __gm__ float *G_handle, __gm__ ComputeT *S_handle,
+    __gm__ ComputeT *V_handle, __gm__ ComputeT *workspace_handle,
+    __gm__ int32_t *h_o_ready_handle, int64_t head, int64_t head_g,
+    int32_t ci, int32_t num_chunks, int32_t H, int32_t Hg,
+    int64_t total_tokens, int32_t vid, int64_t ws_ws_base,
+    int64_t ws_k_base, int64_t ws_kv_base, int64_t v_head_base,
+    int64_t v_chunk_stride,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &k_ub_half,
+    TileUbDataND<float, 1, C, 1, C, pto::PadValue::Zero> &g_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &u_ub_half,
+    TileUbDataND<float, C / 2, D, C / 2, D> &k_ub,
+    TileUbDataND<float, 1, 8, 1, 8> &g_last_tail_ub,
+    TileUbDataND<float, 1, 64, 1, 64> &coeff_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &u_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &ws_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &kv_ub,
+    int64_t ws_u_base = 0, int32_t output_v_stride = D,
+    bool emit_precomputed_qs = true, bool use_public_u = false)
+{
+  const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+  paired_vec_front<D, C, FlagBase, GUbAddr, CoeffUbAddr, UUbAddr,
+                   FusedWyH>(
+      K_handle, U_handle, G_handle, V_handle, workspace_handle, head, head_g,
+      chunk_start, C, ci, H, Hg, total_tokens, vid, output_v_stride, v_head_base,
+      v_chunk_stride, ws_ws_base, ws_k_base, state_ub, k_ub_half, g_ub,
+      u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, ws_u_base,
+      use_public_u);
+  paired_vec_finish<D, C, FlagBase>(
+      S_handle, workspace_handle, h_o_ready_handle, head, 0, ci, num_chunks,
+      H, vid, ws_kv_base, emit_precomputed_qs, state_ub, state_half, kv_ub);
 }
 
 template <int32_t D, int32_t C, bool StoreFinalStateCache>
@@ -776,16 +1163,113 @@ AICORE PTO_INLINE void paired_vec_store_final(
   set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
   wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
 }
+
+template <int32_t D, int32_t C, int32_t FlagBase, int32_t GUbAddr,
+          int32_t CoeffUbAddr, int32_t UUbAddr,
+          bool StoreFinalStateCache, bool InitializeZero, bool LoadState,
+          bool StoreFinal, bool PublishSegment, bool SignalCompletion>
+AICORE PTO_INLINE void fused_wy_h_vec_head_range(
+    __gm__ ComputeT *K_handle, __gm__ ComputeT *U_handle,
+    __gm__ float *G_handle, __gm__ ComputeT *S_handle,
+    __gm__ ComputeT *V_handle, __gm__ ComputeT *FS_handle,
+    __gm__ ComputeT *workspace_handle,
+    __gm__ int32_t *h_o_ready_handle,
+    __gm__ float *final_state_cache, __gm__ int32_t *state_indices,
+    int64_t head, int32_t chunk_begin, int32_t chunk_end,
+    int32_t num_chunks, int32_t H, int32_t Hg, int64_t total_tokens,
+    int32_t vid, int32_t state_index_stride, int64_t state_cache_slots,
+    int64_t output_final_state,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &k_ub_half,
+    TileUbDataND<float, 1, C, 1, C, pto::PadValue::Zero> &g_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &u_ub_half,
+    TileUbDataND<float, C / 2, D, C / 2, D> &k_ub,
+    TileUbDataND<float, 1, 8, 1, 8> &g_last_tail_ub,
+    TileUbDataND<float, 1, 64, 1, 64> &coeff_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &u_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &ws_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &kv_ub)
+{
+  static_assert(!(InitializeZero && LoadState));
+  constexpr int32_t DD = D * D;
+  constexpr int32_t WS_FIELD_STRIDE =
+      DD + GDN_H_WORKSPACE_PAD_BYTES / sizeof(ComputeT);
+  const int64_t cid = static_cast<int64_t>(get_block_idx());
+  const int64_t block_num = static_cast<int64_t>(get_block_num());
+  const int64_t ws_core_offset = cid * WS_FIELD_STRIDE;
+  const int64_t ws_field_span = block_num * WS_FIELD_STRIDE;
+  const int64_t ws_ws_base = ws_core_offset;
+  const int64_t ws_k_base = ws_field_span + ws_core_offset;
+  const int64_t ws_u_base = 2 * ws_field_span + ws_core_offset;
+  const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+  const int64_t head_g = head / (H / Hg);
+  const int64_t v_head_base = head * static_cast<int64_t>(C) * D;
+  const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+  if constexpr (InitializeZero) {
+    paired_vec_init_zero<D, C, FlagBase, true>(
+        S_handle, head, 0, H, vid, state_ub, state_half);
+  }
+  if constexpr (LoadState) {
+    wait_segment_state<C>(h_o_ready_handle, head, chunk_begin, vid);
+    paired_vec_load_state<D, C, FlagBase>(
+        S_handle, head, 0, chunk_begin, H, vid, state_ub, state_half);
+  }
+
+  for (int32_t ci = chunk_begin; ci < chunk_end; ++ci) {
+    paired_vec_chunk<D, C, FlagBase, GUbAddr, CoeffUbAddr, UUbAddr, true>(
+        K_handle, U_handle, G_handle, S_handle, V_handle, workspace_handle,
+        h_o_ready_handle, head, head_g, ci, num_chunks, H, Hg,
+        total_tokens, vid, ws_ws_base, ws_k_base, ws_kv_base, v_head_base,
+        v_chunk_stride, state_ub, state_half, k_ub_half, g_ub, u_ub_half,
+        k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub, ws_u_base);
+  }
+
+  if constexpr (PublishSegment) {
+    publish_segment_state<C>(h_o_ready_handle, head, chunk_end, vid);
+  }
+  if constexpr (StoreFinal) {
+    paired_vec_store_final<D, C, StoreFinalStateCache>(
+        FS_handle, final_state_cache, state_indices, head, H, vid,
+        state_index_stride, state_cache_slots, output_final_state, state_ub,
+        state_half);
+  }
+  if constexpr (SignalCompletion) {
+    ffts_cross_core_sync(
+        PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 3) << 8));
+  }
+}
 #endif
 
 } // namespace
 
 #endif
 
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+#include "chunk_ho.cpp"
+#endif
+
+#if defined(__DAV_C220_CUBE__)
+#define GDN_CHUNK_H_KERNEL chunk_h_kernel_aic
+#elif defined(__DAV_C220_VEC__)
+#define GDN_CHUNK_H_KERNEL chunk_h_kernel_aiv
+#else
+#define GDN_CHUNK_H_KERNEL chunk_h_kernel
+#endif
+
 template <int32_t HiddenSize, int32_t ChunkSize,
           bool StoreFinalStateCache = false,
-          bool LoadInitialStateCache = false>
-AICORE void chunk_h_kernel(
+          bool LoadInitialStateCache = false
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+          ,
+          bool FuseResidentOutput = false,
+          bool FuseResidentGatedRmsNorm = false
+#endif
+          >
+AICORE void GDN_CHUNK_H_KERNEL(
     __gm__ ComputeT *Q_handle, __gm__ ComputeT *K_handle,
     __gm__ ComputeT *W_handle, __gm__ ComputeT *U_handle,
     __gm__ float *G_handle,
@@ -806,7 +1290,26 @@ AICORE void chunk_h_kernel(
     __gm__ float *final_state_cache,
     __gm__ int32_t *state_indices,
     int32_t state_index_stride,
-    int64_t state_cache_slots)
+    int64_t state_cache_slots,
+    bool fuse_wy_h,
+    bool fuse_wy_h_public_u,
+    __gm__ ComputeT *wy_v_handle,
+    __gm__ ComputeT *wy_a1_handle,
+    __gm__ ComputeT *wy_a2_handle,
+    __gm__ int32_t *wy_ready_handle,
+    uint32_t wy_workspace_slots,
+    uint32_t wy_group_size
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    ,
+    __gm__ float *resident_mask_handle,
+    __gm__ ComputeT *resident_raw_qk_mailbox,
+    __gm__ ComputeT *resident_combined_mailbox,
+    __gm__ ComputeT *resident_gated_qk_mailbox,
+    __gm__ GDN_PUBLIC_DTYPE *resident_output_handle,
+    __gm__ GDN_PUBLIC_DTYPE *resident_z_handle,
+    __gm__ GDN_PUBLIC_DTYPE *resident_norm_weight_handle
+#endif
+    )
 {
   // chunk_h advances the recurrent hidden state chunk by chunk:
   //   ws_i      = W_i @ S_i
@@ -927,26 +1430,446 @@ AICORE void chunk_h_kernel(
   AscendC::GlobalTensor<int32_t> h_o_ready_gm;
   h_o_ready_gm.SetGlobalBuffer(h_o_ready_handle);
 
-#if defined(GDN_A5_VECTOR_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-  if constexpr (LoadInitialStateCache) {
-    if (has_initial_state != 0) {
-      // Acquire both the slot metadata and FP32 payload once per AIV before
-      // any work item can dereference an index cached by an earlier launch.
-      dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-      dsb(DSB_DDR);
-    }
-  }
-#endif
-
   int64_t num_seqs = batch_size;
   int64_t total_work = num_seqs * H;
   const int64_t paired_core_count = total_work - block_num;
   const int64_t dense_chunk_count = total_tokens / C;
-  constexpr bool use_paired_head_pipeline = false;
+  bool no_initial_state = has_initial_state == 0;
+  if constexpr (LoadInitialStateCache) {
+    no_initial_state =
+        no_initial_state ||
+        (batch_size == 1 && initial_state_indices != nullptr &&
+         initial_state_indices[0] < 0);
+  }
+#ifdef MEGA_CHUNK_GDN_OVERFLOW_SEGMENT_PIPELINE
+  const int64_t overflow_head_count = total_work - block_num;
+  const int32_t overflow_stage_count =
+      overflow_head_count > 0
+          ? static_cast<int32_t>(block_num / overflow_head_count)
+          : 0;
+  const bool use_overflow_segment_pipeline =
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+      !FuseResidentOutput &&
+#endif
+      batch_size == 1 && has_initial_state == 0 && precompute_qs != 0 &&
+      C == D && cu_seqlens != nullptr && total_tokens > 0 &&
+      total_tokens % C == 0 && dense_chunk_count > 0 &&
+      overflow_head_count > 0 && overflow_head_count < block_num &&
+      block_num % overflow_head_count == 0 && overflow_stage_count >= 2 &&
+      dense_chunk_count >= overflow_stage_count && total_work == H &&
+      static_cast<int64_t>(cu_seqlens[0]) == 0 &&
+      static_cast<int64_t>(cu_seqlens[1]) == total_tokens;
+#else
+  constexpr int64_t overflow_head_count = 0;
+  constexpr int32_t overflow_stage_count = 0;
+  constexpr bool use_overflow_segment_pipeline = false;
+#endif
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+  const int64_t fused_wy_group_count =
+      wy_group_size == 0
+          ? 0
+          : dense_chunk_count * H /
+                static_cast<int64_t>(wy_group_size);
+  const int64_t fused_wy_producer_waves =
+      fused_wy_group_count == 0
+          ? 0
+          : (fused_wy_group_count + block_num - 1) / block_num;
+  const int64_t fused_wy_required_slots =
+      fused_wy_producer_waves *
+      static_cast<int64_t>(wy_group_size);
+  const bool fused_wy_group_size_supported =
+      GROUP >= 1 && GROUP <= 4 &&
+      wy_group_size == static_cast<uint32_t>(GROUP);
+  const bool use_fused_wy_h =
+      fuse_wy_h && no_initial_state && D == C && batch_size == 1 &&
+      cu_seqlens != nullptr && total_tokens > 0 && total_tokens % C == 0 &&
+      fused_wy_group_size_supported && total_work == H &&
+      static_cast<int64_t>(cu_seqlens[0]) == 0 &&
+      static_cast<int64_t>(cu_seqlens[1]) == total_tokens &&
+      wy_v_handle != nullptr &&
+      wy_a1_handle != nullptr && wy_a2_handle != nullptr &&
+      fused_wy_required_slots > 0 &&
+      static_cast<int64_t>(wy_workspace_slots) >=
+          fused_wy_required_slots;
+  const bool use_fused_wy_h_public_u =
+      use_fused_wy_h && fuse_wy_h_public_u && GROUP == 1;
+  // H/O overlap consumes chunk-packed V. The stage-barrier fallback consumes
+  // ordinary BSND V, so fused WY->H must preserve the selected public layout.
+  const bool fused_output_packed = precompute_qs != 0;
+  const int32_t fused_output_v_stride =
+      fused_output_packed ? D : H * D;
+#else
+  constexpr bool use_fused_wy_h = false;
+  constexpr bool use_fused_wy_h_public_u = false;
+  constexpr bool fused_output_packed = false;
+  constexpr int32_t fused_output_v_stride = D;
+#endif
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H_INTERLEAVED_OVERFLOW
+  const bool use_fused_wy_h_interleaved_overflow =
+      use_fused_wy_h && block_num == 20 && total_work == 24 &&
+      paired_core_count == 4;
+#else
+  constexpr bool use_fused_wy_h_interleaved_overflow = false;
+#endif
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H_BALANCED_OVERFLOW
+  const bool use_fused_wy_h_balanced_overflow =
+      use_fused_wy_h && block_num == 20 && total_work == 24 &&
+      paired_core_count == 4;
+#else
+  constexpr bool use_fused_wy_h_balanced_overflow = false;
+#endif
+#ifdef MEGA_CHUNK_GDN_SPLIT_HEAD_H
+  const bool use_split_head_pipeline =
+      batch_size == 1 && has_initial_state == 0 && precompute_qs != 0 &&
+      C == D && cu_seqlens != nullptr && total_tokens > 0 &&
+      total_tokens % C == 0 && dense_chunk_count > 0 &&
+      (dense_chunk_count & 1) == 0 &&
+      static_cast<int64_t>(cu_seqlens[0]) == 0 &&
+      static_cast<int64_t>(cu_seqlens[1]) == total_tokens &&
+      total_work > block_num && total_work < 2 * block_num &&
+      2 * paired_core_count <= block_num;
+#else
+  constexpr bool use_split_head_pipeline = false;
+#endif
+#ifdef MEGA_CHUNK_GDN_SEGMENTED_H
+  constexpr int32_t SEGMENT_CHUNKS = 4;
+  constexpr int32_t SEGMENTED_H_RESERVED_O_WORKERS = 4;
+  const int64_t segmented_h_worker_count =
+      block_num > SEGMENTED_H_RESERVED_O_WORKERS
+          ? block_num - SEGMENTED_H_RESERVED_O_WORKERS
+          : block_num;
+  const bool use_segmented_head_pipeline =
+      batch_size == 1 && has_initial_state == 0 && precompute_qs != 0 &&
+      C == D && cu_seqlens != nullptr && total_tokens > 0 &&
+      total_tokens % C == 0 && dense_chunk_count >= SEGMENT_CHUNKS &&
+      dense_chunk_count >= 2 * SEGMENT_CHUNKS &&
+      dense_chunk_count % SEGMENT_CHUNKS == 0 &&
+      static_cast<int64_t>(cu_seqlens[0]) == 0 &&
+      static_cast<int64_t>(cu_seqlens[1]) == total_tokens &&
+      total_work * (dense_chunk_count / SEGMENT_CHUNKS) > block_num;
+#else
+  constexpr int32_t SEGMENT_CHUNKS = 4;
+  constexpr int64_t segmented_h_worker_count = 0;
+  constexpr bool use_segmented_head_pipeline = false;
+#endif
 
 #if defined(__DAV_C220_CUBE__)
-  if (use_paired_head_pipeline && cid < paired_core_count) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+  if (use_fused_wy_h) {
+    if (use_fused_wy_h_interleaved_overflow) {
+      const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+      if (cid < paired_core_count) {
+        const int64_t primary_head = cid;
+        const int64_t overflow_head = block_num + cid;
+        const int64_t primary_head_g = primary_head / GROUP;
+        const int64_t overflow_head_g = overflow_head / GROUP;
+        const int64_t ws_core_offset =
+            static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+        const int64_t ws_field_span =
+            static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+        const int64_t ws_slot_span = 4 * ws_field_span;
+        const int64_t primary_ws_ws = ws_core_offset;
+        const int64_t primary_ws_k = ws_field_span + ws_core_offset;
+        const int64_t primary_ws_u = 2 * ws_field_span + ws_core_offset;
+        const int64_t primary_ws_kv = 3 * ws_field_span + ws_core_offset;
+        const int64_t overflow_ws_ws = ws_slot_span + primary_ws_ws;
+        const int64_t overflow_ws_k = ws_slot_span + primary_ws_k;
+        const int64_t overflow_ws_u = ws_slot_span + primary_ws_u;
+        const int64_t overflow_ws_kv = ws_slot_span + primary_ws_kv;
+        const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+        const int64_t primary_v_base =
+            primary_head * static_cast<int64_t>(C) * D;
+        const int64_t overflow_v_base =
+            overflow_head * static_cast<int64_t>(C) * D;
+
+        for (int32_t ci = 0; ci < num_chunks; ++ci) {
+          fused_wy_h_cube_chunk<D, C, 0>(
+              Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+              wy_ready_handle, S_handle, V_handle, workspace_handle,
+              primary_head, primary_head_g, ci, H, Hg, primary_ws_ws,
+              primary_ws_u, primary_ws_k, primary_ws_kv, primary_v_base,
+              v_chunk_stride, wy_workspace_slots, wy_group_size, s_l1, w_l1,
+              q_l1, k_l1, v_l1, ws_l0, kv_l0);
+          fused_wy_h_cube_chunk<D, C, 4>(
+              Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+              wy_ready_handle, S_handle, V_handle, workspace_handle,
+              overflow_head, overflow_head_g, ci, H, Hg, overflow_ws_ws,
+              overflow_ws_u, overflow_ws_k, overflow_ws_kv, overflow_v_base,
+              v_chunk_stride, wy_workspace_slots, wy_group_size, s_l1, w_l1,
+              q_l1, k_l1, v_l1, ws_l0, kv_l0);
+        }
+        wait_flag_dev(3);
+        wait_flag_dev(7);
+      } else {
+        fused_wy_h_cube_head_range<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, cid, 0,
+            num_chunks, H, Hg, wy_workspace_slots, wy_group_size, s_l1, w_l1,
+            q_l1, k_l1, v_l1, ws_l0, kv_l0);
+        wait_flag_dev(3);
+      }
+    } else if (use_fused_wy_h_balanced_overflow) {
+      constexpr int32_t SplitChunk = 8;
+      const int64_t overflow_head_count = paired_core_count;
+      if (cid < overflow_head_count) {
+        const int64_t overflow_head = block_num + cid;
+        fused_wy_h_cube_head_range<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle,
+            overflow_head, 0, SplitChunk, H, Hg, wy_workspace_slots,
+            wy_group_size, s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0);
+        wait_flag_dev(3);
+        fused_wy_h_cube_head_range<D, C, 4>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, cid, 0,
+            static_cast<int32_t>(dense_chunk_count), H, Hg,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+        wait_flag_dev(7);
+      } else if (cid < 2 * overflow_head_count) {
+        fused_wy_h_cube_head_range<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, cid, 0,
+            static_cast<int32_t>(dense_chunk_count), H, Hg,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+        wait_flag_dev(3);
+        const int64_t overflow_head =
+            block_num + cid - overflow_head_count;
+        fused_wy_h_cube_head_range<D, C, 4>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle,
+            overflow_head, SplitChunk,
+            static_cast<int32_t>(dense_chunk_count), H, Hg,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+        wait_flag_dev(7);
+      } else {
+        fused_wy_h_cube_head_range<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, cid, 0,
+            static_cast<int32_t>(dense_chunk_count), H, Hg,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+        wait_flag_dev(3);
+      }
+    } else {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_u_base = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    bool resident_output_in_flight = false;
+#endif
+
+    for (int64_t wi = 0;
+         wi < (total_work + block_num - 1) / block_num; ++wi) {
+      const int64_t head = wi * block_num + cid;
+      if (head >= total_work) break;
+      const int64_t head_g = head / GROUP;
+      const int64_t v_head_base =
+          fused_output_packed
+              ? head * static_cast<int64_t>(C) * D
+              : head * static_cast<int64_t>(D);
+      for (int32_t ci = 0; ci < num_chunks; ++ci) {
+        if (wi == 0) {
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+          fused_wy_h_cube_chunk<D, C, 0, FuseResidentOutput>(
+#else
+          fused_wy_h_cube_chunk<D, C, 0>(
+#endif
+              Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+              wy_ready_handle, S_handle, V_handle, workspace_handle, head,
+              head_g, ci, H, Hg, ws_ws_base, ws_u_base, ws_k_base,
+              ws_kv_base, v_head_base, v_chunk_stride, wy_workspace_slots,
+              wy_group_size, s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0,
+              fused_output_v_stride, fused_output_packed,
+              use_fused_wy_h_public_u
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+              , resident_raw_qk_mailbox, resident_combined_mailbox,
+              resident_gated_qk_mailbox, static_cast<int64_t>(cid),
+              resident_output_in_flight
+#endif
+              );
+        } else {
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+          fused_wy_h_cube_chunk<D, C, 4, FuseResidentOutput>(
+#else
+          fused_wy_h_cube_chunk<D, C, 4>(
+#endif
+              Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+              wy_ready_handle, S_handle, V_handle, workspace_handle, head,
+              head_g, ci, H, Hg, ws_ws_base, ws_u_base, ws_k_base,
+              ws_kv_base, v_head_base, v_chunk_stride, wy_workspace_slots,
+              wy_group_size, s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0,
+              fused_output_v_stride, fused_output_packed,
+              use_fused_wy_h_public_u
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+              , resident_raw_qk_mailbox, resident_combined_mailbox,
+              resident_gated_qk_mailbox, static_cast<int64_t>(cid),
+              resident_output_in_flight
+#endif
+              );
+        }
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+        if constexpr (FuseResidentOutput) {
+          resident_output_in_flight = true;
+        }
+#endif
+      }
+      wait_flag_dev(wi == 0 ? 3 : 7);
+    }
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    if constexpr (FuseResidentOutput) {
+      if (resident_output_in_flight) {
+        wait_flag_dev(kResidentHoCombinedFreeFlag);
+      }
+    }
+#endif
+    }
+  } else
+#endif
+#ifdef MEGA_CHUNK_GDN_OVERFLOW_SEGMENT_PIPELINE
+  if (use_overflow_segment_pipeline) {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int32_t stage =
+        static_cast<int32_t>(cid / overflow_head_count);
+    const int32_t chain =
+        static_cast<int32_t>(cid % overflow_head_count);
+    const int32_t base_chunks = num_chunks / overflow_stage_count;
+    const int32_t extra_chunks = num_chunks % overflow_stage_count;
+    const int32_t segment_begin =
+        stage * base_chunks +
+        (stage < extra_chunks ? stage : extra_chunks);
+    const int32_t segment_end =
+        segment_begin + base_chunks + (stage < extra_chunks ? 1 : 0);
+    const int64_t primary_head = cid;
+    const int64_t overflow_head = block_num + chain;
+    const int64_t primary_head_g = primary_head / GROUP;
+    const int64_t overflow_head_g = overflow_head / GROUP;
+
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_slot_span = 4 * ws_field_span;
+    const int64_t primary_ws_ws = ws_core_offset;
+    const int64_t primary_ws_k = ws_field_span + ws_core_offset;
+    const int64_t primary_ws_u = 2 * ws_field_span + ws_core_offset;
+    const int64_t primary_ws_kv = 3 * ws_field_span + ws_core_offset;
+    const int64_t overflow_ws_ws = ws_slot_span + primary_ws_ws;
+    const int64_t overflow_ws_k = ws_slot_span + primary_ws_k;
+    const int64_t overflow_ws_u = ws_slot_span + primary_ws_u;
+    const int64_t overflow_ws_kv = ws_slot_span + primary_ws_kv;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+    const int64_t primary_v_base =
+        primary_head * static_cast<int64_t>(C) * D;
+    const int64_t overflow_v_base =
+        overflow_head * static_cast<int64_t>(C) * D;
+
+    for (int32_t ci = 0; ci < segment_begin; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        fused_wy_h_cube_chunk<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, primary_head,
+            primary_head_g, ci, H, Hg, primary_ws_ws, primary_ws_u,
+            primary_ws_k, primary_ws_kv, primary_v_base, v_chunk_stride,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+      } else
+#endif
+      paired_cube_chunk<D, C, 0>(
+          Q_handle, W_handle, S_handle, V_handle, workspace_handle,
+          primary_head, primary_head_g, ci, H, Hg, primary_ws_ws,
+          primary_ws_k, primary_ws_kv, primary_v_base, v_chunk_stride,
+          s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0);
+    }
+    for (int32_t ci = segment_begin; ci < segment_end; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        fused_wy_h_cube_chunk<D, C, 4>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, overflow_head,
+            overflow_head_g, ci, H, Hg, overflow_ws_ws, overflow_ws_u,
+            overflow_ws_k, overflow_ws_kv, overflow_v_base, v_chunk_stride,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+      } else
+#endif
+      paired_cube_chunk<D, C, 4>(
+          Q_handle, W_handle, S_handle, V_handle, workspace_handle,
+          overflow_head, overflow_head_g, ci, H, Hg, overflow_ws_ws,
+          overflow_ws_k, overflow_ws_kv, overflow_v_base, v_chunk_stride,
+          s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0);
+    }
+    for (int32_t ci = segment_begin; ci < num_chunks; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        fused_wy_h_cube_chunk<D, C, 0>(
+            Q_handle, K_handle, wy_v_handle, wy_a1_handle, wy_a2_handle,
+            wy_ready_handle, S_handle, V_handle, workspace_handle, primary_head,
+            primary_head_g, ci, H, Hg, primary_ws_ws, primary_ws_u,
+            primary_ws_k, primary_ws_kv, primary_v_base, v_chunk_stride,
+            wy_workspace_slots, wy_group_size, s_l1, w_l1, q_l1, k_l1,
+            v_l1, ws_l0, kv_l0);
+      } else
+#endif
+      paired_cube_chunk<D, C, 0>(
+          Q_handle, W_handle, S_handle, V_handle, workspace_handle,
+          primary_head, primary_head_g, ci, H, Hg, primary_ws_ws,
+          primary_ws_k, primary_ws_kv, primary_v_base, v_chunk_stride,
+          s_l1, w_l1, q_l1, k_l1, v_l1, ws_l0, kv_l0);
+    }
+    wait_flag_dev(3);
+    wait_flag_dev(7);
+  } else
+#endif
+  if (use_segmented_head_pipeline) {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int32_t segments_per_head = num_chunks / SEGMENT_CHUNKS;
+    const int64_t total_segments =
+        static_cast<int64_t>(segments_per_head) * H;
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+    for (int64_t task = cid;
+         cid < segmented_h_worker_count && task < total_segments;
+         task += segmented_h_worker_count) {
+      const int32_t segment_idx = static_cast<int32_t>(task / H);
+      const int64_t head = task % H;
+      const int64_t head_g = head / GROUP;
+      const int32_t chunk_begin = segment_idx * SEGMENT_CHUNKS;
+      const int32_t chunk_end = chunk_begin + SEGMENT_CHUNKS;
+      const int64_t v_head_base = head * static_cast<int64_t>(C) * D;
+
+      for (int32_t ci = chunk_begin; ci < chunk_end; ++ci) {
+        const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+        paired_cube_ws<D, C, 0, true, true>(
+            W_handle, S_handle, workspace_handle, head, chunk_start, 0, ci,
+            C, H, ws_ws_base, s_l1, w_l1, ws_l0);
+        paired_cube_qs<D, C>(Q_handle, S_handle, head, head_g, chunk_start,
+                             0, ci, C, H, Hg, s_l1, q_l1, ws_l0);
+        paired_cube_kv<D, C, 0, true, true>(
+            V_handle, workspace_handle, C, D,
+            v_head_base + static_cast<int64_t>(ci) * v_chunk_stride,
+            ws_k_base, ws_kv_base, k_l1, v_l1, kv_l0);
+      }
+      wait_flag_dev(3);
+    }
+  } else if (use_split_head_pipeline && cid < paired_core_count) {
     const int64_t head0 = cid;
     const int64_t head1 = block_num + cid;
     const int64_t head_g0 = head0 / GROUP;
@@ -954,6 +1877,7 @@ AICORE void chunk_h_kernel(
     const int64_t bos = static_cast<int64_t>(cu_seqlens[0]);
     const int64_t slen = static_cast<int64_t>(cu_seqlens[1]) - bos;
     const int32_t num_chunks = static_cast<int32_t>(slen / C);
+    const int32_t split_chunk = num_chunks / 2;
     const int64_t ws_core_offset =
         static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
     const int64_t ws_field_span =
@@ -971,7 +1895,6 @@ AICORE void chunk_h_kernel(
     const int64_t v_head_base0 = head0 * static_cast<int64_t>(C) * D;
     const int64_t v_head_base1 = head1 * static_cast<int64_t>(C) * D;
 
-    wait_flag_dev(3);
 #ifdef MEGA_STOP_AFTER_H
     if constexpr (GDN_PAIR_DEBUG_STAGE == 1) return;
     if constexpr (GDN_PAIR_DEBUG_STAGE == 10) {
@@ -1041,11 +1964,11 @@ AICORE void chunk_h_kernel(
       return;
     }
 #endif
-    for (int32_t ci = 0; ci < num_chunks; ++ci) {
+    for (int32_t ci = 0; ci < split_chunk; ++ci) {
       const int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
-      paired_cube_ws<D, C, 0, false, true>(
-          W_handle, workspace_handle, head0, chunk_start, C, H, ws_ws_base0,
-          ws_s_base0, s_l1, w_l1, ws_l0);
+      paired_cube_ws<D, C, 0, true, true>(
+          W_handle, S_handle, workspace_handle, head0, chunk_start, 0, ci,
+          C, H, ws_ws_base0, s_l1, w_l1, ws_l0);
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 2 ||
                     GDN_PAIR_DEBUG_STAGE == 8 ||
@@ -1058,52 +1981,45 @@ AICORE void chunk_h_kernel(
       paired_cube_qs<D, C>(Q_handle, S_handle, head0, head_g0, chunk_start, 0,
                            ci, C, H, Hg, s_l1, q_l1, ws_l0);
 
-      paired_cube_ws<D, C, 4, false, false>(
-          W_handle, workspace_handle, head1, chunk_start, C, H, ws_ws_base1,
-          ws_s_base1, s_l1, w_l1, ws_l0);
-      wait_flag_dev(1);
+      paired_cube_ws<D, C, 4, true, true>(
+          W_handle, S_handle, workspace_handle, head1, chunk_start, 0, ci,
+          C, H, ws_ws_base1, s_l1, w_l1, ws_l0);
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 3) return;
 #endif
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 4) return;
 #endif
       paired_cube_qs<D, C>(Q_handle, S_handle, head1, head_g1, chunk_start, 0,
                            ci, C, H, Hg, s_l1, q_l1, ws_l0);
 
-      paired_cube_kv<D, C, 0, false, false>(
+      paired_cube_kv<D, C, 0, true, true>(
           V_handle, workspace_handle, C, D,
           v_head_base0 + static_cast<int64_t>(ci) * v_chunk_stride,
           ws_k_base0, ws_kv_base0, k_l1, v_l1, kv_l0);
-      wait_flag_dev(5);
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 5) return;
 #endif
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 6) return;
 #endif
 
-      paired_cube_kv<D, C, 4, false, false>(
+      paired_cube_kv<D, C, 4, true, true>(
           V_handle, workspace_handle, C, D,
           v_head_base1 + static_cast<int64_t>(ci) * v_chunk_stride,
           ws_k_base1, ws_kv_base1, k_l1, v_l1, kv_l0);
-      if (ci + 1 < num_chunks) {
-        wait_flag_dev(3);
-      }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (6 << 8));
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 7) return;
 #endif
-      if (ci + 1 < num_chunks) {
-        wait_flag_dev(7);
-      }
     }
 #ifndef MEGA_STOP_AFTER_H
+    wait_flag_dev(3);
     wait_flag_dev(7);
 #endif
   } else {
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+  bool resident_output_in_flight = false;
+#endif
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
@@ -1129,18 +2045,22 @@ AICORE void chunk_h_kernel(
       chunk_offset = seq_idx * ((seq_len + C - 1) / C);
     }
     int64_t num_chunks = (slen + C - 1) / C;
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
     const bool emit_precomputed_qs =
-        precompute_qs != 0 && C == D && H >= 8 &&
+        !FuseResidentOutput && precompute_qs != 0 && C == D && H >= 8 &&
         cu_seqlens != nullptr;
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-    // Variant16 keeps the private V_new tensor in [H,T,D].
-    constexpr int32_t v_stride = D;
-    const int64_t v_head_base =
-        (head * total_tokens + bos) * static_cast<int64_t>(D);
-    constexpr int64_t v_chunk_stride = static_cast<int64_t>(C) * D;
+    const bool use_resident_packed_v =
+        FuseResidentOutput && precompute_qs != 0 && C == D && H >= 8 &&
+        cu_seqlens != nullptr;
+    const bool use_packed_v =
+        (emit_precomputed_qs || use_resident_packed_v) &&
+        batch_size == 1 && (slen % C) == 0;
 #else
+    const bool emit_precomputed_qs =
+        precompute_qs != 0 && C == D && H >= 8 && cu_seqlens != nullptr;
     const bool use_packed_v =
         emit_precomputed_qs && batch_size == 1 && (slen % C) == 0;
+#endif
     const int32_t v_stride =
         use_packed_v ? D : BSND_QKV_STRIDE;
     const int64_t v_head_base =
@@ -1150,7 +2070,6 @@ AICORE void chunk_h_kernel(
             : (bos * H + head) * static_cast<int64_t>(D);
     const int64_t v_chunk_stride =
         static_cast<int64_t>(H) * C * D;
-#endif
     const int64_t ws_core_offset =
         static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
     const int64_t ws_field_span =
@@ -1175,12 +2094,7 @@ AICORE void chunk_h_kernel(
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
       if (valid > C) valid = C;
 
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-      // S and W are both producer-published before this chunk begins. One
-      // full clean+invalidate replaces thousands of scalar cacheline DCCIs.
-      dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#elif defined(GDN_A5_KERNEL)
+#if defined(GDN_A5_KERNEL)
       // Consumer-side invalidate for the Vec-published state: A5 Cube MTE2
       // loads can return clean stale lines left by a previous launch.
       for (int32_t r = 0; r < D * D; r += 16) {
@@ -1203,15 +2117,8 @@ AICORE void chunk_h_kernel(
         TLOAD(s_l1_load, s_global);
       }
 
-      int64_t w_offset;
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-      w_offset = (head * total_tokens + chunk_start) *
-                 static_cast<int64_t>(D);
-#else
-      w_offset = ((chunk_start) * H + head) * D;
-#endif
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+      int64_t w_offset = ((chunk_start) * H + head) * D;
+#if defined(GDN_A5_KERNEL)
       // W is published by the WY stage Vector cores; same stale-line hazard.
       // Rows are BSND-strided, so invalidate row by row.
       for (int32_t row = 0; row < valid; ++row) {
@@ -1226,11 +2133,7 @@ AICORE void chunk_h_kernel(
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       {
         GmShape2D w_shape(static_cast<int32_t>(valid), D);
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-        GmStride2D w_stride(D);
-#else
         GmStride2D w_stride(BSND_QKV_STRIDE);
-#endif
         GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
         DynMatL1<ComputeT, C, D> w_l1_load(static_cast<int32_t>(valid), D);
         TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
@@ -1294,17 +2197,7 @@ AICORE void chunk_h_kernel(
       wait_flag_dev(1);
 #endif
 
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-      // k_tilde and V_new become visible at the same producer boundary.
-      dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#if defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-      // In variant21 event 2 is also the release predecessor for QS. Make
-      // the Cube-published snapshot visible before that event can reach AIV0,
-      // which publishes the GM ready counter.
-      dsb(DSB_DDR);
-#endif
-#elif defined(GDN_A5_KERNEL)
+#if defined(GDN_A5_KERNEL)
       // Consumer-side invalidate for the Vec-published k_tilde tile before the
       // KV GEMM; a stale line here corrupts the state update (final_state).
       for (int32_t r = 0; r < D * C; r += 16) {
@@ -1326,8 +2219,7 @@ AICORE void chunk_h_kernel(
         TLOAD(k_l1_load, k_global);
       }
 
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+#if defined(GDN_A5_KERNEL)
       // V_new is published by this stage's Vector cores earlier in the chunk
       // loop; the Cube MTE2 load can still hold a stale line from a previous
       // work item or launch, which corrupts the KV product (final_state).
@@ -1372,15 +2264,473 @@ AICORE void chunk_h_kernel(
         TSTORE(kv_global, kv_store);
       }
       ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+      if constexpr (FuseResidentOutput) {
+        ResidentHoCubeOutput<D, C>(
+            resident_combined_mailbox, resident_gated_qk_mailbox,
+            static_cast<int64_t>(cid), resident_output_in_flight, s_l1,
+            w_l1, v_l1, ws_l0);
+        resident_output_in_flight = true;
+      }
+#endif
     }
   }
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+  if constexpr (FuseResidentOutput) {
+    if (resident_output_in_flight) {
+      wait_flag_dev(kResidentHoCombinedFreeFlag);
+    }
+  }
+#endif
+  }
+
+  if (use_split_head_pipeline) {
+    if (cid < 2 * paired_core_count) {
+      const bool helper_core = cid >= paired_core_count;
+      const int64_t head =
+          helper_core ? block_num + cid - paired_core_count : cid;
+      const int64_t head_g = head / GROUP;
+      const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+      const int32_t split_chunk = num_chunks / 2;
+      const int64_t ws_core_offset =
+          static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+      const int64_t ws_field_span =
+          static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+      const int64_t ws_ws_base = ws_core_offset;
+      const int64_t ws_k_base = ws_field_span + ws_core_offset;
+      const int64_t ws_s_base = 2 * ws_field_span + ws_core_offset;
+      const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+      const int64_t v_head_base =
+          fused_output_packed
+              ? head * static_cast<int64_t>(C) * D
+              : head * static_cast<int64_t>(D);
+      const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+      for (int32_t ci = split_chunk; ci < num_chunks; ++ci) {
+        const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+        paired_cube_ws<D, C, 0, true, true>(
+            W_handle, S_handle, workspace_handle, head, chunk_start, 0, ci,
+            C, H, ws_ws_base, s_l1, w_l1, ws_l0);
+        paired_cube_qs<D, C>(Q_handle, S_handle, head, head_g, chunk_start,
+                             0, ci, C, H, Hg, s_l1, q_l1, ws_l0);
+        paired_cube_kv<D, C, 0, true, true>(
+            V_handle, workspace_handle, C, D,
+            v_head_base + static_cast<int64_t>(ci) * v_chunk_stride,
+            ws_k_base, ws_kv_base, k_l1, v_l1, kv_l0);
+      }
+      wait_flag_dev(3);
+    }
   }
 #endif
 #if defined(__DAV_C220_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+  if constexpr (FuseResidentOutput) {
+    ResidentHoPrepareVectorConstants<
+        D, C, FuseResidentGatedRmsNorm>(
+        resident_mask_handle, resident_norm_weight_handle,
+        static_cast<int32_t>(vid));
+  }
+#endif
 
-  if (use_paired_head_pipeline && cid < paired_core_count) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+  if (use_fused_wy_h) {
+    if (use_fused_wy_h_interleaved_overflow) {
+      const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+      if (cid < paired_core_count) {
+        const int64_t primary_head = cid;
+        const int64_t overflow_head = block_num + cid;
+        const int64_t primary_head_g = primary_head / GROUP;
+        const int64_t overflow_head_g = overflow_head / GROUP;
+        const int64_t ws_core_offset =
+            static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+        const int64_t ws_field_span =
+            static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+        const int64_t ws_slot_span = 4 * ws_field_span;
+        const int64_t primary_ws_ws = ws_core_offset;
+        const int64_t primary_ws_k = ws_field_span + ws_core_offset;
+        const int64_t primary_ws_u = 2 * ws_field_span + ws_core_offset;
+        const int64_t primary_ws_kv = 3 * ws_field_span + ws_core_offset;
+        const int64_t overflow_ws_ws = ws_slot_span + primary_ws_ws;
+        const int64_t overflow_ws_k = ws_slot_span + primary_ws_k;
+        const int64_t overflow_ws_u = ws_slot_span + primary_ws_u;
+        const int64_t overflow_ws_kv = ws_slot_span + primary_ws_kv;
+        const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+        const int64_t primary_v_base =
+            primary_head * static_cast<int64_t>(C) * D;
+        const int64_t overflow_v_base =
+            overflow_head * static_cast<int64_t>(C) * D;
+
+        paired_vec_init_zero<D, C, 0, true>(
+            S_handle, primary_head, 0, H, vid, s_ub, s_ub_half);
+        paired_vec_init_zero<D, C, 4, true>(
+            S_handle, overflow_head, 0, H, vid, s_alt_ub, s_ub_half);
+        for (int32_t ci = 0; ci < num_chunks; ++ci) {
+          paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB, true>(
+              K_handle, U_handle, G_handle, S_handle, V_handle,
+              workspace_handle, h_o_ready_handle, primary_head,
+              primary_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+              primary_ws_ws, primary_ws_k, primary_ws_kv, primary_v_base,
+              v_chunk_stride, s_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+              k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub,
+              primary_ws_u);
+          paired_vec_chunk<D, C, 4, G_UB, COEFF_UB, U_UB, true>(
+              K_handle, U_handle, G_handle, S_handle, V_handle,
+              workspace_handle, h_o_ready_handle, overflow_head,
+              overflow_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+              overflow_ws_ws, overflow_ws_k, overflow_ws_kv, overflow_v_base,
+              v_chunk_stride, s_alt_ub, s_ub_half, k_ub_half, g_ub,
+              u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub,
+              overflow_ws_u);
+        }
+        paired_vec_store_final<D, C, StoreFinalStateCache>(
+            FS_handle, final_state_cache, state_indices, primary_head, H, vid,
+            state_index_stride, state_cache_slots, output_final_state, s_ub,
+            s_ub_half);
+        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        paired_vec_store_final<D, C, StoreFinalStateCache>(
+            FS_handle, final_state_cache, state_indices, overflow_head, H,
+            vid, state_index_stride, state_cache_slots, output_final_state,
+            s_alt_ub, s_ub_half);
+        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (7 << 8));
+      } else {
+        fused_wy_h_vec_head_range<
+            D, C, 0, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            true, false, true, false, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, cid, 0, num_chunks, num_chunks, H, Hg,
+            total_tokens, vid, state_index_stride, state_cache_slots,
+            output_final_state, s_ub, s_ub_half, k_ub_half, g_ub,
+            u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+      }
+    } else if (use_fused_wy_h_balanced_overflow) {
+      constexpr int32_t SplitChunk = 8;
+      const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+      const int64_t overflow_head_count = paired_core_count;
+      if (cid < overflow_head_count) {
+        const int64_t overflow_head = block_num + cid;
+        fused_wy_h_vec_head_range<
+            D, C, 0, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            true, false, false, true, false>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, overflow_head, 0, SplitChunk, num_chunks, H, Hg,
+            total_tokens, vid, state_index_stride, state_cache_slots,
+            output_final_state, s_ub, s_ub_half, k_ub_half, g_ub,
+            u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+        fused_wy_h_vec_head_range<
+            D, C, 4, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            true, false, true, false, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, cid, 0, num_chunks, num_chunks, H, Hg,
+            total_tokens, vid, state_index_stride, state_cache_slots,
+            output_final_state, s_ub, s_ub_half, k_ub_half, g_ub,
+            u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+      } else if (cid < 2 * overflow_head_count) {
+        fused_wy_h_vec_head_range<
+            D, C, 0, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            true, false, true, false, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, cid, 0, num_chunks, num_chunks, H, Hg,
+            total_tokens, vid, state_index_stride, state_cache_slots,
+            output_final_state, s_ub, s_ub_half, k_ub_half, g_ub,
+            u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+        const int64_t overflow_head =
+            block_num + cid - overflow_head_count;
+        fused_wy_h_vec_head_range<
+            D, C, 4, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            false, true, true, false, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, overflow_head, SplitChunk, num_chunks,
+            num_chunks, H, Hg, total_tokens, vid, state_index_stride,
+            state_cache_slots, output_final_state, s_ub, s_ub_half,
+            k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+            u_ub, ws_ub, kv_ub);
+      } else {
+        fused_wy_h_vec_head_range<
+            D, C, 0, G_UB, COEFF_UB, U_UB, StoreFinalStateCache,
+            true, false, true, false, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle, FS_handle,
+            workspace_handle, h_o_ready_handle, final_state_cache,
+            state_indices, cid, 0, num_chunks, num_chunks, H, Hg,
+            total_tokens, vid, state_index_stride, state_cache_slots,
+            output_final_state, s_ub, s_ub_half, k_ub_half, g_ub,
+            u_ub_half, k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+      }
+    } else {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_u_base = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+    for (int64_t wi = 0;
+         wi < (total_work + block_num - 1) / block_num; ++wi) {
+      const int64_t head = wi * block_num + cid;
+      if (head >= total_work) break;
+      const int64_t head_g = head / GROUP;
+      const int64_t v_head_base =
+          fused_output_packed
+              ? head * static_cast<int64_t>(C) * D
+              : head * static_cast<int64_t>(D);
+      if (wi == 0) {
+        paired_vec_init_zero<D, C, 0, true>(
+            S_handle, head, 0, H, vid, s_ub, s_ub_half);
+      } else {
+        paired_vec_init_zero<D, C, 4, true>(
+            S_handle, head, 0, H, vid, s_ub, s_ub_half);
+      }
+      for (int32_t ci = 0; ci < num_chunks; ++ci) {
+        if (wi == 0) {
+          paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB, true>(
+              K_handle, U_handle, G_handle, S_handle, V_handle,
+              workspace_handle, h_o_ready_handle, head, head_g, ci,
+              num_chunks, H, Hg, total_tokens, vid, ws_ws_base, ws_k_base,
+              ws_kv_base, v_head_base, v_chunk_stride, s_ub, s_ub_half,
+              k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+              u_ub, ws_ub, kv_ub, ws_u_base, fused_output_v_stride,
+              fused_output_packed, use_fused_wy_h_public_u);
+        } else {
+          paired_vec_chunk<D, C, 4, G_UB, COEFF_UB, U_UB, true>(
+              K_handle, U_handle, G_handle, S_handle, V_handle,
+              workspace_handle, h_o_ready_handle, head, head_g, ci,
+              num_chunks, H, Hg, total_tokens, vid, ws_ws_base, ws_k_base,
+              ws_kv_base, v_head_base, v_chunk_stride, s_ub, s_ub_half,
+              k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+              u_ub, ws_ub, kv_ub, ws_u_base, fused_output_v_stride,
+              fused_output_packed, use_fused_wy_h_public_u);
+        }
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+        if constexpr (FuseResidentOutput) {
+          const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+          ResidentHoGateQkAndScaleQ<D, C>(
+              Q_handle, G_handle, resident_raw_qk_mailbox,
+              resident_combined_mailbox, resident_gated_qk_mailbox,
+              static_cast<int64_t>(cid), chunk_start, total_tokens,
+              static_cast<int32_t>(head), static_cast<int32_t>(head_g), Hg,
+              static_cast<int32_t>(vid));
+          ResidentHoConsumeCombined<D, C, FuseResidentGatedRmsNorm>(
+              resident_combined_mailbox, resident_output_handle,
+              resident_z_handle, static_cast<int64_t>(cid), chunk_start,
+              static_cast<int32_t>(head), H, static_cast<int32_t>(vid),
+              ci + 1 == num_chunks);
+        }
+#endif
+      }
+      paired_vec_store_final<D, C, StoreFinalStateCache>(
+          FS_handle, final_state_cache, state_indices, head, H, vid,
+          state_index_stride, state_cache_slots, output_final_state, s_ub,
+          s_ub_half);
+      ffts_cross_core_sync(
+          PIPE_MTE3,
+          1 | (2 << 4) | (static_cast<int32_t>(wi == 0 ? 3 : 7) << 8));
+    }
+    }
+  } else
+#endif
+#ifdef MEGA_CHUNK_GDN_OVERFLOW_SEGMENT_PIPELINE
+  if (use_overflow_segment_pipeline) {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int32_t stage =
+        static_cast<int32_t>(cid / overflow_head_count);
+    const int32_t chain =
+        static_cast<int32_t>(cid % overflow_head_count);
+    const int32_t base_chunks = num_chunks / overflow_stage_count;
+    const int32_t extra_chunks = num_chunks % overflow_stage_count;
+    const int32_t segment_begin =
+        stage * base_chunks +
+        (stage < extra_chunks ? stage : extra_chunks);
+    const int32_t segment_end =
+        segment_begin + base_chunks + (stage < extra_chunks ? 1 : 0);
+    const int64_t primary_head = cid;
+    const int64_t overflow_head = block_num + chain;
+    const int64_t primary_head_g = primary_head / GROUP;
+    const int64_t overflow_head_g = overflow_head / GROUP;
+
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_slot_span = 4 * ws_field_span;
+    const int64_t primary_ws_ws = ws_core_offset;
+    const int64_t primary_ws_k = ws_field_span + ws_core_offset;
+    const int64_t primary_ws_u = 2 * ws_field_span + ws_core_offset;
+    const int64_t primary_ws_kv = 3 * ws_field_span + ws_core_offset;
+    const int64_t overflow_ws_ws = ws_slot_span + primary_ws_ws;
+    const int64_t overflow_ws_k = ws_slot_span + primary_ws_k;
+    const int64_t overflow_ws_u = ws_slot_span + primary_ws_u;
+    const int64_t overflow_ws_kv = ws_slot_span + primary_ws_kv;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+    const int64_t primary_v_base =
+        primary_head * static_cast<int64_t>(C) * D;
+    const int64_t overflow_v_base =
+        overflow_head * static_cast<int64_t>(C) * D;
+
+    paired_vec_init_zero<D, C, 0, true>(
+        S_handle, primary_head, 0, H, vid, s_ub, s_ub_half);
+    for (int32_t ci = 0; ci < segment_begin; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle,
+            workspace_handle, h_o_ready_handle, primary_head,
+            primary_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+            primary_ws_ws, primary_ws_k, primary_ws_kv, primary_v_base,
+            v_chunk_stride, s_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+            k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub,
+            primary_ws_u);
+      } else
+#endif
+      paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB>(
+          K_handle, U_handle, G_handle, S_handle, V_handle,
+          workspace_handle, h_o_ready_handle, primary_head,
+          primary_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+          primary_ws_ws, primary_ws_k, primary_ws_kv, primary_v_base,
+          v_chunk_stride, s_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+          k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+    }
+
+    if (stage == 0) {
+      paired_vec_init_zero<D, C, 4, true>(
+          S_handle, overflow_head, 0, H, vid, s_alt_ub, s_ub_half);
+    } else {
+      wait_segment_state<C>(h_o_ready_handle, overflow_head,
+                            segment_begin, vid);
+      paired_vec_load_state<D, C, 4>(
+          S_handle, overflow_head, 0, segment_begin, H, vid, s_alt_ub,
+          s_ub_half);
+    }
+    for (int32_t ci = segment_begin; ci < segment_end; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        paired_vec_chunk<D, C, 4, G_UB, COEFF_UB, U_UB, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle,
+            workspace_handle, h_o_ready_handle, overflow_head,
+            overflow_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+            overflow_ws_ws, overflow_ws_k, overflow_ws_kv, overflow_v_base,
+            v_chunk_stride, s_alt_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+            k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub,
+            overflow_ws_u);
+      } else
+#endif
+      paired_vec_chunk<D, C, 4, G_UB, COEFF_UB, U_UB>(
+          K_handle, U_handle, G_handle, S_handle, V_handle,
+          workspace_handle, h_o_ready_handle, overflow_head,
+          overflow_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+          overflow_ws_ws, overflow_ws_k, overflow_ws_kv, overflow_v_base,
+          v_chunk_stride, s_alt_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+          k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+    }
+    if (stage + 1 < overflow_stage_count) {
+      publish_segment_state<C>(h_o_ready_handle, overflow_head,
+                               segment_end, vid);
+    } else {
+      paired_vec_store_final<D, C, StoreFinalStateCache>(
+          FS_handle, final_state_cache, state_indices, overflow_head, H, vid,
+          state_index_stride, state_cache_slots, output_final_state,
+          s_alt_ub, s_ub_half);
+      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (7 << 8));
+    }
+
+    for (int32_t ci = segment_begin; ci < num_chunks; ++ci) {
+#ifdef MEGA_CHUNK_GDN_FUSED_WY_H
+      if (use_fused_wy_h) {
+        paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB, true>(
+            K_handle, U_handle, G_handle, S_handle, V_handle,
+            workspace_handle, h_o_ready_handle, primary_head,
+            primary_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+            primary_ws_ws, primary_ws_k, primary_ws_kv, primary_v_base,
+            v_chunk_stride, s_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+            k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub,
+            primary_ws_u);
+      } else
+#endif
+      paired_vec_chunk<D, C, 0, G_UB, COEFF_UB, U_UB>(
+          K_handle, U_handle, G_handle, S_handle, V_handle,
+          workspace_handle, h_o_ready_handle, primary_head,
+          primary_head_g, ci, num_chunks, H, Hg, total_tokens, vid,
+          primary_ws_ws, primary_ws_k, primary_ws_kv, primary_v_base,
+          v_chunk_stride, s_ub, s_ub_half, k_ub_half, g_ub, u_ub_half,
+          k_ub, g_last_tail_ub, coeff_ub, u_ub, ws_ub, kv_ub);
+    }
+    paired_vec_store_final<D, C, StoreFinalStateCache>(
+        FS_handle, final_state_cache, state_indices, primary_head, H, vid,
+        state_index_stride, state_cache_slots, output_final_state, s_ub,
+        s_ub_half);
+    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+  } else
+#endif
+  if (use_segmented_head_pipeline) {
+    const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+    const int32_t segments_per_head = num_chunks / SEGMENT_CHUNKS;
+    const int64_t total_segments =
+        static_cast<int64_t>(segments_per_head) * H;
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+    for (int64_t task = cid;
+         cid < segmented_h_worker_count && task < total_segments;
+         task += segmented_h_worker_count) {
+      const int32_t segment_idx = static_cast<int32_t>(task / H);
+      const int64_t head = task % H;
+      const int64_t head_g = head / GROUP;
+      const int32_t chunk_begin = segment_idx * SEGMENT_CHUNKS;
+      const int32_t chunk_end = chunk_begin + SEGMENT_CHUNKS;
+      const int64_t v_head_base = head * static_cast<int64_t>(C) * D;
+
+      if (segment_idx == 0) {
+        paired_vec_init_zero<D, C, 0, true>(
+            S_handle, head, 0, H, vid, s_ub, s_ub_half);
+      } else {
+        wait_segment_state<C>(
+            h_o_ready_handle, head, chunk_begin, vid);
+        paired_vec_load_state<D, C, 0>(
+            S_handle, head, 0, chunk_begin, H, vid, s_ub, s_ub_half);
+      }
+
+      for (int32_t ci = chunk_begin; ci < chunk_end; ++ci) {
+        const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+        paired_vec_front<D, C, 0, G_UB, COEFF_UB, U_UB>(
+            K_handle, U_handle, G_handle, V_handle, workspace_handle, head,
+            head_g, chunk_start, C, ci, H, Hg, total_tokens, vid, D,
+            v_head_base, v_chunk_stride, ws_ws_base, ws_k_base, s_ub,
+            k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+            u_ub, ws_ub);
+        paired_vec_finish<D, C, 0>(
+            S_handle, workspace_handle, h_o_ready_handle, head, 0, ci,
+            num_chunks, H, vid, ws_kv_base, true, s_ub,
+            s_ub_half, kv_ub);
+      }
+
+      if (segment_idx + 1 < segments_per_head) {
+        publish_segment_state<C>(
+            h_o_ready_handle, head, chunk_end, vid);
+      } else {
+        paired_vec_store_final<D, C, StoreFinalStateCache>(
+            FS_handle, final_state_cache, state_indices, head, H, vid,
+            state_index_stride, state_cache_slots, output_final_state, s_ub,
+            s_ub_half);
+        ffts_cross_core_sync(
+            PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+      }
+    }
+  } else if (use_split_head_pipeline && cid < paired_core_count) {
     const int64_t head0 = cid;
     const int64_t head1 = block_num + cid;
     const int64_t head_g0 = head0 / GROUP;
@@ -1388,6 +2738,7 @@ AICORE void chunk_h_kernel(
     const int64_t bos = static_cast<int64_t>(cu_seqlens[0]);
     const int64_t slen = static_cast<int64_t>(cu_seqlens[1]) - bos;
     const int32_t num_chunks = static_cast<int32_t>(slen / C);
+    const int32_t split_chunk = num_chunks / 2;
     const int64_t ws_core_offset =
         static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
     const int64_t ws_field_span =
@@ -1406,11 +2757,9 @@ AICORE void chunk_h_kernel(
     const int64_t v_head_base1 = head1 * static_cast<int64_t>(C) * D;
 
     paired_vec_init_zero<D, C, 0, true>(
-        S_handle, workspace_handle, head0, 0, H, vid, ws_s_base0,
-        s_ub, s_ub_half);
-    paired_vec_init_zero<D, C, 0, false>(
-        S_handle, workspace_handle, head1, 0, H, vid, ws_s_base1,
-        s_alt_ub, s_ub_half);
+        S_handle, head0, 0, H, vid, s_ub, s_ub_half);
+    paired_vec_init_zero<D, C, 4, true>(
+        S_handle, head1, 0, H, vid, s_alt_ub, s_ub_half);
 #ifdef MEGA_STOP_AFTER_H
     if constexpr (GDN_PAIR_DEBUG_STAGE == 1) return;
     if constexpr (GDN_PAIR_DEBUG_STAGE == 14 ||
@@ -1439,7 +2788,7 @@ AICORE void chunk_h_kernel(
     }
 #endif
 
-    for (int32_t ci = 0; ci < num_chunks; ++ci) {
+    for (int32_t ci = 0; ci < split_chunk; ++ci) {
       const int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       paired_vec_front<D, C, 0, G_UB, COEFF_UB, U_UB>(
           K_handle, U_handle, G_handle, V_handle, workspace_handle, head0,
@@ -1465,31 +2814,23 @@ AICORE void chunk_h_kernel(
 #endif
       paired_vec_finish<D, C, 0>(
           S_handle, workspace_handle, h_o_ready_handle, head0, 0, ci,
-          num_chunks, H, vid, ws_s_base0, ws_kv_base0, true, s_ub,
-          s_ub_half, kv_ub, h_o_ready_ub);
+          num_chunks, H, vid, ws_kv_base0, true, s_ub,
+          s_ub_half, kv_ub);
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 6) return;
 #endif
       paired_vec_finish<D, C, 4>(
           S_handle, workspace_handle, h_o_ready_handle, head1, 0, ci,
-          num_chunks, H, vid, ws_s_base1, ws_kv_base1, true, s_alt_ub,
-          s_ub_half, kv_ub, h_o_ready_ub);
+          num_chunks, H, vid, ws_kv_base1, true, s_alt_ub,
+          s_ub_half, kv_ub);
 #ifdef MEGA_STOP_AFTER_H
       if constexpr (GDN_PAIR_DEBUG_STAGE == 7) return;
 #endif
     }
 
-    paired_vec_store_final<D, C, StoreFinalStateCache>(
-        FS_handle, final_state_cache, state_indices, head0, H, vid,
-        state_index_stride, state_cache_slots, output_final_state, s_ub,
-        s_ub_half);
-    paired_vec_store_final<D, C, StoreFinalStateCache>(
-        FS_handle, final_state_cache, state_indices, head1, H, vid,
-        state_index_stride, state_cache_slots, output_final_state, s_alt_ub,
-        s_ub_half);
-#ifndef MEGA_STOP_AFTER_H
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (7 << 8));
-#endif
+    publish_segment_state<C>(
+        h_o_ready_handle, head1, split_chunk, vid);
+
   } else {
   // Vec owns the running recurrent state S_i and updates it after every chunk.
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
@@ -1517,17 +2858,22 @@ AICORE void chunk_h_kernel(
       chunk_offset = seq_idx * ((seq_len + C - 1) / C);
     }
     int64_t num_chunks = (slen + C - 1) / C;
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
     const bool emit_precomputed_qs =
-        precompute_qs != 0 && C == D && H >= 8 &&
+        !FuseResidentOutput && precompute_qs != 0 && C == D && H >= 8 &&
         cu_seqlens != nullptr;
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-    constexpr int32_t v_stride = D;
-    const int64_t v_head_base =
-        (head * total_tokens + bos) * static_cast<int64_t>(D);
-    constexpr int64_t v_chunk_stride = static_cast<int64_t>(C) * D;
+    const bool use_resident_packed_v =
+        FuseResidentOutput && precompute_qs != 0 && C == D && H >= 8 &&
+        cu_seqlens != nullptr;
+    const bool use_packed_v =
+        (emit_precomputed_qs || use_resident_packed_v) &&
+        batch_size == 1 && (slen % C) == 0;
 #else
+    const bool emit_precomputed_qs =
+        precompute_qs != 0 && C == D && H >= 8 && cu_seqlens != nullptr;
     const bool use_packed_v =
         emit_precomputed_qs && batch_size == 1 && (slen % C) == 0;
+#endif
     const int32_t v_stride =
         use_packed_v ? D : BSND_QKV_STRIDE;
     const int64_t v_head_base =
@@ -1537,7 +2883,6 @@ AICORE void chunk_h_kernel(
             : (bos * H + head) * static_cast<int64_t>(D);
     const int64_t v_chunk_stride =
         static_cast<int64_t>(H) * C * D;
-#endif
     const int64_t ws_core_offset =
         static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
     const int64_t ws_field_span =
@@ -1549,30 +2894,11 @@ AICORE void chunk_h_kernel(
 
     if (has_initial_state != 0) {
       if constexpr (LoadInitialStateCache) {
-#if defined(GDN_A5_VECTOR_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-        dcci(static_cast<__gm__ void *>(initial_state_indices + seq_idx),
-             SINGLE_CACHE_LINE);
-        dsb(DSB_DDR);
-#endif
         const int32_t state_index = initial_state_indices[seq_idx];
         if (state_index >= 0 && state_index < state_cache_slots) {
           const int64_t cache_offset =
               (static_cast<int64_t>(state_index) * H + head) * DD +
               vid * HalfC * D;
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-          for (int32_t r = 0; r < HalfC * D; r += 16) {
-            dcci(static_cast<__gm__ void *>(
-                     initial_state_cache + cache_offset + r),
-                 SINGLE_CACHE_LINE);
-          }
-          dsb(DSB_DDR);
-#endif
-#if defined(GDN_A5_VECTOR_KERNEL)
-          set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-          wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-#endif
           GmShape2D cache_shape(HalfC, D);
           GmStride2D cache_stride(D);
           GmTensor2D<float> cache_global(initial_state_cache + cache_offset,
@@ -1645,14 +2971,8 @@ AICORE void chunk_h_kernel(
 
     int64_t k_offset_0 =
         (chunk_start_0 * Hg + head_g) * D + vid * HalfC * BSND_K_STRIDE;
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-    // Initial K and G are consumed from the same completed frontend stage.
-    dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#endif
     if (valid_rows_0 > 0) {
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+#if defined(GDN_A5_KERNEL)
       // K only feeds the state update (final_state); a stale line here does
       // not show up in the main output, so it must be invalidated explicitly.
       for (int32_t row = 0; row < valid_rows_0; ++row) {
@@ -1683,8 +3003,7 @@ AICORE void chunk_h_kernel(
     }
 
     {
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+#if defined(GDN_A5_KERNEL)
       // g (log-sigmoid gate) only feeds the state recurrence; same
       // consumer-side stale-line hazard as K.
       for (int32_t r = 0; r < valid0 * 4; r += 32) {
@@ -1725,22 +3044,10 @@ AICORE void chunk_h_kernel(
       // is the key fix that keeps ragged tails and dense varlen boundary mixes
       // from reading or writing beyond the live rows in this stripe.
 
-      int64_t u_offset;
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-      u_offset =
-          (head * total_tokens + chunk_start +
-           static_cast<int64_t>(vid) * HalfC) * D;
-#else
-      u_offset = (chunk_start * H + head) * D +
-                 vid * HalfC * BSND_QKV_STRIDE;
-#endif
+      int64_t u_offset = (chunk_start * H + head) * D + vid * HalfC * BSND_QKV_STRIDE;
       if (valid_rows > 0) {
         GmShape2D u_shape(valid_rows, D);
-#ifdef MEGA_CHUNK_GDN_A5_PACKED_WUV
-        GmStride2D u_stride(D);
-#else
         GmStride2D u_stride(BSND_QKV_STRIDE);
-#endif
         GmTensor2D<ComputeT> u_global(U_handle + u_offset, u_shape, u_stride);
         DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> u_load(valid_rows, D);
         TASSIGN(u_load, U_UB_HALF);
@@ -1799,10 +3106,7 @@ AICORE void chunk_h_kernel(
       TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
 
       wait_flag_dev(0);
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-      dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#elif defined(GDN_A5_KERNEL)
+#if defined(GDN_A5_KERNEL)
       // A5 Vector MTE2 loads can return clean stale lines when the workspace
       // addresses were read by a previous launch.  Invalidate the Cube
       // product rows on the consumer immediately before loading them.
@@ -1879,23 +3183,6 @@ AICORE void chunk_h_kernel(
         TSTORE(k_global, k_store);
       }
 
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-      // Both AIV siblings own disjoint V_new row stripes. Drain and clean
-      // each stripe before event 1; Cube joins both event-1 releases and
-      // propagates them through event 2 to the ready-counter publisher.
-      constexpr int32_t DcciCacheLineElems =
-          64 / static_cast<int32_t>(sizeof(ComputeT));
-      pipe_barrier(PIPE_ALL);
-      for (int32_t row = 0; row < valid_rows; ++row) {
-        for (int32_t r = 0; r < D; r += DcciCacheLineElems) {
-          dcci(static_cast<__gm__ void *>(
-                   V_handle + v_offset + row * v_stride + r),
-               SINGLE_CACHE_LINE);
-        }
-      }
-      dsb(DSB_DDR);
-#endif
       ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
 
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
@@ -1929,13 +3216,8 @@ AICORE void chunk_h_kernel(
 
         int64_t nk_off =
             (next_start * Hg + head_g) * D + vid * HalfC * BSND_K_STRIDE;
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-        dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#endif
         if (next_valid_rows > 0) {
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+#if defined(GDN_A5_KERNEL)
           // Same stale-line invalidation for the prefetched K rows.
           for (int32_t row = 0; row < next_valid_rows; ++row) {
             for (int32_t r = 0; r < D; r += 16) {
@@ -1966,8 +3248,7 @@ AICORE void chunk_h_kernel(
         }
 
         {
-#if defined(GDN_A5_KERNEL) && \
-    !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
+#if defined(GDN_A5_KERNEL)
           // Same stale-line invalidation for the prefetched gate row.
           for (int32_t r = 0; r < next_valid * 4; r += 32) {
             dcci(static_cast<__gm__ void *>(
@@ -1993,7 +3274,6 @@ AICORE void chunk_h_kernel(
       }
 
       wait_flag_dev(2);
-#ifndef MEGA_CHUNK_GDN_A5_GROUP_QK_SKIP_HO_READY
       if (emit_precomputed_qs && vid == 0) {
         const int64_t ready_offset =
             (seq_idx * H + head) * H_O_READY_STRIDE;
@@ -2004,18 +3284,8 @@ AICORE void chunk_h_kernel(
             AscendC::DcciDst::CACHELINE_ALL>(
             h_o_ready_gm[ready_offset]);
         __asm__ __volatile__("");
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-        // This is the doorbell release. QS and both V_new stripes reached
-        // DDR before event 2, so only the counter line remains to publish.
-        dsb(DSB_DDR);
-#endif
       }
-#endif
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
-      dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
-#elif defined(GDN_A5_KERNEL)
+#if defined(GDN_A5_KERNEL)
       // Same consumer-side invalidation for the k_tilde^T @ v_new product
       // published by the Cube stage; without it the recurrence can fold in a
       // stale line from a previous launch and corrupt the final state.
@@ -2096,6 +3366,23 @@ AICORE void chunk_h_kernel(
         ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
       }
 
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+      if constexpr (FuseResidentOutput) {
+        ResidentHoGateQkAndScaleQ<D, C>(
+            Q_handle, G_handle, resident_raw_qk_mailbox,
+            resident_combined_mailbox, resident_gated_qk_mailbox,
+            static_cast<int64_t>(cid), chunk_start, total_tokens,
+            static_cast<int32_t>(head), static_cast<int32_t>(head_g), Hg,
+            static_cast<int32_t>(vid));
+        ResidentHoConsumeCombined<
+            D, C, FuseResidentGatedRmsNorm>(
+            resident_combined_mailbox, resident_output_handle,
+            resident_z_handle, static_cast<int64_t>(cid), chunk_start,
+            static_cast<int32_t>(head), H, static_cast<int32_t>(vid),
+            ci + 1 == static_cast<int32_t>(num_chunks));
+      }
+#endif
+
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -2173,5 +3460,57 @@ AICORE void chunk_h_kernel(
     }
   }
   }
+
+  if (use_split_head_pipeline) {
+    if (cid < 2 * paired_core_count) {
+      const bool helper_core = cid >= paired_core_count;
+      const int64_t head =
+          helper_core ? block_num + cid - paired_core_count : cid;
+      const int64_t head_g = head / GROUP;
+      const int32_t num_chunks = static_cast<int32_t>(dense_chunk_count);
+      const int32_t split_chunk = num_chunks / 2;
+      const int64_t ws_core_offset =
+          static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+      const int64_t ws_field_span =
+          static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+      const int64_t ws_ws_base = ws_core_offset;
+      const int64_t ws_k_base = ws_field_span + ws_core_offset;
+      const int64_t ws_s_base = 2 * ws_field_span + ws_core_offset;
+      const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
+      const int64_t v_head_base = head * static_cast<int64_t>(C) * D;
+      const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+
+      if (helper_core) {
+        wait_segment_state<C>(
+            h_o_ready_handle, head, split_chunk, vid);
+        paired_vec_load_state<D, C, 0>(
+            S_handle, head, 0, split_chunk, H, vid, s_ub, s_ub_half);
+      } else {
+        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+      }
+
+      for (int32_t ci = split_chunk; ci < num_chunks; ++ci) {
+        const int64_t chunk_start = static_cast<int64_t>(ci) * C;
+        paired_vec_front<D, C, 0, G_UB, COEFF_UB, U_UB>(
+            K_handle, U_handle, G_handle, V_handle, workspace_handle, head,
+            head_g, chunk_start, C, ci, H, Hg, total_tokens, vid, D,
+            v_head_base, v_chunk_stride, ws_ws_base, ws_k_base, s_ub,
+            k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+            u_ub, ws_ub);
+        paired_vec_finish<D, C, 0>(
+            S_handle, workspace_handle, h_o_ready_handle, head, 0, ci,
+            num_chunks, H, vid, ws_kv_base, true, s_ub,
+            s_ub_half, kv_ub);
+      }
+
+      paired_vec_store_final<D, C, StoreFinalStateCache>(
+          FS_handle, final_state_cache, state_indices, head, H, vid,
+          state_index_stride, state_cache_slots, output_final_state, s_ub,
+          s_ub_half);
+      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+    }
+  }
 #endif
 }
+
+#undef GDN_CHUNK_H_KERNEL
