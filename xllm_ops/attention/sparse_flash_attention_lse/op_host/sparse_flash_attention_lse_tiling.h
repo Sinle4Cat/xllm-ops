@@ -441,6 +441,7 @@ private:
     ge::graphStatus CheckVAndKRopeShapeForBatchContinuous();
     ge::graphStatus CheckVAndKRopeShapeForPageAttention();
     ge::graphStatus CheckVAndKRopeShape();
+    ge::graphStatus CheckVAndKShapeWithoutRope();
     ge::graphStatus CheckVAndKRope();
     ge::graphStatus CheckTopK();
     ge::graphStatus CheckTopkShape();

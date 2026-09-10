@@ -259,8 +259,9 @@ void SFALSEMlaTiling::GenTilingKey()
         pageAttention = 1U;
     }
 
+    const uint32_t hasRope = (sfaInfo_->opParamInfo.queryRope.tensor != nullptr) ? 1U : 0U;
     tilingKey_ = GET_TPL_TILING_KEY(0U, pageAttention, layoutQuery, layoutKV,
-        perfMode_ == SFAPerfMode::V_TEMPLATE_MODE, static_cast<uint32_t>(sfaInfo_->gSize > 64)); // N1 > 128时核间切G
+        perfMode_ == SFAPerfMode::V_TEMPLATE_MODE, static_cast<uint32_t>(sfaInfo_->gSize > 64), hasRope); // N1 > 128时核间切G
 
     OP_LOGI(sfaInfo_->opName, "SFA tilingKey_: %lu.", tilingKey_);
 }
@@ -466,6 +467,7 @@ void SFALSEMlaTiling::GetWorkspaceSize()
         // topk BlkSize == 1场景, 需要额外空间缓存离散聚合的值
         //              bufNum  s2Base   D   dRope  sizeOf(half)
         // 4:bufNum  512:s2Base  512:D  64:dRope  2:sizeOf(half)
+        // kernel 侧 kvMerge 布局仍按 576 行宽寻址, NoPE 时 rope 半区闲置, 避免 host/device 不一致
         workspaceSize_ += 4 * 512 * (512 + 64) * 2 * actCoreNum;
         // 缓存有效mte2 size的长度 份数  512B对齐的长度  sizeof(int32_t)   aiv核数
         workspaceSize_ += 4 * 128 * 4 * (2 * actCoreNum); // 4:缓存有效mte2 size的长度 128:份数  4:512B对齐的长度  2:aiv核数
@@ -801,6 +803,10 @@ ge::graphStatus SFALSETilingCheck::CheckRopeExistence()
     OP_CHECK_IF((opParamInfo_.queryRope.tensor == nullptr && opParamInfo_.keyRope.tensor != nullptr),
         OP_LOGE(opName_, "QueryRope is null, but keyRope exists, they should be both null or exist."),
         return ge::GRAPH_FAILED);
+    if (opParamInfo_.queryRope.tensor == nullptr) {
+        // NoPE场景: queryRope/keyRope均为空, 走HAS_ROPE=0的kernel实例化, 无需校验rope desc
+        return ge::GRAPH_SUCCESS;
+    }
     OP_CHECK_IF(opParamInfo_.keyRope.desc == nullptr || opParamInfo_.queryRope.desc == nullptr,
         OP_LOGE(opName_, "In Mla situation, desc of keyRope and queryRope should not be null"),
         return ge::GRAPH_FAILED);
@@ -937,8 +943,12 @@ void SFALSETilingCheck::SetSFAShapeCompare()
     keyShapeCmp_ = opParamInfo_.key.shape->GetStorageShape();
     valueShapeCmp_ = opParamInfo_.value.shape->GetStorageShape();
     attenOutShapeCmp_ = opParamInfo_.attenOut.shape->GetStorageShape();
-    queryRopeShapeCmp_ = opParamInfo_.queryRope.tensor->GetStorageShape();
-    keyRopeShapeCmp_ = opParamInfo_.keyRope.tensor->GetStorageShape();
+    if (opParamInfo_.queryRope.tensor != nullptr) {
+        queryRopeShapeCmp_ = opParamInfo_.queryRope.tensor->GetStorageShape();
+    }
+    if (opParamInfo_.keyRope.tensor != nullptr) {
+        keyRopeShapeCmp_ = opParamInfo_.keyRope.tensor->GetStorageShape();
+    }
     softmaxMaxShapeCmp_ = opParamInfo_.softmaxMax.shape->GetStorageShape();
     softmaxSumShapeCmp_ = opParamInfo_.softmaxSum.shape->GetStorageShape();
 }
@@ -1098,6 +1108,9 @@ ge::graphStatus SFALSETilingCheck::CheckSoftmaxSum()
 
 ge::graphStatus SFALSETilingCheck::CheckQRope()
 {
+    if (opParamInfo_.queryRope.tensor == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
     if (ge::GRAPH_SUCCESS != CheckDTypeConsistency(opParamInfo_.queryRope.desc->GetDataType(),
         inputQType_, QUERY_ROPE_NAME) ||
         ge::GRAPH_SUCCESS != CheckQRopeShape()) {
@@ -1131,9 +1144,11 @@ ge::graphStatus SFALSETilingCheck::CheckVAndKRopeShapeForBatchContinuous()
         return ge::GRAPH_FAILED;
     }
 
-    shapeParams.D = ropeHeadDim_;
-    if (CompareShape(shapeParams, keyRopeShapeCmp_, kvLayout_, KEY_ROPE_NAME) != ge::GRAPH_SUCCESS) {
-        return ge::GRAPH_FAILED;
+    if (opParamInfo_.keyRope.tensor != nullptr) {
+        shapeParams.D = ropeHeadDim_;
+        if (CompareShape(shapeParams, keyRopeShapeCmp_, kvLayout_, KEY_ROPE_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
     }
     return ge::GRAPH_SUCCESS;
 }
@@ -1170,9 +1185,11 @@ ge::graphStatus SFALSETilingCheck::CheckVAndKRopeShapeForPageAttention()
         return ge::GRAPH_FAILED;
     }
 
-    shapeParams.D = ropeHeadDim_;
-    if (CompareShape(shapeParams, keyRopeShapeCmp_, kvLayout_, KEY_ROPE_NAME) != ge::GRAPH_SUCCESS) {
-        return ge::GRAPH_FAILED;
+    if (opParamInfo_.keyRope.tensor != nullptr) {
+        shapeParams.D = ropeHeadDim_;
+        if (CompareShape(shapeParams, keyRopeShapeCmp_, kvLayout_, KEY_ROPE_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
     }
 
     return ge::GRAPH_SUCCESS;
@@ -1186,6 +1203,51 @@ ge::graphStatus SFALSETilingCheck::CheckVAndKRopeShape()
 
     if (kvStorageMode_ == KvStorageMode::PAGE_ATTENTION) {
         return CheckVAndKRopeShapeForPageAttention();
+    }
+
+    OP_LOGE(opName_, "storage mode of key and value is %u, it is incorrect.", static_cast<uint32_t>(kvStorageMode_));
+    return ge::GRAPH_FAILED;
+}
+
+// NoPE场景(queryRope/keyRope均为空)下仅校验key/value本身, 跳过rope相关校验
+ge::graphStatus SFALSETilingCheck::CheckVAndKShapeWithoutRope()
+{
+    if (kvStorageMode_ == KvStorageMode::BATCH_CONTINUOUS) {
+        SFALSETilingShapeCompareParam shapeParams;
+        shapeParams.B = bSize_;
+        shapeParams.N = n2Size_;
+        shapeParams.S = s2Size_;
+        shapeParams.T = kvTSize_;
+        shapeParams.D = qkHeadDim_;
+        if (CompareShape(shapeParams, keyShapeCmp_, kvLayout_, KEY_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
+        shapeParams.D = vHeadDim_;
+        if (CompareShape(shapeParams, valueShapeCmp_, kvLayout_, VALUE_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
+        return ge::GRAPH_SUCCESS;
+    }
+
+    if (kvStorageMode_ == KvStorageMode::PAGE_ATTENTION) {
+        int64_t blockNum = keyShapeCmp_.GetDim(0);
+        OP_CHECK_IF(blockNum <= 0,
+            OP_LOGE(opName_, "The first dim(%ld) of key should be greater than 0", blockNum),
+            return ge::GRAPH_FAILED);
+        SFALSETilingShapeCompareParam shapeParams;
+        shapeParams.Bn = blockNum;
+        shapeParams.N = n2Size_;
+        shapeParams.Bs = blockSize_;
+        shapeParams.D = qkHeadDim_;
+        shapeParams.T = kvTSize_;
+        if (CompareShape(shapeParams, keyShapeCmp_, kvLayout_, KEY_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
+        shapeParams.D = vHeadDim_;
+        if (CompareShape(shapeParams, valueShapeCmp_, kvLayout_, VALUE_NAME) != ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
+        return ge::GRAPH_SUCCESS;
     }
 
     OP_LOGE(opName_, "storage mode of key and value is %u, it is incorrect.", static_cast<uint32_t>(kvStorageMode_));
@@ -1300,8 +1362,12 @@ ge::graphStatus SFALSETilingCheck::CheckActualSeqLensShape()
 ge::graphStatus SFALSETilingCheck::CheckMultiParaConsistency()
 {
     SetSFAShapeCompare();
-    if (ge::GRAPH_SUCCESS != CheckVAndKRope() ||
-        ge::GRAPH_SUCCESS != CheckQRope() ||
+    // NoPE场景(queryRope/keyRope均为空)跳过rope相关的shape/dtype一致性校验, 但仍需校验key/value
+    bool hasRope = (opParamInfo_.queryRope.tensor != nullptr);
+    if ((hasRope && (ge::GRAPH_SUCCESS != CheckVAndKRope() ||
+        ge::GRAPH_SUCCESS != CheckQRope())) ||
+        (!hasRope && (ge::GRAPH_SUCCESS != CheckDTypeConsistency(opParamInfo_.value.desc->GetDataType(),
+            inputKvType_, VALUE_NAME) || ge::GRAPH_SUCCESS != CheckVAndKShapeWithoutRope())) ||
         ge::GRAPH_SUCCESS != CheckTopK() ||
         ge::GRAPH_SUCCESS != CheckAttenOut() ||
         ge::GRAPH_SUCCESS != CheckSoftmaxMax() ||
@@ -1349,8 +1415,14 @@ ge::graphStatus SFALSETilingCheck::CheckFeatureMlaNoQuantShape() const
         OP_LOGE(opName_, "qk_head_dim[%u] should be equal to v_head_dim[%u]", qkHeadDim_, vHeadDim_),
         return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(ropeHeadDim_ != 64,
-        OP_LOGE(opName_, "rope_head_dim should be 64, but got %u", ropeHeadDim_),
+    // ropeHeadDim必须与rope tensor的存在性绑定: 有rope输入时只允许64维, NoPE(无rope输入)时只允许0,
+    // 防止"tensor非空但D=0"的非法输入通过校验后进入HAS_ROPE=1的kernel按64维越界读取
+    const bool hasRope = (opParamInfo_.queryRope.tensor != nullptr);
+    OP_CHECK_IF(hasRope && ropeHeadDim_ != 64,
+        OP_LOGE(opName_, "rope_head_dim should be 64 when query_rope is provided, but got %u", ropeHeadDim_),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(!hasRope && ropeHeadDim_ != 0,
+        OP_LOGE(opName_, "rope_head_dim should be 0 when query_rope is not provided, but got %u", ropeHeadDim_),
         return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -1534,10 +1606,7 @@ ge::graphStatus SFALSEInfoParser::CheckRequiredInOutExistence() const
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.softmaxSum.desc == nullptr, OP_LOGE(opName_, "Desc of tensor softmaxSum is nullptr"),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.queryRope.tensor == nullptr, OP_LOGE(opName_, "Shape of queryRope is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.queryRope.desc == nullptr, OP_LOGE(opName_, "Desc of queryRope is nullptr"),
-               return ge::GRAPH_FAILED);
+    // queryRope为可选输入(NoPE场景为nullptr), 其存在性在CheckRopeExistence中校验
 
     return ge::GRAPH_SUCCESS;
 }
@@ -1869,6 +1938,11 @@ ge::graphStatus SFALSEInfoParser::GetValueHeadDim()
 
 ge::graphStatus SFALSEInfoParser::GetRopeHeadDim()
 {
+    if (opParamInfo_.queryRope.tensor == nullptr) {
+        // NoPE场景: 无rope输入, ropeHeadDim按0处理
+        ropeHeadDim_ = 0;
+        return ge::GRAPH_SUCCESS;
+    }
     if (queryShape_.GetDimNum() != queryRopeShape_.GetDimNum()) {
         OP_LOGE(opName_, "The dimensions of query and query_rope should be equal, but query has dimension %zu while query_rope has dimension %zu.",
                 queryShape_.GetDimNum(), queryRopeShape_.GetDimNum());
@@ -1935,7 +2009,9 @@ void SFALSEInfoParser::SetSFAShape()
     keyShape_ = opParamInfo_.key.shape->GetStorageShape();
     valueShape_ = opParamInfo_.value.shape->GetStorageShape();
     sparseIndicesShape_ = opParamInfo_.sparseIndices.shape->GetStorageShape();
-    queryRopeShape_ = opParamInfo_.queryRope.tensor->GetStorageShape();
+    if (opParamInfo_.queryRope.tensor != nullptr) {
+        queryRopeShape_ = opParamInfo_.queryRope.tensor->GetStorageShape();
+    }
 }
 
 ge::graphStatus SFALSEInfoParser::GetGSize()
