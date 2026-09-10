@@ -138,6 +138,63 @@ AICORE inline void SyncAllImpl()
 #endif
 }
 
+constexpr int64_t GDN_WY_H_FREE_STRIDE = 16;
+
+AICORE inline void ResetWyHFree(__gm__ int32_t *free_handle)
+{
+#if defined(__DAV_C220_CUBE__) && !defined(GDN_A5_KERNEL)
+    const int64_t offset =
+        static_cast<int64_t>(get_block_idx()) * GDN_WY_H_FREE_STRIDE;
+    AscendC::GlobalTensor<int32_t> free_global;
+    free_global.SetGlobalBuffer(free_handle);
+    free_global.SetValue(offset, 0);
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<
+        int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_ALL>(free_global[offset]);
+    __asm__ __volatile__("");
+#endif
+}
+
+AICORE inline void ReleaseWyHBlock(__gm__ int32_t *free_handle)
+{
+#if defined(PTO_NPU_ARCH_A2A3) && !defined(GDN_A5_KERNEL)
+    // The full MIX rendezvous used to drain every local pipeline before H
+    // reused the Solve/WY L1, L0 and UB allocations. Keep that local ordering
+    // while replacing only the cross-block portion with the GM handoff below.
+    pipe_barrier(PIPE_ALL);
+#endif
+#if defined(__DAV_C220_CUBE__) && !defined(GDN_A5_KERNEL)
+    const int64_t offset =
+        static_cast<int64_t>(get_block_idx()) * GDN_WY_H_FREE_STRIDE;
+    AscendC::GlobalTensor<int32_t> free_global;
+    free_global.SetGlobalBuffer(free_handle);
+    free_global.SetValue(offset, 1);
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<
+        int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_ALL>(free_global[offset]);
+    __asm__ __volatile__("");
+#elif defined(__DAV_C220_VEC__) && !defined(GDN_A5_KERNEL)
+    const int64_t offset =
+        static_cast<int64_t>(get_block_idx()) * GDN_WY_H_FREE_STRIDE;
+    AscendC::GlobalTensor<int32_t> free_global;
+    free_global.SetGlobalBuffer(free_handle);
+    while (true) {
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<
+            int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+            AscendC::DcciDst::CACHELINE_OUT>(free_global[offset]);
+        __asm__ __volatile__("");
+        if (free_global.GetValue(offset) != 0) {
+            break;
+        }
+    }
+    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+#endif
+}
+
 #if defined(GDN_A5_KERNEL)
 // Scalar conversions between a 2-byte compute type and float.  The C310
 // backend has no scalar bf16<->fp32 convert instruction ("not support bf16
@@ -449,7 +506,7 @@ template <typename SrcT, typename DstT>
 AICORE inline void mega_prepare_solve_constants(
     __gm__ SrcT *src, __gm__ DstT *dst, int64_t element_count)
 {
-#if defined(__DAV_C220_VEC__) || defined(__DAV_C310_VEC__)
+#if defined(__DAV_C220_VEC__)
     static_assert(!std::is_same_v<SrcT, DstT>,
                   "mega_prepare_solve_constants requires distinct types.");
     if (get_subblockid() != 0) return;
@@ -540,6 +597,8 @@ AICORE inline void mega_prepare_solve_constants(
         output_queue.FreeTensor(zero_local);
         input_queue.FreeTensor(src_local);
     }
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
 #else
     (void)src;
     (void)dst;
@@ -654,25 +713,28 @@ using pto::Stride;
 #include "wy_fast.cpp"
 }
 
-namespace mk_h {
-using pto::Stride;
-#include "chunk_h.cpp"
-}
-
 namespace mk_o {
 using pto::Stride;
 #include "chunk_o.cpp"
 }
 
+namespace mk_h {
+using pto::Stride;
+#include "chunk_h.cpp"
+}
+
 #if defined(__DAV_C220_CUBE__)
 #define GDN_WY_FAST_CALL wy_fast_kernel_aic
 #define GDN_CHUNK_O_CALL chunk_o_kernel_aic
+#define GDN_CHUNK_H_CALL chunk_h_kernel_aic
 #elif defined(__DAV_C220_VEC__)
 #define GDN_WY_FAST_CALL wy_fast_kernel_aiv
 #define GDN_CHUNK_O_CALL chunk_o_kernel_aiv
+#define GDN_CHUNK_H_CALL chunk_h_kernel_aiv
 #else
 #define GDN_WY_FAST_CALL wy_fast_kernel
 #define GDN_CHUNK_O_CALL chunk_o_kernel
+#define GDN_CHUNK_H_CALL chunk_h_kernel
 #endif
 
 template <bool WaitForKktReady = false, uint32_t ReadyGroupSize = 3>
@@ -739,15 +801,24 @@ template <bool FuseGatedRmsNorm = false,
           bool EnableHoPipeline = false,
           bool EnableHoOverlap = true,
           bool LoadInitialStateCache = false,
-          bool EnableKktSolvePipeline = false>
+          bool EnableKktSolvePipeline = false,
+          bool EnableSolveWyPipeline = false,
+          bool EnableFusedWyH = false>
 AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr, GM_ADDR g_in_ptr, GM_ADDR beta_ptr,
                                     GM_ADDR msk_lower_ptr, GM_ADDR msk_full_ptr, GM_ADDR minus_id_ptr,
                                     GM_ADDR cu_seqlens_ptr, GM_ADDR o_ptr, GM_ADDR g_sum_ptr, GM_ADDR g_t_ptr,
                                     GM_ADDR beta_t_ptr, GM_ADDR A_ptr, GM_ADDR A_inv_f32_ptr, GM_ADDR A_inv_ptr,
                                     GM_ADDR w_ptr, GM_ADDR u_ptr, GM_ADDR s_ptr, GM_ADDR v_new_ptr, GM_ADDR fs_ptr,
                                     GM_ADDR h0_ptr, int64_t has_initial_state, GM_ADDR kkt_ws_ptr,
-                                    GM_ADDR wy_ws_a1_ptr, GM_ADDR wy_ws_a2_ptr, GM_ADDR h_ws_ptr,
+                                    GM_ADDR wy_ws_a1_ptr, GM_ADDR wy_ws_a2_ptr,
+                                    GM_ADDR solve_wy_ready_ptr,
+                                    uint32_t solve_wy_workspace_slots,
+                                    GM_ADDR wy_h_free_ptr,
+                                    GM_ADDR h_o_ready_ptr,
+                                    GM_ADDR h_ws_ptr,
                                     GM_ADDR o_ws_qk_ptr, GM_ADDR o_ws_qs_ptr, GM_ADDR o_ws_gated_ptr,
+                                    GM_ADDR o_ws_ping_qk_ptr, GM_ADDR o_ws_ping_qs_ptr,
+                                    GM_ADDR o_ws_ping_gated_ptr,
                                     int32_t H, uint32_t num_key_heads, int64_t batch_size, int64_t seq_len,
                                     int64_t total_tokens, uint32_t num_matrices, uint64_t ffts_addr,
                                     GM_ADDR z_ptr, GM_ADDR norm_weight_ptr,
@@ -785,6 +856,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
             num_key_heads, num_matrices,
             reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
 #ifdef MEGA_CHUNK_GDN_BLOCKED_SOLVE
+    // The blocked solver consumes KKT tiles in-place. Keep a stage boundary
+    // until its first-wave FFTS ready/free lifecycle is proven independently.
     constexpr bool CanPipelineKktSolve = false;
 #else
     constexpr bool CanPipelineKktSolve = true;
@@ -805,12 +878,120 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     // the A2/A3 four-slot FFTS protocol.
     constexpr bool kkt_solve_wave_count_supported = false;
 #endif
-    const bool use_kkt_solve_pipeline =
+    const bool use_kkt_solve_ffts_pipeline =
         EnableKktSolvePipeline && CanPipelineKktSolve && reuse_group_kk &&
         (static_cast<uint32_t>(H) == 2u * num_key_heads ||
          static_cast<uint32_t>(H) == 3u * num_key_heads) &&
         (num_matrices % kkt_solve_group_size) == 0 &&
         kkt_solve_wave_count_supported;
+    const uint32_t solve_wy_group_count =
+        kkt_solve_group_size == 0
+            ? 0
+            : num_matrices / kkt_solve_group_size;
+    const uint32_t solve_wy_producer_waves =
+        solve_wy_group_count == 0
+            ? 0
+            : (solve_wy_group_count + get_block_num() - 1) /
+                  get_block_num();
+    const uint32_t solve_wy_required_slots =
+        solve_wy_producer_waves * kkt_solve_group_size;
+    const bool solve_wy_group_size_supported =
+        kkt_solve_group_size >= 1 && kkt_solve_group_size <= 4;
+    const bool use_solve_wy_pipeline =
+        EnableSolveWyPipeline && solve_wy_group_size_supported &&
+        batch_size == 1 &&
+        seq_len == total_tokens && total_tokens >= 8 * C &&
+        total_tokens % C == 0 &&
+        num_matrices ==
+            static_cast<uint32_t>(total_tokens / C) *
+                static_cast<uint32_t>(H) &&
+        solve_wy_ready_ptr != nullptr && solve_wy_required_slots != 0 &&
+        solve_wy_workspace_slots >= solve_wy_required_slots;
+    const bool use_async_solve_wy_pipeline = use_solve_wy_pipeline;
+#if defined(MEGA_CHUNK_GDN_GM_KKT_SOLVE_PIPELINE) && \
+    defined(MEGA_CHUNK_GDN_BLOCKED_SOLVE) && \
+    !defined(MEGA_CHUNK_GDN_BLOCKED32_SOLVE) && \
+    defined(PTO_NPU_ARCH_A2A3)
+    const bool use_kkt_solve_gm_pipeline =
+        EnableKktSolvePipeline && CanPipelineKktSolve && reuse_group_kk &&
+        !use_kkt_solve_ffts_pipeline && solve_wy_group_size_supported &&
+        (num_matrices % kkt_solve_group_size) == 0 &&
+        use_solve_wy_pipeline;
+#else
+    constexpr bool use_kkt_solve_gm_pipeline = false;
+#endif
+    const bool use_kkt_solve_pipeline =
+        use_kkt_solve_ffts_pipeline || use_kkt_solve_gm_pipeline;
+    const uint32_t kkt_solve_pipeline_mode =
+        use_kkt_solve_ffts_pipeline ? 1u
+                                    : (use_kkt_solve_gm_pipeline ? 2u : 0u);
+#if defined(MEGA_CHUNK_GDN_RESIDENT_HO) && !defined(GDN_A5_KERNEL)
+    const bool resident_h_o_candidate =
+        FuseGatedRmsNorm && StoreFinalStateCache && LoadInitialStateCache &&
+        EnableHoOverlap && batch_size == 1 && seq_len == total_tokens &&
+        total_tokens == 2048 && H == 24 && num_key_heads == 8 && D == 128 &&
+        C == 128 && num_matrices == 384 && cu_seqlens_ptr != nullptr &&
+        initial_state_indices_ptr != nullptr &&
+        static_cast<int64_t>(
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr)[0]) == 0 &&
+        static_cast<int64_t>(
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr)[1]) ==
+            total_tokens &&
+        reinterpret_cast<__gm__ int32_t *>(initial_state_indices_ptr)[0] < 0;
+#else
+    constexpr bool resident_h_o_candidate = false;
+#endif
+    const bool use_fused_wy_h =
+        EnableFusedWyH && use_solve_wy_pipeline;
+    const bool use_fused_wy_h_public_u =
+        use_fused_wy_h && kkt_solve_group_size == 1;
+#if defined(MEGA_CHUNK_GDN_ASYNC_WY_H) && defined(PTO_NPU_ARCH_A2A3)
+    const bool use_async_wy_h =
+        use_fused_wy_h && !use_fused_wy_h_public_u &&
+        kkt_solve_group_size >= 2 && kkt_solve_group_size <= 4 &&
+        wy_h_free_ptr != nullptr;
+#else
+    constexpr bool use_async_wy_h = false;
+#endif
+
+    const uint32_t h_o_chunk_count =
+        H > 0 && (num_matrices % static_cast<uint32_t>(H)) == 0
+            ? num_matrices / static_cast<uint32_t>(H)
+            : 0;
+    const uint32_t expected_h_o_matrices =
+        h_o_chunk_count * static_cast<uint32_t>(H);
+    const bool h_o_group_geometry_supported =
+        kkt_solve_group_size == 1 || kkt_solve_group_size == 4 ||
+        num_key_heads >= 8;
+    const uint32_t h_o_pipeline_max_chunks =
+        kkt_solve_group_size >= 2 && kkt_solve_group_size <= 3
+            ? 128u
+            : 64u;
+#if defined(GDN_A5_KERNEL)
+    // PR #41's A5 intra-block protocol covers the regular chunk-H/O flow.
+    // The overlap schedule still assumes the legacy FFTS execution model.
+    constexpr bool use_h_o_pipeline = false;
+#else
+    // With fewer head owners than MIX blocks, long sequences reuse an H-to-O
+    // mailbox across multiple waves and the existing ready/free protocol does
+    // not fully cover that lifecycle. Short group2/3/4 schedules are proven,
+    // while group1 is admitted only for the single-wave H<=8 geometry. Long
+    // group2/3/4 schedules require at least one head owner per block.
+    const bool h_o_owner_geometry_supported =
+        (h_o_chunk_count <= 8 &&
+         (kkt_solve_group_size >= 2 ||
+          static_cast<uint32_t>(H) <= 8)) ||
+        (static_cast<uint32_t>(H) >= get_block_num() &&
+         kkt_solve_group_size >= 2);
+    const bool use_h_o_pipeline =
+        EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
+        cu_seqlens_ptr != nullptr && h_o_chunk_count >= 4 &&
+        h_o_chunk_count <= h_o_pipeline_max_chunks &&
+        h_o_group_geometry_supported &&
+        h_o_owner_geometry_supported &&
+        !(kkt_solve_group_size == 4 && h_o_chunk_count > 32) &&
+        num_matrices == expected_h_o_matrices;
+#endif
 
     mega_transpose_TH_to_HT<float>(reinterpret_cast<__gm__ float *>(g_sum_ptr),
                                    reinterpret_cast<__gm__ float *>(g_t_ptr), total_tokens, H);
@@ -825,7 +1006,75 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
             num_key_heads);
     }
 
+#if defined(__DAV_C220_VEC__) && !defined(GDN_A5_KERNEL)
+    if (use_solve_wy_pipeline) {
+        mk_wy::solve_wy_reset_ready(
+            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+            static_cast<int64_t>(get_block_idx()), get_subblockid());
+    }
+#endif
+
+#if defined(__DAV_C220_VEC__) && !defined(GDN_A5_KERNEL) && \
+    defined(MEGA_CHUNK_GDN_EARLY_HO_READY_RESET)
+    if (use_h_o_pipeline && h_o_ready_ptr != nullptr &&
+        get_subblockid() == 0) {
+        constexpr int64_t H_O_READY_STRIDE = 16;
+        AscendC::GlobalTensor<int32_t> h_o_ready_gm;
+        h_o_ready_gm.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t *>(h_o_ready_ptr));
+        const int64_t cid = static_cast<int64_t>(get_block_idx());
+        const int64_t block_num = static_cast<int64_t>(get_block_num());
+        const int64_t ready_count = batch_size * static_cast<int64_t>(H);
+        const int64_t paired_core_count =
+            static_cast<int64_t>(H) - block_num;
+        const bool reset_split_midpoint =
+            batch_size == 1 && has_initial_state == 0 && total_tokens > 0 &&
+            total_tokens % C == 0 &&
+            ((total_tokens / C) & 1) == 0 &&
+            paired_core_count > 0 &&
+            static_cast<int64_t>(H) < 2 * block_num &&
+            2 * paired_core_count <= block_num;
+#ifdef MEGA_CHUNK_GDN_SEGMENTED_H
+        const bool reset_segment_handoffs =
+            batch_size == 1 && has_initial_state == 0 && total_tokens > 0 &&
+            total_tokens % C == 0 && (total_tokens / C) >= 8 &&
+            (total_tokens / C) % 4 == 0;
+#else
+        constexpr bool reset_segment_handoffs = false;
+#endif
+        for (int64_t ready_idx = cid; ready_idx < ready_count;
+             ready_idx += block_num) {
+            const int64_t ready_offset = ready_idx * H_O_READY_STRIDE;
+            h_o_ready_gm.SetValue(ready_offset, 0);
+            if (reset_segment_handoffs) {
+                h_o_ready_gm.SetValue(ready_offset + 1, 0);
+                h_o_ready_gm.SetValue(ready_offset + 2, 0);
+            } else if (reset_split_midpoint && ready_idx >= block_num) {
+                h_o_ready_gm.SetValue(ready_offset + 1, 0);
+                h_o_ready_gm.SetValue(ready_offset + 2, 0);
+            }
+            __asm__ __volatile__("");
+            AscendC::DataCacheCleanAndInvalid<
+                int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                AscendC::DcciDst::CACHELINE_ALL>(
+                h_o_ready_gm[ready_offset]);
+            __asm__ __volatile__("");
+        }
+    }
+#endif
+
+#if defined(MEGA_CHUNK_GDN_ASYNC_WY_H) && defined(PTO_NPU_ARCH_A2A3)
+    if (use_async_wy_h) {
+        ResetWyHFree(reinterpret_cast<__gm__ int32_t *>(wy_h_free_ptr));
+    }
+#endif
+
     GDN_STAGE_SYNC();
+
+#ifdef MEGA_STOP_AFTER_TRANSPOSE
+    pipe_barrier(PIPE_ALL);
+    return;
+#endif
 
 #ifdef MEGA_CHUNK_GDN_PRECOMPUTED_M_NEG
     const bool use_precomputed_m_neg = !reuse_group_kk;
@@ -841,8 +1090,9 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len, total_tokens,
         static_cast<uint32_t>(H), num_key_heads, num_matrices, ffts_addr,
         reuse_group_kk ? 1u : 0u,
-        use_kkt_solve_pipeline ? 1u : 0u,
-        use_precomputed_m_neg ? 1u : 0u);
+        kkt_solve_pipeline_mode,
+        use_precomputed_m_neg ? 1u : 0u,
+        reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr));
 
 #if defined(__DAV_C220_CUBE__)
     if (!reuse_group_kk) {
@@ -857,28 +1107,16 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         GDN_STAGE_SYNC();
     }
 
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
-    // Variant17 remaps the group schedule onto A5's intra-block event range.
-    // Limit reuse to the chunk range accepted by chunk O's precomputed-QS
-    // path; outside it variant16 remains the correctness fallback.
-    const uint32_t group_qk_chunk_count =
-        H > 0 && (num_matrices % static_cast<uint32_t>(H)) == 0
-            ? num_matrices / static_cast<uint32_t>(H)
-            : 0;
-    const uint64_t max_group_qk_chunk_count =
-        batch_size > 0 ? static_cast<uint64_t>(batch_size) * 64u : 0u;
-    const bool reuse_group_qk =
-        EnableHoPipeline && H >= 8 && D == C &&
-        static_cast<uint32_t>(H) == 3u * num_key_heads &&
-        group_qk_chunk_count >= 4 &&
-        static_cast<uint64_t>(group_qk_chunk_count) <=
-            max_group_qk_chunk_count &&
-        mk_o::CanReuseGroupQk<C>(
-            batch_size, total_tokens, static_cast<uint32_t>(H),
-            num_key_heads, num_matrices,
-            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
-#elif defined(GDN_A5_KERNEL)
+#ifdef MEGA_STOP_AFTER_KKT
+    pipe_barrier(PIPE_ALL);
+    return;
+#endif
+
+#if defined(GDN_A5_KERNEL) || defined(MEGA_CHUNK_GDN_DISABLE_GROUP_QK)
+    // The group-QK schedule uses eight simultaneously live FFTS flag IDs,
+    // including 11..15.  A5 intra-block events only provide IDs 0..10, so
+    // keep this optional schedule on the legacy path until it has an A5
+    // event-allocation scheme.  The regular H/O pipeline uses IDs 0..7.
     constexpr bool reuse_group_qk = false;
 #else
     const bool reuse_group_qk =
@@ -893,15 +1131,222 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr);
 #ifdef MEGA_CHUNK_GDN_BLOCKED_SOLVE
     const bool use_blocked_solve =
-        batch_size >= 1 && cu_seqlens_ptr != nullptr && H > 0 &&
-        num_matrices >= static_cast<uint32_t>(H);
+        batch_size == 1 && seq_len == total_tokens && total_tokens > 0 &&
+        total_tokens % C == 0 && cu_seqlens_ptr != nullptr && H > 0 &&
+        num_matrices ==
+            static_cast<uint32_t>(total_tokens / C) *
+                static_cast<uint32_t>(H);
     if (use_blocked_solve) {
-        mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<ComputeT>(
-            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
-            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr), num_matrices,
-            static_cast<uint32_t>(H),
-            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+#ifdef MEGA_CHUNK_GDN_BLOCKED16_SOLVE
+        if (use_async_solve_wy_pipeline) {
+            if (kkt_solve_group_size == 1) {
+                mk_solve::runKernelTriInvBlocked16BSND<
+                    ComputeT, 1, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H), total_tokens);
+            } else if (kkt_solve_group_size == 2) {
+                mk_solve::runKernelTriInvBlocked16BSND<
+                    ComputeT, 2, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H), total_tokens);
+            } else if (kkt_solve_group_size == 3) {
+                mk_solve::runKernelTriInvBlocked16BSND<
+                    ComputeT, 3, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H), total_tokens);
+            } else {
+                mk_solve::runKernelTriInvBlocked16BSND<
+                    ComputeT, 4, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H), total_tokens);
+            }
+        } else {
+            mk_solve::runKernelTriInvBlocked16BSND<ComputeT>(
+                reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+                reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                num_matrices, static_cast<uint32_t>(H), total_tokens);
+        }
+        wy_a_input_ptr = reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr);
+#else
+#ifdef MEGA_CHUNK_GDN_BLOCKED32_SOLVE
+        const bool use_blocked32_solve =
+            batch_size == 1 && seq_len == total_tokens && total_tokens > 0 &&
+            total_tokens % C == 0 &&
+            num_matrices ==
+                static_cast<uint32_t>(total_tokens / C) *
+                    static_cast<uint32_t>(H);
+        if (use_blocked32_solve) {
+            if (use_kkt_solve_pipeline) {
+                if (kkt_solve_group_size == 2) {
+                    mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                        ComputeT, true, 2>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                } else {
+                    mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                        ComputeT, true, 3>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                }
+            } else {
+                if (use_async_solve_wy_pipeline) {
+                    if (kkt_solve_group_size == 1) {
+                        mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                            ComputeT, false, 1, true>(
+                                reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                                reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                                num_matrices, static_cast<uint32_t>(H),
+                                reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                    } else if (kkt_solve_group_size == 2) {
+                        mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                            ComputeT, false, 2, true>(
+                                reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                                reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                                num_matrices, static_cast<uint32_t>(H),
+                                reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                    } else if (kkt_solve_group_size == 3) {
+                        mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                            ComputeT, false, 3, true>(
+                                reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                                reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                                num_matrices, static_cast<uint32_t>(H),
+                                reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                    } else {
+                        mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<
+                            ComputeT, false, 4, true>(
+                                reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                                reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                                num_matrices, static_cast<uint32_t>(H),
+                                reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                    }
+                } else {
+                    mk_solve::runKernelTriInvBlocked32ResidentInplaceBSND<ComputeT>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                }
+            }
+        } else {
+#endif
+        if (use_kkt_solve_pipeline) {
+            if (kkt_solve_group_size == 1) {
+                mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                    ComputeT, true, 1, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                        reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                        use_kkt_solve_gm_pipeline ? 1u : 0u);
+            } else if (kkt_solve_group_size == 2) {
+                if (use_async_solve_wy_pipeline) {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, true, 2, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                            use_kkt_solve_gm_pipeline ? 1u : 0u);
+                } else {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, true, 2>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                            use_kkt_solve_gm_pipeline ? 1u : 0u);
+                }
+            } else if (kkt_solve_group_size == 3) {
+                if (use_async_solve_wy_pipeline) {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, true, 3, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                            use_kkt_solve_gm_pipeline ? 1u : 0u);
+                } else {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, true, 3>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                            use_kkt_solve_gm_pipeline ? 1u : 0u);
+                }
+            } else {
+                mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                    ComputeT, true, 4, true>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                        reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+                        use_kkt_solve_gm_pipeline ? 1u : 0u);
+            }
+        } else {
+            if (use_async_solve_wy_pipeline) {
+                if (kkt_solve_group_size == 1) {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, false, 1, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                } else if (kkt_solve_group_size == 2) {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, false, 2, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                } else if (kkt_solve_group_size == 3) {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, false, 3, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                } else {
+                    mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                        ComputeT, false, 4, true>(
+                            reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                            reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                            num_matrices, static_cast<uint32_t>(H),
+                            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+                }
+            } else {
+                mk_solve::runKernelTriInvBlocked64ResidentInplaceBSND<
+                    ComputeT>(
+                        reinterpret_cast<__gm__ ComputeT *>(A_ptr),
+                        reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr),
+                        num_matrices, static_cast<uint32_t>(H),
+                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
+            }
+        }
+#ifdef MEGA_CHUNK_GDN_BLOCKED32_SOLVE
+        }
+#endif
         wy_a_input_ptr = reinterpret_cast<__gm__ ComputeT *>(A_ptr);
+#endif
     } else {
 #endif
         if constexpr (EnableKktSolvePipeline) {
@@ -951,38 +1396,85 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     }
 #endif
 
-
-    GDN_STAGE_SYNC();
-
-#ifdef MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
-#if defined(__DAV_C310_VEC__)
-    mk_solve::TriInvA5DumpBsndBuffer<ComputeT, C>(
-        reinterpret_cast<__gm__ ComputeT *>(o_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr), num_matrices,
-        static_cast<uint32_t>(H),
-        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr));
-#endif
-    GDN_STAGE_SYNC();
+    if (!use_async_solve_wy_pipeline) {
+        GDN_STAGE_SYNC();
+        GDN_STAGE_SYNC();
+    }
+#ifdef MEGA_STOP_AFTER_SOLVE
+    pipe_barrier(PIPE_ALL);
     return;
-#endif
-
-#ifndef MEGA_CHUNK_GDN_A5_SINGLE_POST_SOLVE_SYNC
-    GDN_STAGE_SYNC();
 #endif
 #ifdef MEGA_STOP_AFTER_SYNC_BEFORE_WY
     return;
 #endif
 
-    mk_wy::GDN_WY_FAST_CALL<D, C>(
-        reinterpret_cast<__gm__ ComputeT *>(k_ptr), reinterpret_cast<__gm__ ComputeT *>(v_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr), reinterpret_cast<__gm__ float *>(g_t_ptr),
-        wy_a_input_ptr, reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr), reinterpret_cast<__gm__ ComputeT *>(w_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(u_ptr), reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len,
-        total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+    if (use_solve_wy_pipeline) {
+        if (use_fused_wy_h_public_u) {
+        mk_wy::GDN_WY_FAST_CALL<D, C, true, true, true>(
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr), wy_a_input_ptr,
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(u_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
+            seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
+            ffts_addr,
+            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+            solve_wy_workspace_slots, kkt_solve_group_size, num_matrices,
+            use_async_solve_wy_pipeline);
+        } else if (use_fused_wy_h) {
+        mk_wy::GDN_WY_FAST_CALL<D, C, true, true>(
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr), wy_a_input_ptr,
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(u_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
+            seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
+            ffts_addr,
+            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+            solve_wy_workspace_slots, kkt_solve_group_size, num_matrices,
+            use_async_solve_wy_pipeline);
+        } else {
+        mk_wy::GDN_WY_FAST_CALL<D, C, true>(
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr), wy_a_input_ptr,
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(u_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
+            seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
+            ffts_addr,
+            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+            solve_wy_workspace_slots, kkt_solve_group_size, num_matrices,
+            use_async_solve_wy_pipeline);
+        }
+    } else {
+        mk_wy::GDN_WY_FAST_CALL<D, C>(
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr), wy_a_input_ptr,
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(u_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
+            seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
+            ffts_addr);
+    }
 
 #if defined(__DAV_C220_VEC__) && !defined(GDN_A5_KERNEL)
-    if (get_block_idx() < num_matrices) {
+    if (!use_solve_wy_pipeline && get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
         wait_flag_dev(3);
         wait_flag_dev(4);
@@ -994,104 +1486,91 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     return;
 #endif
 
-    const uint32_t h_o_chunk_count =
-        H > 0 && (num_matrices % static_cast<uint32_t>(H)) == 0
-            ? num_matrices / static_cast<uint32_t>(H)
-            : 0;
-    const uint32_t expected_h_o_matrices =
-        h_o_chunk_count * static_cast<uint32_t>(H);
-#if defined(GDN_A5_KERNEL)
-#if defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-    bool h_o_sequences_valid = cu_seqlens_ptr != nullptr;
-    uint64_t scanned_h_o_chunks = 0;
-    if (h_o_sequences_valid) {
-        auto *h_o_cu_seqlens =
-            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr);
-        for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-            const int64_t seq_start =
-                static_cast<int64_t>(h_o_cu_seqlens[seq_idx]);
-            const int64_t seq_end =
-                static_cast<int64_t>(h_o_cu_seqlens[seq_idx + 1]);
-            const int64_t seq_tokens = seq_end - seq_start;
-            if (seq_start < 0 || seq_end > total_tokens ||
-                seq_tokens <= 0) {
-                h_o_sequences_valid = false;
-                break;
-            }
-            const uint64_t seq_chunks =
-                static_cast<uint64_t>((seq_tokens + C - 1) / C);
-            if (seq_chunks > 64u) {
-                h_o_sequences_valid = false;
-                break;
-            }
-            scanned_h_o_chunks += seq_chunks;
-        }
+#if defined(MEGA_CHUNK_GDN_RESIDENT_HO) && !defined(GDN_A5_KERNEL)
+    // Keep this experimental schedule on the exact dense shape used for its
+    // precision/performance gate. Other shapes retain the stable H/O path.
+    const bool use_resident_h_o =
+        resident_h_o_candidate && use_h_o_pipeline;
+#endif
+    // Fused group2/3/4 H owners consume A1/A2 through per-tile GM generation
+    // counters. The producer publishes a generation only after both Vector
+    // halves have drained their MTE3 stores, and the consumer invalidates the
+    // counter before loading that tile. This permits WY Vector work to overlap
+    // H Cube work without a full MIX rendezvous. Group1 still materializes the
+    // public U boundary and keeps the stage synchronization.
+#if defined(MEGA_CHUNK_GDN_ASYNC_WY_H) && defined(PTO_NPU_ARCH_A2A3)
+    if (use_async_wy_h) {
+        ReleaseWyHBlock(
+            reinterpret_cast<__gm__ int32_t *>(wy_h_free_ptr));
+    } else {
+        GDN_STAGE_SYNC();
     }
-    constexpr uint64_t H_O_READY_STRIDE_BYTES =
-        16u * static_cast<uint64_t>(sizeof(int32_t));
-    const uint64_t h_o_ready_bytes =
-        batch_size > 0 && H > 0
-            ? static_cast<uint64_t>(batch_size) *
-                  static_cast<uint64_t>(H) * H_O_READY_STRIDE_BYTES
-            : 0u;
-    // Variant16's regular O path starts its ping QK mailbox in the second
-    // KKT tile. The first tile is dead after WY and can hold the ready lines.
-    const uint64_t h_o_ready_capacity_bytes =
-        static_cast<uint64_t>(get_block_num()) * C * C * sizeof(ComputeT);
-    const bool use_h_o_pipeline =
-        EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
-        h_o_sequences_valid && h_o_chunk_count >= 4 &&
-        scanned_h_o_chunks == static_cast<uint64_t>(h_o_chunk_count) &&
-        num_matrices == expected_h_o_matrices &&
-        h_o_ready_bytes <= h_o_ready_capacity_bytes;
 #else
-    // Keep the validated A5 full MIX barrier unless an A5-only candidate
-    // explicitly enables the per-chunk H/O readiness protocol.
-    constexpr bool use_h_o_pipeline = false;
-#endif
-#else
-    const bool use_h_o_pipeline =
-        EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
-        cu_seqlens_ptr != nullptr && h_o_chunk_count >= 4 &&
-        h_o_chunk_count <= 64 &&
-        num_matrices == expected_h_o_matrices;
-#endif
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
-    const bool precompute_qs = use_h_o_pipeline || reuse_group_qk;
-#endif
-#if defined(__DAV_C220_VEC__)
-    if (use_h_o_pipeline && get_subblockid() == 0) {
-        constexpr int64_t H_O_READY_STRIDE = 16;
-        AscendC::GlobalTensor<int32_t> h_o_ready_gm;
-        h_o_ready_gm.SetGlobalBuffer(
-            reinterpret_cast<__gm__ int32_t *>(kkt_ws_ptr));
-        const int64_t cid = static_cast<int64_t>(get_block_idx());
-        const int64_t block_num = static_cast<int64_t>(get_block_num());
-        const int64_t ready_count = batch_size * static_cast<int64_t>(H);
-        for (int64_t ready_idx = cid; ready_idx < ready_count;
-             ready_idx += block_num) {
-            const int64_t ready_offset = ready_idx * H_O_READY_STRIDE;
-            h_o_ready_gm.SetValue(ready_offset, 0);
-            __asm__ __volatile__("");
-            AscendC::DataCacheCleanAndInvalid<
-                int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
-                AscendC::DcciDst::CACHELINE_ALL>(
-                h_o_ready_gm[ready_offset]);
-            __asm__ __volatile__("");
-        }
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-        // The zero generation belongs to this launch. Flush it before the
-        // following full MIX rendezvous releases H on graph replay.
-        dsb(DSB_DDR);
-#endif
-    }
-#endif
     GDN_STAGE_SYNC();
+#endif
 
-    mk_h::chunk_h_kernel<D, C, StoreFinalStateCache,
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    if (use_resident_h_o) {
+        // A_inv is dead after KKT/Solve/WY. Reuse it as a dense
+        // [chunk, key_head, C, C] raw-QK cache so all value heads in a GQA
+        // group consume one Q@K result without increasing workspace size.
+        mk_h::ResidentHoPrecomputeGroupQk<D, C>(
+            reinterpret_cast<__gm__ ComputeT *>(q_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr), total_tokens,
+            static_cast<int32_t>(num_key_heads));
+        GDN_STAGE_SYNC();
+    }
+#endif
+
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    if (use_resident_h_o) {
+        mk_h::GDN_CHUNK_H_CALL<D, C, StoreFinalStateCache,
+                             LoadInitialStateCache, true,
+                             FuseGatedRmsNorm>(
+            reinterpret_cast<__gm__ ComputeT *>(q_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(u_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(s_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_new_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(fs_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(h0_ptr), has_initial_state, 1,
+            reinterpret_cast<__gm__ ComputeT *>(h_ws_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
+            seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
+            use_h_o_pipeline ? 1u : 0u,
+            reinterpret_cast<__gm__ int32_t *>(h_o_ready_ptr), ffts_addr,
+            reinterpret_cast<__gm__ float *>(initial_state_cache_ptr),
+            reinterpret_cast<__gm__ int32_t *>(initial_state_indices_ptr),
+            reinterpret_cast<__gm__ float *>(final_state_cache_ptr),
+            reinterpret_cast<__gm__ int32_t *>(state_indices_ptr),
+            state_index_stride, state_cache_slots,
+            use_fused_wy_h,
+            use_fused_wy_h_public_u,
+            reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+            reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+            solve_wy_workspace_slots, kkt_solve_group_size,
+            reinterpret_cast<__gm__ float *>(msk_full_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_qs_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_gated_ptr),
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(o_ptr),
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(z_ptr),
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(norm_weight_ptr));
+    } else
+#endif
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    {
+    mk_h::GDN_CHUNK_H_CALL<D, C, StoreFinalStateCache,
+                         LoadInitialStateCache, false, false>(
+#else
+    mk_h::GDN_CHUNK_H_CALL<D, C, StoreFinalStateCache,
                          LoadInitialStateCache>(
+#endif
         reinterpret_cast<__gm__ ComputeT *>(q_ptr),
         reinterpret_cast<__gm__ ComputeT *>(k_ptr),
         reinterpret_cast<__gm__ ComputeT *>(w_ptr),
@@ -1104,42 +1583,41 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ ComputeT *>(h_ws_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size,
         seq_len, total_tokens, static_cast<uint32_t>(H), num_key_heads,
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
-        precompute_qs ? 1u : 0u,
-#else
         use_h_o_pipeline ? 1u : 0u,
-#endif
-        reinterpret_cast<__gm__ int32_t *>(kkt_ws_ptr), ffts_addr,
+        reinterpret_cast<__gm__ int32_t *>(h_o_ready_ptr), ffts_addr,
         reinterpret_cast<__gm__ float *>(initial_state_cache_ptr),
         reinterpret_cast<__gm__ int32_t *>(initial_state_indices_ptr),
         reinterpret_cast<__gm__ float *>(final_state_cache_ptr),
         reinterpret_cast<__gm__ int32_t *>(state_indices_ptr),
-        state_index_stride, state_cache_slots);
+        state_index_stride, state_cache_slots, use_fused_wy_h,
+        use_fused_wy_h_public_u,
+        reinterpret_cast<__gm__ ComputeT *>(v_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+        reinterpret_cast<__gm__ int32_t *>(solve_wy_ready_ptr),
+        solve_wy_workspace_slots, kkt_solve_group_size
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+        ,
+        reinterpret_cast<__gm__ float *>(msk_full_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(o_ws_qk_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(o_ws_qs_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(o_ws_gated_ptr),
+        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(o_ptr),
+        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(z_ptr),
+        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(norm_weight_ptr)
+#endif
+        );
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    }
+#endif
 
-    if (use_h_o_pipeline && EnableHoOverlap) {
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-        // H and O reuse event IDs 0..7. A local 1-AIC/2-AIV rendezvous closes
-        // every H event before this physical MIX block enters O, without
-        // waiting for other physical blocks that are still executing H.
-        constexpr uint16_t H_O_LOCAL_BARRIER_EVENT = 8;
-        static_assert(H_O_LOCAL_BARRIER_EVENT <= 10,
-                      "A5 H/O local barrier must fit event IDs 0..10");
-        constexpr uint16_t H_O_LOCAL_BARRIER_CONFIG =
-            static_cast<uint16_t>(
-                1u | (2u << SYNC_MODE_SHIFT_VALUE) |
-                (H_O_LOCAL_BARRIER_EVENT << SYNC_FLAG_SHIFT_VALUE));
-#if defined(GDN_A5_CUBE_KERNEL)
-        gdn_sync::Wait<PIPE_MTE2>(H_O_LOCAL_BARRIER_EVENT);
-        gdn_sync::Signal<PIPE_FIX>(H_O_LOCAL_BARRIER_CONFIG);
-#elif defined(GDN_A5_VECTOR_KERNEL)
-        gdn_sync::Signal<PIPE_MTE3>(H_O_LOCAL_BARRIER_CONFIG);
-        gdn_sync::Wait<PIPE_MTE2>(H_O_LOCAL_BARRIER_EVENT);
-#endif
-#else
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    if (use_resident_h_o) {
         pipe_barrier(PIPE_ALL);
+    } else
 #endif
+    if (use_h_o_pipeline && EnableHoOverlap) {
+        pipe_barrier(PIPE_ALL);
     } else {
 #if defined(__DAV_C220_VEC__)
         // O consumes H's GM state/workspace. Cross-core rendezvous alone does
@@ -1151,34 +1629,45 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         GDN_STAGE_SYNC();
     }
 
-    mk_o::GDN_CHUNK_O_CALL<D, C, FuseGatedRmsNorm>(
-        reinterpret_cast<__gm__ ComputeT *>(q_ptr), reinterpret_cast<__gm__ ComputeT *>(k_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(v_new_ptr), reinterpret_cast<__gm__ ComputeT *>(s_ptr),
-        reinterpret_cast<__gm__ float *>(g_t_ptr),
-        reinterpret_cast<__gm__ float *>(msk_full_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(o_ws_qk_ptr), reinterpret_cast<__gm__ ComputeT *>(o_ws_qs_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(o_ws_gated_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
-        reuse_group_qk ? 1u : 0u,
-        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(o_ptr),
-        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len, total_tokens,
-        static_cast<uint32_t>(H), num_key_heads,
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
-        precompute_qs ? 1u : 0u,
-#else
-        use_h_o_pipeline ? 1u : 0u,
+#ifdef MEGA_STOP_BEFORE_O
+    pipe_barrier(PIPE_ALL);
+    return;
 #endif
-        reinterpret_cast<__gm__ int32_t *>(kkt_ws_ptr), ffts_addr,
-        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(z_ptr),
-        reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(norm_weight_ptr));
+
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    if (!use_resident_h_o) {
+#endif
+        mk_o::GDN_CHUNK_O_CALL<D, C, FuseGatedRmsNorm>(
+            reinterpret_cast<__gm__ ComputeT *>(q_ptr), reinterpret_cast<__gm__ ComputeT *>(k_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(v_new_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(s_ptr),
+            reinterpret_cast<__gm__ float *>(g_t_ptr),
+            reinterpret_cast<__gm__ float *>(msk_full_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_qk_ptr), reinterpret_cast<__gm__ ComputeT *>(o_ws_qs_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_gated_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_ping_qk_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_ping_qs_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(o_ws_ping_gated_ptr),
+            reuse_group_qk ? 1u : 0u,
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(o_ptr),
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len, total_tokens,
+            static_cast<uint32_t>(H), num_key_heads,
+            use_h_o_pipeline ? 1u : 0u,
+            reinterpret_cast<__gm__ int32_t *>(h_o_ready_ptr), ffts_addr,
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(z_ptr),
+            reinterpret_cast<__gm__ GDN_PUBLIC_DTYPE *>(norm_weight_ptr));
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+    }
+#endif
 
 #undef GDN_STAGE_SYNC
 
 #if defined(__DAV_C220_CUBE__)
-    if (get_block_idx() < num_matrices) {
+    if (
+#ifdef MEGA_CHUNK_GDN_RESIDENT_HO
+        !use_resident_h_o &&
+#endif
+        get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
         wait_flag_dev(3);
     }
@@ -1187,6 +1676,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
 #undef GDN_WY_FAST_CALL
 #undef GDN_CHUNK_O_CALL
+#undef GDN_CHUNK_H_CALL
 
 #if defined(GDN_A5_KERNEL)
 #undef ffts_cross_core_sync
@@ -1234,6 +1724,14 @@ GDN_KERNEL_NAME(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr, GM_ADDR g_in_ptr, G
                        4 * (tile_bytes + GDN_H_WORKSPACE_PAD_BYTES);
     GM_ADDR o_ws_qs_ptr = o_ws_qk_ptr + static_cast<uint64_t>(tiling_data.block_dim) * tile_bytes;
     GM_ADDR o_ws_gated_ptr = o_ws_qs_ptr + static_cast<uint64_t>(tiling_data.block_dim) * tile_bytes;
+    GM_ADDR o_ws_ping_qk_ptr =
+        o_ws_gated_ptr + static_cast<uint64_t>(tiling_data.block_dim) * tile_bytes;
+    GM_ADDR o_ws_ping_qs_ptr =
+        o_ws_ping_qk_ptr +
+        static_cast<uint64_t>(tiling_data.block_dim) * 2 * tile_bytes;
+    GM_ADDR o_ws_ping_gated_ptr =
+        o_ws_ping_qs_ptr +
+        static_cast<uint64_t>(tiling_data.block_dim) * tile_bytes;
     if (tiling_data.num_heads == 0 || tiling_data.num_heads > GDN_MAX_HEADS) {
         return;
     }
@@ -1241,7 +1739,12 @@ GDN_KERNEL_NAME(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr, GM_ADDR g_in_ptr, G
     mega_kernel_impl<false, false>(q_ptr, k_ptr, v_ptr, g_in_ptr, beta_ptr, msk_lower_ptr, msk_full_ptr, minus_id_ptr,
                      cu_seqlens_ptr, o_ptr, g_sum_ptr, g_t_ptr, beta_t_ptr, A_ptr, A_inv_f32_ptr, A_inv_ptr, w_ptr,
                      u_ptr, s_ptr, v_new_ptr, fs_ptr, initial_state_ptr, tiling_data.has_initial_state, kkt_ws_ptr,
-                     wy_ws_a1_ptr, wy_ws_a2_ptr, h_ws_ptr, o_ws_qk_ptr, o_ws_qs_ptr, o_ws_gated_ptr,
+                     wy_ws_a1_ptr, wy_ws_a2_ptr, nullptr, 1, nullptr,
+                     kkt_ws_ptr,
+                     h_ws_ptr,
+                     o_ws_qk_ptr, o_ws_qs_ptr, o_ws_gated_ptr,
+                     o_ws_ping_qk_ptr, o_ws_ping_qs_ptr,
+                     o_ws_ping_gated_ptr,
                      static_cast<int32_t>(tiling_data.num_heads), tiling_data.num_key_heads, tiling_data.batch_size,
                      tiling_data.seq_len, tiling_data.total_tokens, tiling_data.num_matrices, tiling_data.ffts_addr,
                      nullptr, nullptr, nullptr, nullptr, 1,
