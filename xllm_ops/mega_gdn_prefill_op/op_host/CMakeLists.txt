@@ -40,19 +40,12 @@ add_ops_compile_options(
 )
 set(MEGA_GDN_PREFILL_A5_VARIANT_OPTIONS)
 if("ascend950" IN_LIST ASCEND_COMPUTE_UNIT)
-    # The validated R07 preset is the A5 default; other architectures do not
-    # receive these compile options. Explicit environment values allow ablation.
-    set(MEGA_GDN_PREFILL_A5_VARIANT 84)
-    if(DEFINED ENV{MEGA_GDN_PREFILL_A5_VARIANT})
-        set(MEGA_GDN_PREFILL_A5_VARIANT "$ENV{MEGA_GDN_PREFILL_A5_VARIANT}")
-    endif()
-    if(NOT MEGA_GDN_PREFILL_A5_VARIANT MATCHES "^[0-9]+$")
+    # Retired experiment IDs must fail rather than silently use another kernel.
+    if(DEFINED ENV{MEGA_GDN_PREFILL_A5_VARIANT} AND
+       NOT "$ENV{MEGA_GDN_PREFILL_A5_VARIANT}" STREQUAL "84")
         message(FATAL_ERROR
-            "MEGA_GDN_PREFILL_A5_VARIANT must be a non-negative integer; got "
-            "${MEGA_GDN_PREFILL_A5_VARIANT}")
+            "Historical MEGA_GDN_PREFILL_A5_VARIANT values are retired; use 84 or unset it.")
     endif()
-    list(APPEND MEGA_GDN_PREFILL_A5_VARIANT_OPTIONS
-        "-DMEGA_GDN_A5_SOLVE_VARIANT=${MEGA_GDN_PREFILL_A5_VARIANT}")
 endif()
 if("ascend950" IN_LIST ASCEND_COMPUTE_UNIT AND
    (NOT DEFINED ENV{MEGA_GDN_PREFILL_SOLVE_PAIR_PIPELINE} OR
