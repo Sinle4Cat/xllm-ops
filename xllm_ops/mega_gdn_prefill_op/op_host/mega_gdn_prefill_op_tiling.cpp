@@ -256,12 +256,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     const uint32_t block_dim = aic_core_count;
-    // A5 schedules one vector sub-block per mixed block. A2/A3 exposes both
-    // vector siblings, so its schedulable task count is the physical AIV count.
-    const uint32_t vector_task_count =
-        arch_policy.target == GdnTargetArch::A5
-            ? std::min(aiv_core_count, aic_core_count)
-            : aiv_core_count;
+    // Both A5 vector siblings participate in the isolated Ascend950 backend.
+    // Match its flattened task IDs; the A2/A3 task count remains unchanged.
+    const uint32_t vector_task_count = aiv_core_count;
     if (vector_task_count == 0) {
         return ge::GRAPH_FAILED;
     }

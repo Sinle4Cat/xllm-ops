@@ -1,3 +1,7 @@
+// Ascend950 backend is isolated from the upstream A2/A3 pipeline.
+#if defined(GDN_PREFILL_TARGET_A5)
+#include "arch35/mega_gdn_prefill_op.cpp"
+#else
 // Qwen3.5 prefill Conv-to-gated-RMSNorm single-launch PTO kernel.
 
 #include "gdn_prefill_arch.h"
@@ -347,3 +351,4 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
 }
 
 #undef GDN_PREFILL_COMPUTE_DTYPE
+#endif // Ascend950 backend

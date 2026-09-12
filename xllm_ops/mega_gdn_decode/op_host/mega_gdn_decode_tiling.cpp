@@ -15,6 +15,9 @@ constexpr int64_t kMaxNumCacheSlots = 1024;
 constexpr int64_t kMaxBatchSize = 32;
 constexpr size_t kFlaSsmStateLayoutAttr = 0;
 constexpr uint64_t kNonFlaTilingKeyOffset = 10;
+constexpr uint64_t kA5B4DeferredNormTilingKey = 101;
+constexpr uint64_t kA5B4RegBaseTilingKey = 102;
+constexpr uint64_t kA5B4RegBase2BTilingKey = 103;
 
 bool IsSupportedShape(int64_t numKHeads, int64_t numVHeads)
 {
@@ -119,12 +122,6 @@ static ge::graphStatus MegaGdnDecodeTiling(gert::TilingContext* context)
     if (flaSsmStateLayout == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    uint64_t tilingKey = batchSize == 1 ? 2 : 1;
-    if (!*flaSsmStateLayout) {
-        tilingKey += kNonFlaTilingKeyOffset;
-    }
-    context->SetTilingKey(tilingKey);
-
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aicCoreNum = platform.GetCoreNumAic();
     const uint32_t aivCoreNum = platform.GetCoreNumAiv();
@@ -132,6 +129,33 @@ static ge::graphStatus MegaGdnDecodeTiling(gert::TilingContext* context)
         platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     const uint32_t headCount =
         static_cast<uint32_t>(batchSize * numVHeads);
+    const bool useA5B4DeferredNorm =
+        *flaSsmStateLayout && isAscend950 && batchSize == 4 &&
+        numVHeads == 3 * numKHeads && headCount > aivCoreNum &&
+        headCount <= 4 * aivCoreNum;
+    // Keep the row-streaming RegBase experiment limited to the local 27B
+    // TP1/TP2 head shapes.  Other A5 B4 ratio-3 shapes retain the proven
+    // deferred-Norm implementation, and A2/A3 never select either A5 key.
+    const bool useA5B4RegBase =
+        useA5B4DeferredNorm &&
+        ((numKHeads == 16 && numVHeads == 48) ||
+         (numKHeads == 8 && numVHeads == 24));
+    const bool useA5B4RegBase2B =
+        *flaSsmStateLayout && isAscend950 && batchSize == 4 &&
+        numKHeads == 16 && numVHeads == 16 && headCount > aivCoreNum &&
+        headCount <= 4 * aivCoreNum;
+    uint64_t tilingKey = useA5B4RegBase2B
+        ? kA5B4RegBase2BTilingKey
+        : (useA5B4RegBase
+               ? kA5B4RegBaseTilingKey
+               : (useA5B4DeferredNorm
+                      ? kA5B4DeferredNormTilingKey
+                      : (batchSize == 1 ? 2 : 1)));
+    if (!*flaSsmStateLayout) {
+        tilingKey += kNonFlaTilingKeyOffset;
+    }
+    context->SetTilingKey(tilingKey);
+
     const uint32_t convTaskCount = static_cast<uint32_t>(convTileCount);
     const uint32_t taskCount = batchSize == 1 && !isAscend950
         ? std::max((convTaskCount + 1) / 2, headCount)
