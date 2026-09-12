@@ -15,12 +15,14 @@ template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
           bool UseDeferredNorm,
           bool UseTwoOwnerQkGroups = false,
-          bool FlaSsmStateLayout = true>
+          bool FlaSsmStateLayout = true,
+          bool UseRegBase = false>
 #else
 template <int32_t SpeculativeTokens,
           bool UseQkGroupCache,
           bool UseDeferredNorm,
-          bool FlaSsmStateLayout = true>
+          bool FlaSsmStateLayout = true,
+          bool UseRegBase = false>
 #endif
 AICORE PTO_INLINE void RunMegaGdnMtpDecode(
     GM_ADDR qkv,
@@ -50,13 +52,15 @@ AICORE PTO_INLINE void RunMegaGdnMtpDecode(
       UseQkGroupCache,
       UseDeferredNorm,
       UseTwoOwnerQkGroups,
-      FlaSsmStateLayout>(
+      FlaSsmStateLayout,
+      UseRegBase>(
 #else
   mega_gdn_mtp_decode_pto::Run<
       SpeculativeTokens,
       UseQkGroupCache,
       UseDeferredNorm,
-      FlaSsmStateLayout>(
+      FlaSsmStateLayout,
+      UseRegBase>(
 #endif
       reinterpret_cast<__gm__ bfloat16_t*>(qkv),
       reinterpret_cast<__gm__ bfloat16_t*>(z),
@@ -116,20 +120,23 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
     USE_QK_GROUP_CACHE,                                                      \
     USE_DEFERRED_NORM,                                                       \
     USE_TWO_OWNER_QK_GROUPS,                                                 \
-    FLA_SSM_STATE_LAYOUT)                                                    \
+    FLA_SSM_STATE_LAYOUT,                                                    \
+    USE_REGBASE)                                                             \
   RunMegaGdnMtpDecode<                                                      \
       K,                                                                    \
       USE_QK_GROUP_CACHE,                                                   \
       USE_DEFERRED_NORM,                                                    \
       USE_TWO_OWNER_QK_GROUPS,                                              \
-      FLA_SSM_STATE_LAYOUT>
+      FLA_SSM_STATE_LAYOUT,                                                 \
+      USE_REGBASE>
 #else
 #define RUN_MTP_IMPL(                                                       \
     K,                                                                       \
     USE_QK_GROUP_CACHE,                                                      \
     USE_DEFERRED_NORM,                                                       \
     USE_TWO_OWNER_QK_GROUPS,                                                 \
-    FLA_SSM_STATE_LAYOUT)                                                    \
+    FLA_SSM_STATE_LAYOUT,                                                    \
+    USE_REGBASE)                                                             \
   RunMegaGdnMtpDecode<                                                      \
       K,                                                                    \
       USE_QK_GROUP_CACHE,                                                   \
@@ -143,12 +150,28 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
     USE_DEFERRED_NORM,                                                       \
     USE_TWO_OWNER_QK_GROUPS,                                                 \
     FLA_SSM_STATE_LAYOUT)                                                    \
+  RUN_MTP_WITH_REGBASE(                                                     \
+      K,                                                                    \
+      USE_QK_GROUP_CACHE,                                                   \
+      USE_DEFERRED_NORM,                                                    \
+      USE_TWO_OWNER_QK_GROUPS,                                              \
+      FLA_SSM_STATE_LAYOUT,                                                 \
+      false)
+
+#define RUN_MTP_WITH_REGBASE(                                               \
+    K,                                                                       \
+    USE_QK_GROUP_CACHE,                                                      \
+    USE_DEFERRED_NORM,                                                       \
+    USE_TWO_OWNER_QK_GROUPS,                                                 \
+    FLA_SSM_STATE_LAYOUT,                                                    \
+    USE_REGBASE)                                                             \
   RUN_MTP_IMPL(                                                             \
       K,                                                                    \
       USE_QK_GROUP_CACHE,                                                   \
       USE_DEFERRED_NORM,                                                    \
       USE_TWO_OWNER_QK_GROUPS,                                              \
-      FLA_SSM_STATE_LAYOUT)(                                                \
+      FLA_SSM_STATE_LAYOUT,                                                 \
+      USE_REGBASE)(                                                         \
       qkv,                                                                   \
       z,                                                                     \
       b,                                                                     \
@@ -188,6 +211,14 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
 #if defined(PTO_NPU_ARCH_A5)
   } else if constexpr (TILING_KEY_IS(308)) {
     RUN_MTP(8, true, true, true, true);
+  } else if constexpr (TILING_KEY_IS(303)) {
+    RUN_MTP(3, true, true, true, true);
+  } else if constexpr (TILING_KEY_IS(203)) {
+    RUN_MTP(3, false, true, false, true);
+  } else if constexpr (TILING_KEY_IS(403)) {
+    RUN_MTP_WITH_REGBASE(3, false, true, false, true, true);
+  } else if constexpr (TILING_KEY_IS(503)) {
+    RUN_MTP_WITH_REGBASE(3, true, true, true, true, true);
 #endif
   } else if constexpr (TILING_KEY_IS(210)) {
     RUN_MTP(10, false, true, false, true);
@@ -221,6 +252,7 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode(
     RUN_MTP(0, false, false, false, false);
   }
 #undef RUN_MTP
+#undef RUN_MTP_WITH_REGBASE
 #undef RUN_MTP_IMPL
 }
 
