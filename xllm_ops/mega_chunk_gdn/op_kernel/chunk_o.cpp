@@ -1397,6 +1397,9 @@ AICORE inline void PublishGatedQKTile(
         PIPE_MTE3,
         1 | (2 << 4) | (own_ready_flag << 8));
   }
+  // QKHalfUbAddr is reused by the next QK or Z load on MTE2.
+  set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+  wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
 #endif
 }
 
