@@ -639,28 +639,13 @@ AICORE void GDN_WY_FAST_KERNEL(
 #endif
             if (live_rows > 0) {
               const int64_t a_offset =
-#ifdef MEGA_CHUNK_GDN_A5_SOLVE_WY_PACKED_HANDOFF
-                  a_head_major
-                      ? (static_cast<int64_t>(head_idx) * total_tokens +
-                         token_start + tile_row) * ChunkSize
-                      : ((token_start + tile_row) *
-                             static_cast<int64_t>(H) +
-                         head_idx) * ChunkSize;
-              const int32_t a_row_stride =
-                  a_head_major ? ChunkSize : H * ChunkSize;
-#else
                   ((token_start + tile_row) * static_cast<int64_t>(H) +
                    head_idx) * ChunkSize;
               constexpr int32_t a_row_stride = 0;
               (void)a_head_major;
-#endif
               GmShape2D a_shape(live_rows, ChunkSize);
               GmStride2D a_stride(
-#ifdef MEGA_CHUNK_GDN_A5_SOLVE_WY_PACKED_HANDOFF
-                  a_row_stride
-#else
                   H * ChunkSize
-#endif
               );
               GmTensor2D<ComputeT> a_global(A_handle + a_offset, a_shape,
                                         a_stride);
