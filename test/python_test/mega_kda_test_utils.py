@@ -5,6 +5,11 @@ import math
 import torch
 
 
+# Per-rank shapes for GLM-5.3-Flash, not a distributed communication test.
+GLM_KDA_HEADS = 64
+TP_SIZES = (1, 2, 4, 8, 16, 32, 64)
+
+
 def bitwise_equal(actual, expected):
     return (actual.shape == expected.shape and actual.dtype == expected.dtype
             and torch.equal(actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8),

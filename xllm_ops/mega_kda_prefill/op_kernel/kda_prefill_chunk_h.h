@@ -547,6 +547,9 @@ AICORE void chunk_h_kda_kernel(__gm__ bfloat16_t *K_handle, __gm__ float *W_hand
         TSTORE(s_out_global, s_out_store);
       }
 
+      // GCS_UB aliases the preceding chunk's KV operand. Return it only after
+      // the state TADD has consumed KV; the S store orders MTE3, not MTE2.
+      SetWaitFlag<PIPE_V, PIPE_MTE2>(0);
       // Load head-major K (BF16), g_cs (FP32), and g_total.
       int64_t hk_base =
           static_cast<int64_t>(head) * total_tokens * K_DIM +

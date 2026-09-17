@@ -107,10 +107,19 @@ Graph replays. The provisional operator smoke gate splits at `abs(golden)=1e-3`:
 normal relative tolerance is 1%, near-zero absolute tolerance is `1e-5`, and
 each category's exceeding fraction must be <= 0.1%. This is not an all-elements
 1% guarantee or a production model accuracy criterion. Common 1k through 32k
-tests also check 20 fixed-input bitwise-identical Graph replays per shape.
+tests also check 20 fixed-input bitwise-identical Graph replays per shape;
+TP1 at 2k uses 1000 replays to cover delayed chunk-state buffer reuse failures.
+Every replay compares output, Conv state and SSM state separately.
 Bitwise checks compare raw bytes, including signed zero. Output and golden must
 have identical shapes/dtypes; nonfinite outputs, golden values or derived errors
 always fail. CPU regression coverage is in `test_mega_kda_accuracy_checks.py`.
+
+TP shape coverage uses the model's 64 KDA heads: TP1/2/4/8/16/32/64 map to
+local H=64/32/16/8/4/2/1. Each TP is crossed with all six common lengths,
+tail/empty-sequence cases with and without Conv bias, and fixed100/carry100
+Graph replay. CPU oracle and Host policy checks cover the same head counts.
+These are single-device per-rank shape tests, not distributed TP or HCCL tests.
+Select the TP matrix with `pytest -k tp` (or one size with `-k tp8`).
 
 One mixed Device entry does not imply one total runtime task. In torch_npu 2.9,
 NPUGraph replay updates the RNG seed and offset with two Fill kernels before

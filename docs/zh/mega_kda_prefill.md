@@ -34,9 +34,18 @@ CPU golden 使用 FP64 递推和明确的 BF16 舍入边界，正常值相对误
 当前单算子 smoke 门槛：以 `abs(golden)=1e-3` 分组，正常值相对误差阈值
 为 1%，近零值绝对误差阈值为 `1e-5`，两类超限比例各不超过 0.1%。这不等于
 所有元素误差均小于 1%，也不代表模型精度验收。1k 至 32k 各档另检验 20 轮
-固定输入图回放的逐比特一致性，按原始字节比较，区分正零与负零。
+固定输入图回放的逐比特一致性；TP1、2k 加强到 1000 轮，以覆盖 chunk 状态
+缓冲区复用引起的延迟错误。每轮分别检查输出、Conv state 和 SSM state，
+按原始字节比较，区分正零与负零。
 输出和 golden 必须同 shape、同 dtype；输出、golden 或派生误差出现 NaN/Inf
 一律失败。CPU 漏洞回归见 `test_mega_kda_accuracy_checks.py`。
+
+TP shape 测试按模型的 64 个 KDA heads 设置：TP1/2/4/8/16/32/64 对应
+每卡 H=64/32/16/8/4/2/1。每档交叉覆盖 1k 至 32k、带/不带 Conv bias 的
+尾块与空序列，以及 fixed100/carry100 图回放；CPU golden 和 Host policy
+也覆盖这 7 档 head 数。可用 `pytest -k tp` 选择矩阵，`-k tp8` 选择单档。
+这是单卡执行的分片 shape 验证，不是多卡 TP/HCCL 或整网验收。
+
 torch_npu 2.9 的 NPUGraph 每次回放前使用
 两个 Fill 核更新 RNG seed 和 offset；它们属于框架回放开销，不是本算子的
 workspace 或状态初始化，算子中不包含这类 Fill 实现。纯 kernel 耗时应单列，

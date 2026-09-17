@@ -19,7 +19,9 @@ PTO Device 入口、CMake 构建和 ACLNN/Python 测试绑定。尚未接入 xLL
 ## 支持范围
 
 目前仅注册 Ascend 910B。BF16 输入、FP32 `[slots,H,V,K]` SSM，D=128，
-H=1..128，MTP capacity=1..16。普通 decode 的 Conv history 长度为 3，
+H=1..128，MTP query capacity=1..17。模型 MTP=K 表示 K 个草稿 token，
+验证时还包含当前 token，因此 capacity=K+1；模型 MTP1..16 对应 capacity2..17。
+capacity=1 仍支持单 token MTP verify。普通 decode 的 Conv history 长度为 3，
 MTP 为 capacity+2。Conv 权重按 MegaGDN 的 `[4,C]` 布局预打包，不能逐次转置。
 
 与 `MegaKdaPrefill` 不同，decode 的 beta 是 sigmoid 前的 BF16 投影，sigmoid
@@ -28,7 +30,9 @@ MTP 为 capacity+2。Conv 权重按 MegaGDN 的 `[4,C]` 布局预打包，不能
 
 数学边界保留 SiLU Conv、BF16 Conv 输出舍入、Q/K L2 norm、KDA 向量 gate、
 sigmoid beta 与逐 token FP32 状态更新，不复用 GDN 的标量 decay 公式。
-每个 task 负责 16 行 V，使用 AIV 与 33,536 字节显式 UB，无用户 workspace。
+每个 task 负责 32 行 V，使用 AIV 与 62,368 字节显式 UB，无用户 workspace。
+V 行分片只改变任务粒度，不改变数学计算或状态契约；不代表所有 batch、head 数
+和 MTP capacity 均已获得性能收益。
 
 ## 验证边界
 
@@ -47,5 +51,13 @@ NaN/Inf 一律失败。按 `abs(golden)=1e-3` 分组报告正常值相对误差�
 编译成功、CPU golden 自检成功都不等于原生算子精度通过。仍需完成真实 ACLNN/Graph
 状态保持验证、冻结 Triton 基线对齐、预热收敛和正式性能验收，之后才能打开模型路由。
 目前不声明超过 Triton 20%，也不声明整网精度通过。
+
+TP 矩阵按 64 个 KDA heads 切分，覆盖 TP1/2/4/8/16/32/64，对应每卡
+H=64/32/16/8/4/2/1。每档交叉普通 decode 与全部整数 query capacity1..17，
+覆盖模型 MTP1..16，包含 CPU
+golden、dense fixed20 图回放、动态元数据 replay20 和独立状态 carry20。
+原 batch/ragged/padding 用例保留，Host policy 也覆盖全部 head 数。
+可用 `pytest -k tp` 选择矩阵，`-k tp8` 选择单档；这只是单卡分片 shape
+测试，不代表多卡 TP 通信、模型显存容量或整网验证通过。
 
 完整参数、状态前置条件和复现命令见 [英文接口合同](../en/mega_kda_decode.md)。

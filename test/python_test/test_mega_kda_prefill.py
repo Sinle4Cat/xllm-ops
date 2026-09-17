@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from mega_kda_prefill_reference import OUTPUTS, make_case, reference
-from mega_kda_test_utils import bitwise_equal, error_metrics
+from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = pytest.mark.skipif(os.getenv("MEGA_KDA_PREFILL_TEST_NPU") is None,
@@ -30,6 +30,11 @@ int main() {
     assert(w.q == 0 && w.k > w.q && w.bytes % 512 == 0);
     assert(w.eye + 16384 * 4 == w.bytes);
     assert(w.wy_k - w.wy_a == t.blocks * 16384 * sizeof(float));
+    for (int tp : {1, 2, 4, 8, 16, 32, 64}) {
+        t.heads = 64 / tp;
+        assert(ValidTiling(t));
+    }
+    t.heads = 2;
     t.ffts_addr = 0; assert(!ValidTiling(t)); t.ffts_addr = 1;
     t.blocks = 33; assert(!ValidTiling(t)); t.blocks = 24;
     t.tokens = 0; assert(!ValidTiling(t));
@@ -98,6 +103,19 @@ def test_oracle_contract(lengths, bias):
     assert torch.equal(discarded[2], data["ssm_state_out"])
 
 
+@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
+def test_tp_reference_shape(tp):
+    heads = GLM_KDA_HEADS // tp
+    data = make_case((3, 0, 1), heads=heads, bias=True)
+    result = reference(data)
+    assert data["qkv"].shape == (4, heads * 384)
+    assert data["gate"].shape == (4, heads, 128)
+    for name, value in zip(OUTPUTS, result):
+        assert value.shape == data[name].shape and value.dtype == data[name].dtype
+        assert torch.isfinite(value).all(), name
+    assert result[2].shape[1:] == (heads, 128, 128)
+
+
 @pytest.mark.parametrize("invalid", ["offsets", "read", "write", "duplicate", "alias"])
 def test_invalid_metadata(invalid):
     data = make_case((2, 3), heads=1)
@@ -145,17 +163,19 @@ def check(data, actual, label, input_snapshots=None):
 
 
 @NATIVE
+@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
 @pytest.mark.parametrize("lengths", [(1,), (2, 0, 3), (127,), (128,), (129, 0, 3), (257, 5)])
 @pytest.mark.parametrize("bias", [False, True])
-def test_native_accuracy(lengths, bias):
-    data = make_case(lengths, heads=2, bias=bias)
+def test_native_accuracy(tp, lengths, bias):
+    heads = GLM_KDA_HEADS // tp
+    data = make_case(lengths, heads=heads, bias=bias)
     lib, actual = native_case(data)
     for _ in range(3): lib.mega_kda_prefill(**actual)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         lib.mega_kda_prefill(**actual)
     graph.replay()
-    check(data, actual, f"{lengths}/{bias}")
+    check(data, actual, f"TP={tp}/H={heads}/{lengths}/bias={bias}")
 
 
 @NATIVE
@@ -200,9 +220,11 @@ def test_native_dynamic_invalid_metadata():
 
 
 @NATIVE
+@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
 @pytest.mark.parametrize("tokens", [1024, 2048, 4096, 8192, 16384, 32768])
-def test_native_common_lengths(tokens):
-    data = make_case((tokens,), heads=4, bias=True)
+def test_native_common_lengths(tp, tokens):
+    heads = GLM_KDA_HEADS // tp
+    data = make_case((tokens,), heads=heads, bias=True)
     # Raise output magnitude so relative-error checks cover normal values too.
     data["qkv"].mul_(5)
     data["conv_weight"].mul_(2)
@@ -211,11 +233,15 @@ def test_native_common_lengths(tokens):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph): lib.mega_kda_prefill(**actual)
     graph.replay()
-    check(data, actual, f"T={tokens}/H=4")
+    check(data, actual, f"TP={tp}/T={tokens}/H={heads}")
     first = [actual[name].cpu() for name in OUTPUTS]
-    for _ in range(20):
+    # Long TP1 replay catches delayed corruption when chunk state UB is reused.
+    replays = 1000 if tp == 1 and tokens == 2048 else 20
+    for iteration in range(replays):
         graph.replay()
-        assert all(bitwise_equal(actual[name].cpu(), want) for name, want in zip(OUTPUTS, first))
+        matches = {name: bitwise_equal(actual[name].cpu(), want)
+                   for name, want in zip(OUTPUTS, first)}
+        assert all(matches.values()), (tp, tokens, iteration, matches)
 
 
 @NATIVE
@@ -245,9 +271,11 @@ def test_native_gate_range(gate_bias, beta):
 
 
 @NATIVE
+@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
 @pytest.mark.parametrize("carry", [False, True])
-def test_native_graph_100(carry):
-    data = make_case((3, 1), heads=1, bias=True)
+def test_native_graph_100(tp, carry):
+    heads = GLM_KDA_HEADS // tp
+    data = make_case((3, 1), heads=heads, bias=True)
     lib, actual = native_case(data)
     for _ in range(3): lib.mega_kda_prefill(**actual)
     graph = torch.npu.NPUGraph()
@@ -257,7 +285,7 @@ def test_native_graph_100(carry):
     for iteration in range(100):
         snapshots = {k: v.cpu() for k, v in actual.items() if isinstance(v, torch.Tensor) and k not in OUTPUTS}
         graph.replay()
-        expected = check(data, actual, f"carry={carry}/{iteration}", snapshots)
+        expected = check(data, actual, f"TP={tp}/H={heads}/carry={carry}/{iteration}", snapshots)
         current = [actual[name].cpu() for name in OUTPUTS]
         if not carry:
             if fixed is None: fixed = current

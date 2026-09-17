@@ -48,47 +48,53 @@ struct Args {
     __gm__ float* ssm_out;
 };
 
-// One task owns 16 contiguous V rows. Q/K/Conv are private to each task;
+constexpr int kVRows = 32;
+constexpr int kVShards = 128 / kVRows;
+
+// One task owns kVRows contiguous V rows. Q/K/Conv are private to each task;
 // only V-shard zero publishes Conv state, so no cross-core rendezvous is needed.
 struct Scratch {
-    TileND<float, 16, 128> state, expanded, product;
-    TileND<float, 16, 64> reduce_work;
+    TileND<float, kVRows, 128> state, expanded, product;
+    TileND<float, kVRows, 64> reduce_work;
     TileND<float, 1, 128> q, k, v, g, tmp, x, weight, acc;
     TileND<bfloat16_t, 1, 128> bf16;
     TileND<half, 1, 128> fp16;
-    TileND<float, 1, 16> reduced, delta, value;
-    Column<16> reduced_col, delta_col;
+    TileND<float, 1, kVRows> reduced, delta, value;
+    Column<kVRows> reduced_col, delta_col;
     Column<8, 1> norm_col;
     TileND<float, 1, 8, 1, 1> norm, beta_scalar;
     TileND<bfloat16_t, 1, 16, 1, 1> beta_bf16;
-    TileND<bfloat16_t, 1, 16> out;
+    TileND<bfloat16_t, 1, kVRows> out;
 
     AICORE inline void Init(int64_t vStart)
     {
+        constexpr int stateBytes = kVRows * 128 * sizeof(float);
+        constexpr int vectors = 3 * stateBytes + kVRows * 64 * sizeof(float);
+        constexpr int scalars = vectors + 4608 + 2 * kVRows * sizeof(float);
         TASSIGN(state, 0);
-        TASSIGN(expanded, 8192);
-        TASSIGN(product, 16384);
-        TASSIGN(reduce_work, 24576);
-        TASSIGN(q, 28672);
-        TASSIGN(k, 29184);
-        TASSIGN(v, 29696);
-        TASSIGN(value, 29696 + vStart * 4);
-        TASSIGN(g, 30208);
-        TASSIGN(tmp, 30720);
-        TASSIGN(x, 31232);
-        TASSIGN(weight, 31744);
-        TASSIGN(acc, 32256);
-        TASSIGN(bf16, 32768);
-        TASSIGN(fp16, 33024);
-        TASSIGN(reduced, 33280);
-        TASSIGN(reduced_col, 33280);
-        TASSIGN(delta, 33344);
-        TASSIGN(delta_col, 33344);
-        TASSIGN(norm, 33408);
-        TASSIGN(norm_col, 33408);
-        TASSIGN(beta_scalar, 33440);
-        TASSIGN(beta_bf16, 33472);
-        TASSIGN(out, 33504);
+        TASSIGN(expanded, stateBytes);
+        TASSIGN(product, 2 * stateBytes);
+        TASSIGN(reduce_work, 3 * stateBytes);
+        TASSIGN(q, vectors);
+        TASSIGN(k, vectors + 512);
+        TASSIGN(v, vectors + 1024);
+        TASSIGN(value, vectors + 1024 + vStart * 4);
+        TASSIGN(g, vectors + 1536);
+        TASSIGN(tmp, vectors + 2048);
+        TASSIGN(x, vectors + 2560);
+        TASSIGN(weight, vectors + 3072);
+        TASSIGN(acc, vectors + 3584);
+        TASSIGN(bf16, vectors + 4096);
+        TASSIGN(fp16, vectors + 4352);
+        TASSIGN(reduced, vectors + 4608);
+        TASSIGN(reduced_col, vectors + 4608);
+        TASSIGN(delta, vectors + 4608 + kVRows * 4);
+        TASSIGN(delta_col, vectors + 4608 + kVRows * 4);
+        TASSIGN(norm, scalars);
+        TASSIGN(norm_col, scalars);
+        TASSIGN(beta_scalar, scalars + 32);
+        TASSIGN(beta_bf16, scalars + 64);
+        TASSIGN(out, scalars + 96);
     }
 };
 
@@ -233,10 +239,10 @@ AICORE inline void Run(const Args& a, const TilingData& t)
     set_mask_norm();
     set_vector_mask(-1, -1);
     const int64_t channels = 384 * t.heads;
-    for (int64_t task = get_block_idx(); task < t.batch * t.heads * 8; task += get_block_num()) {
-        const int64_t batch = task / (t.heads * 8);
-        const int64_t head = task / 8 % t.heads;
-        const int64_t vStart = task % 8 * 16;
+    for (int64_t task = get_block_idx(); task < t.batch * t.heads * kVShards; task += get_block_num()) {
+        const int64_t batch = task / (t.heads * kVShards);
+        const int64_t head = task / kVShards % t.heads;
+        const int64_t vStart = task % kVShards * kVRows;
         const int64_t begin = a.offsets[batch], end = a.offsets[batch + 1];
         const int64_t count = end - begin;
         const int64_t accepted = Mtp ? a.accepted[batch] : 1;
@@ -262,7 +268,7 @@ AICORE inline void Run(const Args& a, const TilingData& t)
         }
         Scratch s;
         s.Init(vStart);
-        Load<float, 16, 128>(s.state, a.ssm_in + (ssmRead * t.heads + head) * 16384 + vStart * 128);
+        Load<float, kVRows, 128>(s.state, a.ssm_in + (ssmRead * t.heads + head) * 16384 + vStart * 128);
         for (int64_t token = begin; token < end; ++token) {
             Conv(s, a, t, convRead, token, begin, accepted - 1, head * 128, s.q);
             Conv(s, a, t, convRead, token, begin, accepted - 1, (t.heads + head) * 128, s.k);
@@ -270,9 +276,9 @@ AICORE inline void Run(const Args& a, const TilingData& t)
             Recurrent(s, a, t, token, head);
             const int64_t slot = a.ssm_write[batch * t.max_query_tokens + token - begin];
             if (slot >= 0) {
-                Store<float, 16, 128>(a.ssm_out + (slot * t.heads + head) * 16384 + vStart * 128, s.state);
+                Store<float, kVRows, 128>(a.ssm_out + (slot * t.heads + head) * 16384 + vStart * 128, s.state);
             }
-            Store<bfloat16_t, 1, 16>(a.output + (token * t.heads + head) * 128 + vStart, s.out);
+            Store<bfloat16_t, 1, kVRows>(a.output + (token * t.heads + head) * 128 + vStart, s.out);
         }
         if (vStart == 0 && convWrite >= 0) {
             // Width four: keep two accepted history tokens, then append raw QKV.

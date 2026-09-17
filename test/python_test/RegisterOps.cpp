@@ -2001,7 +2001,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_decode(
   TORCH_CHECK(qkv.device().type() == c10::DeviceType::PrivateUse1,
               "MegaKdaDecode requires NPU tensors");
   TORCH_CHECK((mode == 0 && max_query_tokens == 1 && !num_accepted_tokens) ||
-              (mode == 1 && max_query_tokens >= 1 && max_query_tokens <= 16 && num_accepted_tokens),
+              (mode == 1 && max_query_tokens >= 1 && max_query_tokens <= 17 && num_accepted_tokens),
               "invalid MegaKdaDecode mode/capacity/accepted-count combination");
   std::vector<at::Tensor> inputs = {
       qkv, gate, beta, a_log, gate_bias, conv_weight, conv_state_in,

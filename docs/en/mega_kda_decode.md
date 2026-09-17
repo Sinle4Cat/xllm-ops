@@ -26,7 +26,10 @@ within one launch are not supported.
 ## Tensor Contract
 
 All tensors must be contiguous ND, on the same NPU. `D=128`, `1 <= H <= 128`,
-`C=3*H*128`, `1 <= M <= 16`. B and N must be positive. M=1 for ordinary decode.
+`C=3*H*128`, `1 <= M <= 17`. B and N must be positive. M=1 for ordinary decode.
+Model MTP K denotes K speculative tokens plus the current token: M=K+1.
+Thus model MTP1 through MTP16 uses capacities 2 through 17. Capacity 1 remains
+supported for single-query MTP verification.
 Packed QKV order is all Q heads, all K heads, all V heads.
 
 | Parameter | Shape | Dtype |
@@ -94,8 +97,10 @@ honor each operator's contract when switching between phases.
   state slots and Conv tails are not initialized by the kernel. Preservation
   through the actual ACLNN/Graph call remains a required native test.
 
-The Device uses only AIV, zero user workspace and 33,536 bytes of explicitly
-assigned UB per task. Each task owns 16 V rows and processes a request serially.
+The Device uses only AIV, zero user workspace and 62,368 bytes of explicitly
+assigned UB per task. Each task owns 32 V rows and processes a request serially.
+The V-row split changes task granularity, not the arithmetic or state contract.
+It does not imply a speedup for every batch, head count or MTP capacity.
 Only its first V shard writes Conv state. The current implementation deliberately
 keeps private Conv/Q/K work per shard; it is not a tuned performance baseline.
 
@@ -133,5 +138,14 @@ gate is unchanged: output
 These smoke thresholds are not a formal model-accuracy or Triton-equivalence
 acceptance report. Fresh native-versus-frozen-Triton validation and baseline
 warmup-convergence qualification are still required before performance claims.
+
+The explicit TP matrix maps GLM's 64 KDA heads to local H=64/32/16/8/4/2/1
+for TP1/2/4/8/16/32/64. Every size covers ordinary decode and every integer
+MTP query capacity from 1 through 17 (model MTP1 through MTP16),
+with CPU oracle checks, dense fixed20 Graph replay, changed-metadata replay20
+and independent state carry20. Existing batch/ragged/padding cases remain.
+Host policy checks also cover all seven head counts. Select these cases with
+`pytest -k tp`, or a single size with `-k tp8`. They execute one rank's shape
+on one device; they do not validate distributed TP collectives or model memory.
 
 Only Ascend 910B is registered. No A3/A5 support or speedup is claimed.

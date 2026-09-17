@@ -13,7 +13,7 @@ def reference(data):
     mode, capacity = data["mode"], data["max_query_tokens"]
     accepted = data["num_accepted_tokens"]
     if not ((mode == 0 and capacity == 1 and accepted is None) or
-            (mode == 1 and 1 <= capacity <= 16 and accepted is not None)):
+            (mode == 1 and 1 <= capacity <= 17 and accepted is not None)):
         raise ValueError("invalid route")
     qkv = data["qkv"]
     heads = data["gate"].shape[1]

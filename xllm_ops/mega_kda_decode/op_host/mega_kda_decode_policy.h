@@ -27,7 +27,8 @@ inline uint64_t SelectKey(int64_t mode, bool hasAccepted, const TilingData& t)
             return 0;
         }
     }
-    if (t.max_query_tokens > 16 || t.heads > 128 ||
+    // MTP16 verifies the current token plus sixteen speculative tokens.
+    if (t.max_query_tokens > 17 || t.heads > 128 ||
         t.tokens > t.batch * t.max_query_tokens ||
         !FitsBytes({t.tokens, t.heads, 384, 2}) ||
         !FitsBytes({t.conv_input_slots, t.conv_history, t.heads, 384, 2}) ||
