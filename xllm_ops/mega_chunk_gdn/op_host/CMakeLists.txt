@@ -37,7 +37,6 @@ add_ops_compile_options(
             -DGDN_KERNEL_NAME=mega_chunk_gdn
             -DGDN_D=128
             -DGDN_C=128
-            ${MEGA_CHUNK_GDN_PROFILE_OPTIONS}
             -I${CMAKE_CURRENT_SOURCE_DIR}
             -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
             -I${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/pto-isa/include
@@ -45,5 +44,12 @@ add_ops_compile_options(
 )
 
 if (NOT BUILD_OPS_RTY_KERNEL)
+    # Profiling stops must never leak into a simultaneous A2/A3 build.
+    if(MEGA_CHUNK_GDN_PROFILE_OPTIONS)
+        add_ops_compile_options(
+            OP_NAME MegaChunkGdn
+            COMPUTE_UNIT ascend950
+            OPTIONS ${MEGA_CHUNK_GDN_PROFILE_OPTIONS})
+    endif()
     add_modules_sources(OPTYPE mega_chunk_gdn ACLNNTYPE aclnn)
 endif()
