@@ -175,8 +175,10 @@ endif()
 
 if(DEFINED ENV{MEGA_GDN_PREFILL_DUMP_SOLVE} AND
    "$ENV{MEGA_GDN_PREFILL_DUMP_SOLVE}" STREQUAL "1")
-    list(APPEND MEGA_GDN_PREFILL_PROFILE_OPTIONS
-        -DMEGA_GDN_PREFILL_DUMP_SOLVE_BUILD)
+    add_ops_compile_options(
+        OP_NAME MegaGdnPrefillOp
+        COMPUTE_UNIT ascend950
+        OPTIONS -DMEGA_GDN_PREFILL_DUMP_SOLVE_BUILD)
 endif()
 
 add_ops_compile_options(
