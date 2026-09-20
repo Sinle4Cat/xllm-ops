@@ -177,7 +177,11 @@ struct MegaGdnNativePrefillKernelTilingData {
 #endif
 // The included helpers keep the public BF16 boundary and cast into FP16 on
 // A2/A3.
+#if defined(GDN_PREFILL_ARCH_A2A3)
+#define MEGA_GDN_NATIVE_A2A3_KKT_CACHE
+#endif
 #include "../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
+#undef MEGA_GDN_NATIVE_A2A3_KKT_CACHE
 #if defined(GDN_PREFILL_ARCH_A2A3)
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK

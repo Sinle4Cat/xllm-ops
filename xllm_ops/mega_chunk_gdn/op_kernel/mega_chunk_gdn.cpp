@@ -796,10 +796,17 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         num_matrices / kkt_solve_group_size;
     const uint32_t kkt_solve_producer_waves =
         (kkt_solve_group_count + get_block_num() - 1) / get_block_num();
-    // A2/A3 use the four-slot FFTS ready/free protocol. Its eighth producer
-    // wave can expose stale KKT tiles, so long sequences use the stage barrier.
+    // A2/A3 use the four-slot FFTS ready/free protocol. The shared A_inv
+    // fallback keeps the <=7-wave bound because Solve can overwrite future
+    // producer inputs there. The native path uses S as an independent KK
+    // cache when D >= C; S is unused by H until this KKT phase has finished.
+#if defined(MEGA_GDN_NATIVE_A2A3_KKT_CACHE)
+    const bool kkt_solve_wave_count_supported =
+        D >= C || kkt_solve_producer_waves <= 7;
+#else
     const bool kkt_solve_wave_count_supported =
         kkt_solve_producer_waves <= 7;
+#endif
 #else
     // A5 has a separate intra-block/software-sync contract and must never enter
     // the A2/A3 four-slot FFTS protocol.
@@ -816,10 +823,18 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                                    reinterpret_cast<__gm__ float *>(g_t_ptr), total_tokens, H);
     mega_transpose_TH_to_HT<ComputeT>(reinterpret_cast<__gm__ ComputeT *>(beta_ptr),
                                   reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr), total_tokens, H);
+#if defined(MEGA_GDN_NATIVE_A2A3_KKT_CACHE)
+    // S has matrices*D*D elements. Since num_matrices is
+    // chunk_count*num_heads, num_heads >= num_key_heads, and D >= C, it
+    // covers the chunk_count*num_key_heads*C*C independent KK cache.
+    GM_ADDR kk_cache_ptr = D >= C ? s_ptr : A_inv_ptr;
+#else
+    GM_ADDR kk_cache_ptr = A_inv_ptr;
+#endif
     if (reuse_group_kk) {
         mk_kkt::BuildGroupKkCache<D, C>(
             reinterpret_cast<__gm__ ComputeT *>(k_ptr),
-            reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+            reinterpret_cast<__gm__ ComputeT *>(kk_cache_ptr),
             reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
             batch_size, num_matrices, static_cast<uint32_t>(H),
             num_key_heads);
@@ -837,7 +852,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ ComputeT *>(k_ptr), reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr),
         reinterpret_cast<__gm__ float *>(g_t_ptr), reinterpret_cast<__gm__ float *>(msk_lower_ptr),
         reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr), reinterpret_cast<__gm__ ComputeT *>(A_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(kk_cache_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len, total_tokens,
         static_cast<uint32_t>(H), num_key_heads, num_matrices, ffts_addr,
         reuse_group_kk ? 1u : 0u,
