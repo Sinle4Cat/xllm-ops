@@ -194,8 +194,18 @@ AICORE inline bool CanReuseGroupQk(
     }
     chunk_count += sequence_chunk_count;
 #else
-    chunk_count += static_cast<uint32_t>(
+    const uint32_t sequence_chunk_count = static_cast<uint32_t>(
         (seq_tokens + ChunkSize - 1) / ChunkSize);
+    // A2/A3 group-QK uses the same precomputed-QS mailbox as the
+    // producer/consumer H/O path. Keep its per-sequence and launch limits
+    // aligned with the outer H guard and O consumer.
+    if (sequence_chunk_count > 2048u) {
+      return false;
+    }
+    chunk_count += sequence_chunk_count;
+    if (chunk_count > 8192u) {
+      return false;
+    }
 #endif
   }
 #else
@@ -1889,8 +1899,60 @@ AICORE void GDN_CHUNK_O_KERNEL(
     h_o_chunk_count =
         batch_size * ((seq_len + ChunkSize - 1) / ChunkSize);
   }
-#if defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE) || \
+#if defined(MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK) && \
+    !defined(GDN_A5_KERNEL)
+  // Keep the A2/A3 O consumer contract identical to the H producer:
+  // validate CSR ranges, cap each sequence at 2048 chunks, cap a launch at
+  // batch*2048 chunks, and ensure the ready mailbox fits in the reserved
+  // first KKT tile. This scan is metadata-only and does not touch math.
+  bool h_o_sequences_valid = cu_seqlens != nullptr;
+  uint64_t h_o_scanned_chunks = 0;
+  uint64_t h_o_max_seq_chunks = 0;
+  if (h_o_sequences_valid) {
+    for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+      const int64_t seq_start =
+          static_cast<int64_t>(cu_seqlens[seq_idx]);
+      const int64_t seq_end =
+          static_cast<int64_t>(cu_seqlens[seq_idx + 1]);
+      const int64_t seq_tokens = seq_end - seq_start;
+      if (seq_start < 0 || seq_end > total_tokens || seq_tokens <= 0) {
+        h_o_sequences_valid = false;
+        break;
+      }
+      const uint64_t seq_chunks =
+          static_cast<uint64_t>((seq_tokens + ChunkSize - 1) / ChunkSize);
+      if (seq_chunks > 2048u) {
+        h_o_sequences_valid = false;
+        break;
+      }
+      h_o_scanned_chunks += seq_chunks;
+      h_o_max_seq_chunks =
+          h_o_max_seq_chunks > seq_chunks ? h_o_max_seq_chunks : seq_chunks;
+    }
+  }
+  constexpr uint64_t H_O_READY_STRIDE_BYTES =
+      16u * static_cast<uint64_t>(sizeof(int32_t));
+  const uint64_t h_o_ready_bytes =
+      batch_size > 0 && H > 0
+          ? static_cast<uint64_t>(batch_size) *
+                static_cast<uint64_t>(H) * H_O_READY_STRIDE_BYTES
+          : 0u;
+  const uint64_t h_o_ready_capacity_bytes =
+      static_cast<uint64_t>(block_num) * ChunkSize * ChunkSize *
+      sizeof(ComputeT);
+  const bool use_precomputed_qs =
+      precompute_qs != 0 && ChunkSize == HiddenSize && H >= 8 &&
+      batch_size >= 1 && h_o_sequences_valid &&
+      h_o_max_seq_chunks <= 2048u &&
+      h_o_scanned_chunks == static_cast<uint64_t>(h_o_chunk_count) &&
+      h_o_chunk_count >= 4 &&
+      h_o_chunk_count <= batch_size * static_cast<int64_t>(2048) &&
+      h_o_chunk_count <= 8192 &&
+      h_o_ready_bytes <= h_o_ready_capacity_bytes;
+#elif defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE) || \
     defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
+  // Preserve the validated A5 limits exactly; the 32K extension is A2/A3
+  // only and must not widen an A5 schedule.
   const bool use_precomputed_qs =
       precompute_qs != 0 && ChunkSize == HiddenSize && H >= 8 &&
       batch_size >= 1 && cu_seqlens != nullptr &&

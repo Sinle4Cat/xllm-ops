@@ -145,7 +145,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t cacheIdx, b
     LocalTensor<T> ring = inBuf.Get<T>();
     bool hasGmHistoryCopy = false;
     bool hasVectorInit = false;
-    const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+    const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * (nativeReadStride_ > 0 ? nativeReadStride_ : stateLen * dim) + channelStart;
     int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * dim + channelStart;
 
     for (int32_t i = 0; i < ringStart; ++i) {

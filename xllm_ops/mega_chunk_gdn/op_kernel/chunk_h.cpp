@@ -743,7 +743,8 @@ AICORE PTO_INLINE void paired_vec_store_final(
     int32_t vid, int32_t state_index_stride, int64_t state_cache_slots,
     int64_t output_final_state,
     TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
-    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half)
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half,
+    int64_t state_cache_stride = 0)
 {
   if (output_final_state == 0) return;
   constexpr int32_t HalfC = C / 2;
@@ -755,9 +756,10 @@ AICORE PTO_INLINE void paired_vec_store_final(
     TCVT(state_ub, state_half, pto::RoundMode::CAST_NONE);
     pipe_barrier(PIPE_V);
     const int32_t state_index = state_indices[0] * state_index_stride;
-    if (state_index >= 0 && state_index < state_cache_slots) {
+    if (state_index >= 0 && state_index < state_cache_slots &&
+        (state_cache_stride == 0 || state_index > 0)) {
       const int64_t cache_offset =
-          (static_cast<int64_t>(state_index) * H + head) * DD +
+          static_cast<int64_t>(state_index) * (state_cache_stride > 0 ? state_cache_stride : H * DD) + head * DD +
           vid * HalfC * D;
       GmShape2D cache_shape(HalfC, D);
       GmStride2D cache_stride(D);
@@ -806,7 +808,7 @@ AICORE void chunk_h_kernel(
     __gm__ float *final_state_cache,
     __gm__ int32_t *state_indices,
     int32_t state_index_stride,
-    int64_t state_cache_slots)
+    int64_t state_cache_slots, int64_t state_cache_stride = 0)
 {
   // chunk_h advances the recurrent hidden state chunk by chunk:
   //   ws_i      = W_i @ S_i
@@ -1482,11 +1484,11 @@ AICORE void chunk_h_kernel(
     paired_vec_store_final<D, C, StoreFinalStateCache>(
         FS_handle, final_state_cache, state_indices, head0, H, vid,
         state_index_stride, state_cache_slots, output_final_state, s_ub,
-        s_ub_half);
+        s_ub_half, state_cache_stride);
     paired_vec_store_final<D, C, StoreFinalStateCache>(
         FS_handle, final_state_cache, state_indices, head1, H, vid,
         state_index_stride, state_cache_slots, output_final_state, s_alt_ub,
-        s_ub_half);
+        s_ub_half, state_cache_stride);
 #ifndef MEGA_STOP_AFTER_H
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (7 << 8));
 #endif
@@ -1556,9 +1558,10 @@ AICORE void chunk_h_kernel(
         dsb(DSB_DDR);
 #endif
         const int32_t state_index = initial_state_indices[seq_idx];
-        if (state_index >= 0 && state_index < state_cache_slots) {
+        if (state_index >= 0 && state_index < state_cache_slots &&
+        (state_cache_stride == 0 || state_index > 0)) {
           const int64_t cache_offset =
-              (static_cast<int64_t>(state_index) * H + head) * DD +
+              static_cast<int64_t>(state_index) * (state_cache_stride > 0 ? state_cache_stride : H * DD) + head * DD +
               vid * HalfC * D;
 #if defined(GDN_A5_KERNEL) && \
     !defined(MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI)
@@ -2111,9 +2114,10 @@ AICORE void chunk_h_kernel(
         pipe_barrier(PIPE_V);
         const int32_t state_index =
             state_indices[seq_idx] * state_index_stride;
-        if (state_index >= 0 && state_index < state_cache_slots) {
+        if (state_index >= 0 && state_index < state_cache_slots &&
+        (state_cache_stride == 0 || state_index > 0)) {
           const int64_t cache_offset =
-              (static_cast<int64_t>(state_index) * H + head) * DD +
+              static_cast<int64_t>(state_index) * (state_cache_stride > 0 ? state_cache_stride : H * DD) + head * DD +
               vid * HalfC * D;
           GmShape2D cache_shape(HalfC, D);
           GmStride2D cache_stride(D);
@@ -2150,9 +2154,10 @@ AICORE void chunk_h_kernel(
       if constexpr (StoreFinalStateCache) {
         const int32_t state_index =
             state_indices[seq_idx] * state_index_stride;
-        if (state_index >= 0 && state_index < state_cache_slots) {
+        if (state_index >= 0 && state_index < state_cache_slots &&
+        (state_cache_stride == 0 || state_index > 0)) {
           const int64_t cache_offset =
-              (static_cast<int64_t>(state_index) * H + head) * DD +
+              static_cast<int64_t>(state_index) * (state_cache_stride > 0 ? state_cache_stride : H * DD) + head * DD +
               vid * HalfC * D;
           for (int32_t r = 0; r < HalfC * D; r += 16) {
             dcci(static_cast<__gm__ void *>(final_state_cache + cache_offset + r),

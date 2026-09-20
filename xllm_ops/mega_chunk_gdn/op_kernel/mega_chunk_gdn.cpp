@@ -756,7 +756,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                                     int32_t state_index_stride,
                                     GM_ADDR initial_state_cache_ptr,
                                     GM_ADDR initial_state_indices_ptr,
-                                    int64_t state_cache_slots)
+                                    int64_t state_cache_slots, int64_t state_cache_stride = 0)
 {
     constexpr int32_t D = GDN_D;
     constexpr int32_t C = GDN_C;
@@ -1050,10 +1050,53 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     constexpr bool use_h_o_pipeline = false;
 #endif
 #else
+    // A2/A3 uses the same two-mailbox/QS protocol as the validated
+    // multi-batch path in chunk_o.cpp.  Support up to 2048 chunks per
+    // sequence (256K at C=128) and 8192 chunks per launch (B=4), while
+    // retaining CSR/range and ready-counter capacity validation.
+    bool h_o_sequences_valid = cu_seqlens_ptr != nullptr;
+    uint64_t h_o_scanned_chunks = 0;
+    uint64_t h_o_max_seq_chunks = 0;
+    if (h_o_sequences_valid) {
+        auto *h_o_cu_seqlens =
+            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr);
+        for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            const int64_t seq_start =
+                static_cast<int64_t>(h_o_cu_seqlens[seq_idx]);
+            const int64_t seq_end =
+                static_cast<int64_t>(h_o_cu_seqlens[seq_idx + 1]);
+            const int64_t seq_tokens = seq_end - seq_start;
+            if (seq_start < 0 || seq_end > total_tokens || seq_tokens <= 0) {
+                h_o_sequences_valid = false;
+                break;
+            }
+            const uint64_t seq_chunks =
+                static_cast<uint64_t>((seq_tokens + C - 1) / C);
+            if (seq_chunks > 2048u) {
+                h_o_sequences_valid = false;
+                break;
+            }
+            h_o_scanned_chunks += seq_chunks;
+            h_o_max_seq_chunks =
+                h_o_max_seq_chunks > seq_chunks ? h_o_max_seq_chunks
+                                                  : seq_chunks;
+        }
+    }
+    constexpr uint64_t H_O_READY_STRIDE_BYTES =
+        16u * static_cast<uint64_t>(sizeof(int32_t));
+    const uint64_t h_o_ready_bytes =
+        batch_size > 0 && H > 0
+            ? static_cast<uint64_t>(batch_size) *
+                  static_cast<uint64_t>(H) * H_O_READY_STRIDE_BYTES
+            : 0u;
+    const uint64_t h_o_ready_capacity_bytes =
+        static_cast<uint64_t>(get_block_num()) * C * C * sizeof(ComputeT);
     const bool use_h_o_pipeline =
         EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
-        cu_seqlens_ptr != nullptr && h_o_chunk_count >= 4 &&
-        h_o_chunk_count <= 64 &&
+        h_o_sequences_valid && h_o_max_seq_chunks <= 2048u &&
+        h_o_scanned_chunks == static_cast<uint64_t>(h_o_chunk_count) &&
+        h_o_chunk_count >= 4 && h_o_chunk_count <= 8192 &&
+        h_o_ready_bytes <= h_o_ready_capacity_bytes &&
         num_matrices == expected_h_o_matrices;
 #endif
 #if defined(GDN_A5_KERNEL) && \
@@ -1115,7 +1158,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ int32_t *>(initial_state_indices_ptr),
         reinterpret_cast<__gm__ float *>(final_state_cache_ptr),
         reinterpret_cast<__gm__ int32_t *>(state_indices_ptr),
-        state_index_stride, state_cache_slots);
+        state_index_stride, state_cache_slots, state_cache_stride);
 
     if (use_h_o_pipeline && EnableHoOverlap) {
 #if defined(GDN_A5_KERNEL) && \

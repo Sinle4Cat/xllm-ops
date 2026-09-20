@@ -114,6 +114,9 @@ template <CAUSAL_CONV1D_TEMPLATE_ARGS>
 class CausalConv1d {
 public:
     __aicore__ inline CausalConv1d() = default;
+protected:
+    int64_t nativeReadStride_ = 0;
+    int64_t nativeWriteStride_ = 0;
 
 protected:
     static constexpr bool kIsUpdateMode = (runModeKey == CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE);
@@ -834,7 +837,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackState(int32_t cacheIdx, int
     const int32_t lastT = len - 1;
     LocalTensor<T> ring = inBuf.Get<T>();
     const int32_t lastSlot = SlotCurr(lastT);
-    const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+    const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * (nativeWriteStride_ > 0 ? nativeWriteStride_ : stateLen * dim) + channelStart;
 
     for (int32_t pos = 0; pos < (width - 1); ++pos) {
         const int32_t tap = (width - 2) - pos;
