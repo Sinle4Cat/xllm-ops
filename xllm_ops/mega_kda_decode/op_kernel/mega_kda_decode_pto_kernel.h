@@ -13,14 +13,18 @@ using TileND = Tile<TileType::Vec, T, R, C, BLayout::RowMajor, VR, VC>;
 template <int R, int VR = R>
 using Column = Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, VR, 1>;
 
-AICORE inline void VBarrier() { pipe_barrier(PIPE_V); }
+AICORE inline void VBarrier() {
+#if __CCE_AICORE__ == 220
+    pipe_barrier(PIPE_V);
+#endif
+}
 
 template <typename T, int R, int C, typename TileT>
 AICORE inline void Load(TileT& tile, __gm__ T* ptr)
 {
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    GlobalTensor<T, Shape<1, 1, 1, R, C>, Stride<R * C, R * C, R * C, C, 1>> gm(ptr);
+    GlobalTensor<T, Shape<1, 1, 1, R, C>, pto::Stride<R * C, R * C, R * C, C, 1>> gm(ptr);
     TLOAD(tile, gm);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -31,7 +35,7 @@ AICORE inline void Store(__gm__ T* ptr, TileT& tile)
 {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    GlobalTensor<T, Shape<1, 1, 1, R, C>, Stride<R * C, R * C, R * C, C, 1>> gm(ptr);
+    GlobalTensor<T, Shape<1, 1, 1, R, C>, pto::Stride<R * C, R * C, R * C, C, 1>> gm(ptr);
     TSTORE(gm, tile);
     // A subsequent token/task may reuse every UB address below.
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
@@ -48,6 +52,9 @@ struct Args {
     __gm__ float* ssm_out;
 };
 
+#if __CCE_AICORE__ == 310
+#include "mega_kda_decode_a5_dynamic.h"
+#else
 constexpr int kVRows = 32;
 constexpr int kVShards = 128 / kVRows;
 
@@ -235,7 +242,7 @@ AICORE inline void Recurrent(Scratch& s, const Args& a, const TilingData& t,
 template <bool Mtp>
 AICORE inline void Run(const Args& a, const TilingData& t)
 {
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_C220_VEC__) || defined(__DAV_C310_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
     const int64_t channels = 384 * t.heads;
@@ -298,4 +305,5 @@ AICORE inline void Run(const Args& a, const TilingData& t)
     pipe_barrier(PIPE_ALL);
 #endif
 }
+#endif
 } // namespace mega_kda

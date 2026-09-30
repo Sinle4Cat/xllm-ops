@@ -1,7 +1,7 @@
 # MegaKdaDecode
 
 Experimental GLM-5.3-Flash vector KDA Conv + recurrent decode operator for
-Ascend 910B. It follows `mega_gdn_prefill_op`'s OpDef, separate shape inference,
+Ascend910B and Ascend950 (A5). It follows `mega_gdn_prefill_op`'s OpDef, separate shape inference,
 Host tiling, PTO Device entry, CMake discovery and generated ACLNN integration.
 It is not wired into the xLLM model path. Native precision, Graph replay and
 performance must pass on an exclusive NPU before enabling that path.
@@ -148,4 +148,5 @@ Host policy checks also cover all seven head counts. Select these cases with
 `pytest -k tp`, or a single size with `-k tp8`. They execute one rank's shape
 on one device; they do not validate distributed TP collectives or model memory.
 
-Only Ascend 910B is registered. No A3/A5 support or speedup is claimed.
+Ascend910B and Ascend950 are registered. For A5, build with `--soc=ascend950`.
+No A3 registration or speedup over a reference implementation is claimed.

@@ -35,7 +35,10 @@ int main() {
         assert(ValidTiling(t));
     }
     t.heads = 2;
-    t.ffts_addr = 0; assert(!ValidTiling(t)); t.ffts_addr = 1;
+    t.ffts_addr = 0;
+    assert(!ValidTiling(t));
+    assert(ValidTiling(t, true));  // A5 hardware barriers do not consume an FFTS address.
+    t.ffts_addr = 1;
     t.blocks = 33; assert(!ValidTiling(t)); t.blocks = 24;
     t.tokens = 0; assert(!ValidTiling(t));
     t.tokens = 32768; assert(ValidTiling(t));
@@ -176,6 +179,67 @@ def test_native_accuracy(tp, lengths, bias):
         lib.mega_kda_prefill(**actual)
     graph.replay()
     check(data, actual, f"TP={tp}/H={heads}/{lengths}/bias={bias}")
+
+
+@NATIVE
+@pytest.mark.parametrize("heads", [1, 8, 64])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("tail_start", [1, 17, 33, 49])
+def test_native_frontend_batch_row_tails(heads, bias, tail_start):
+    # After the three history-dependent tokens, exercise every 1..64-row tail,
+    # an empty sequence, and short tails in a subsequent 128-token chunk.
+    lengths = (0, *range(tail_start + 3, tail_start + 19), 130, 135, 159)
+    data = make_case(lengths, heads=heads, bias=bias)
+    lib, actual = native_case(data)
+    lib.mega_kda_prefill(**actual)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        lib.mega_kda_prefill(**actual)
+    for _ in range(5):
+        graph.replay()
+    check(data, actual, f"frontend_batch_rows/H={heads}/bias={bias}")
+
+
+@NATIVE
+@pytest.mark.parametrize("heads", [1, 8, 64])
+def test_native_multichunk_graph_100(heads):
+    # Exercise all off-diagonal blocks and partial 32-row Cube tiles repeatedly.
+    data = make_case((127, 128, 129, 257, 0), heads=heads, bias=True)
+    lib, actual = native_case(data)
+    lib.mega_kda_prefill(**actual)
+    check(data, actual, f"multichunk_graph/H={heads}/eager")
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        lib.mega_kda_prefill(**actual)
+    fixed = [actual[name].cpu() for name in OUTPUTS]
+    for iteration in range(100):
+        graph.replay()
+        current = [actual[name].cpu() for name in OUTPUTS]
+        assert all(bitwise_equal(a, b) for a, b in zip(fixed, current)), iteration
+    check(data, actual, f"multichunk_graph/H={heads}/final")
+
+
+@NATIVE
+@pytest.mark.parametrize("heads", [1, 8, 64])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("seed", [20260915, 17, 91])
+def test_native_diagonal_boundaries_graph(heads, bias, seed):
+    # Both sides of the 32-row KKT and 64-row inverse boundaries, including
+    # tails in the second chunk and an empty sequence in the same invocation.
+    lengths = (0, 31, 32, 33, 63, 64, 65, 95, 96, 97, 191, 192, 193)
+    data = make_case(lengths, heads=heads, bias=bias, seed=seed)
+    lib, actual = native_case(data)
+    lib.mega_kda_prefill(**actual)
+    check(data, actual, f"diagonal_boundaries/H={heads}/bias={bias}/seed={seed}/eager")
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        lib.mega_kda_prefill(**actual)
+    fixed = [actual[name].cpu() for name in OUTPUTS]
+    for iteration in range(20):
+        graph.replay()
+        assert all(bitwise_equal(before, actual[name].cpu())
+                   for name, before in zip(OUTPUTS, fixed)), iteration
+    check(data, actual, f"diagonal_boundaries/H={heads}/bias={bias}/seed={seed}/graph")
 
 
 @NATIVE

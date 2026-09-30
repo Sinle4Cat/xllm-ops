@@ -1965,8 +1965,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_prefill(
     TORCH_CHECK(symbol, "failed to resolve rtGetC2cCtrlAddr: ", dlerror());
     return reinterpret_cast<GetC2c>(symbol);
   }();
-  TORCH_CHECK(get_c2c(&ffts_addr, &ffts_len) == 0 && ffts_addr,
-              "MegaKdaPrefill requires the Ascend910B FFTS address");
+  const char* kda_soc_name = aclrtGetSocName();
+  const bool kda_is_a5 = kda_soc_name &&
+      std::string(kda_soc_name).find("Ascend950") != std::string::npos;
+  if (!kda_is_a5) {
+    TORCH_CHECK(get_c2c(&ffts_addr, &ffts_len) == 0 && ffts_addr,
+                "MegaKdaPrefill requires the Ascend910B FFTS address");
+  }
   const int64_t ffts_attr = static_cast<int64_t>(ffts_addr);
   // No metadata D2H: replay reads current device tensors and caller-owned outputs.
   EXEC_NPU_CMD(aclnnMegaKdaPrefill, qkv, gate, beta, a_log, gate_bias,

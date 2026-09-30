@@ -5,6 +5,8 @@
 #include "kda_prefill_wy.h"
 #include "kda_prefill_chunk_h.h"
 #include "kda_prefill_chunk_o.h"
+#include "kda_prefill_kkt_cube_a5.h"
+#include "kda_prefill_inverse_block_a5.h"
 #include "lib/matmul_intf.h"
 
 using MegaKdaPrefillTilingData = kda_prefill::TilingData;
@@ -35,7 +37,9 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
         reinterpret_cast<__gm__ float*>(ssm_state_out)};
     // Every core validates the same immutable metadata before any publication or barrier.
     if (!ValidMetadata(a, t)) return;
+#if __CCE_AICORE__ == 220
     set_ffts_base_addr(t.ffts_addr);
+#endif
     auto* ws = AscendC::GetUserWorkspace(workspace);
     const Workspace w(t);
     Prepare(a, t, ws, w);
@@ -47,9 +51,19 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
     mega_kda_prefill_kkt_rows::launch_kkt_rows(KDA_BF16(k), KDA_F32(g), KDA_F32(beta),
         KDA_F32(masks), KDA_F32(lower), KDA_BF16(q), KDA_F32(aqk), a.cu,
         t.batch, t.tokens, t.tokens, t.heads);
+#if __CCE_AICORE__ == 310
+    mega_kda_prefill_kkt_cube_a5::Run(KDA_BF16(q), KDA_BF16(k), KDA_F32(g),
+        KDA_F32(beta), KDA_F32(lower), KDA_F32(aqk), KDA_F32(h_ws), a.cu,
+        t.batch, t.tokens, t.heads);
+#endif
     Rendezvous();
+#if __CCE_AICORE__ == 310
+    mega_kda_prefill_inverse_block_a5::Run(KDA_F32(lower), KDA_F32(inverse),
+        KDA_F32(eye), KDA_F32(h_ws), a.cu, t.batch, t.heads);
+#else
     mega_kda_prefill_inverse_fp32::inverse_fp32(KDA_F32(lower), KDA_F32(inverse),
         KDA_F32(eye), nullptr, a.cu, t.batch, t.tokens, t.heads);
+#endif
     Rendezvous();
     mega_kda_prefill_wy_kda::wy_kda_kernel<128, 128>(KDA_BF16(k), KDA_F32(value),
         KDA_F32(beta), KDA_F32(g), KDA_F32(inverse), KDA_F32(wy_a), KDA_F32(wy_k),

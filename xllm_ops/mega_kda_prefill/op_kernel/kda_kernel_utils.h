@@ -11,6 +11,15 @@ for the full License text.
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 
+// A5 links the AIC and AIV objects into one image. Architecture-dependent
+// template bodies must not survive as identical weak symbols: the linker
+// could select the AIC body for an AIV call (or vice versa).
+#if __CCE_AICORE__ == 310
+#define KDA_ARCH_INLINE PTO_INLINE
+#else
+#define KDA_ARCH_INLINE
+#endif
+
 namespace mega_kda_prefill_utils {
 /**
  * @brief Do a sync step (set-wait flag) between two pipes.

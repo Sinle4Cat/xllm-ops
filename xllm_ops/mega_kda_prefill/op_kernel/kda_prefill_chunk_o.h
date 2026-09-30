@@ -111,7 +111,7 @@ AICORE PTO_INLINE void gemm_oneshot(
 #endif
 
 template <int32_t HiddenSize, int32_t ChunkSize>
-AICORE void chunk_o_kda_kernel(
+AICORE KDA_ARCH_INLINE void chunk_o_kda_kernel(
     __gm__ bfloat16_t *Q_handle, __gm__ bfloat16_t *K_handle, __gm__ float *V_handle,
     __gm__ float *S_handle, __gm__ float *G_handle, __gm__ float *Mask_handle,
     __gm__ float *workspace_handle, __gm__ float *O_handle,
@@ -119,7 +119,9 @@ AICORE void chunk_o_kda_kernel(
     int64_t total_tokens, int32_t num_heads, uint64_t ffts_addr) {
   auto cid = get_block_idx();
   auto block_num = get_block_num();
+#if __CCE_AICORE__ == 220
   set_ffts_base_addr(ffts_addr);
+#endif
 
   constexpr int32_t K_DIM = HiddenSize;
   constexpr int32_t V_DIM = HiddenSize;
@@ -155,6 +157,27 @@ AICORE void chunk_o_kda_kernel(
   TileMatL1<float, C, V_DIM, C, V_DIM> v_l1;
   TASSIGN(v_l1, (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
 
+#if __CCE_AICORE__ == 310
+  // A5-only input prefetch slots.  The regular Q/S/Aqk/V slots above remain
+  // unchanged for A2.  These three extra 64 KiB tiles occupy the unused tail
+  // of the 512 KiB L1 and let MTE2 fetch the immutable H-stage products while
+  // the cube is waiting for Vec to publish q_eff.
+  constexpr int32_t PREFETCH_S_L1_ADDR =
+      (C * K_DIM + C * K_DIM + KV + C * C + KV) * sizeof(float);
+  constexpr int32_t PREFETCH_QKM_L1_ADDR =
+      (C * K_DIM + C * K_DIM + KV + C * C + KV + KV) * sizeof(float);
+  constexpr int32_t PREFETCH_V_L1_ADDR =
+      (C * K_DIM + C * K_DIM + KV + C * C + KV + KV + C * C) * sizeof(float);
+  static_assert(PREFETCH_V_L1_ADDR + C * V_DIM * sizeof(float) <= 512 * 1024,
+                "A5 O prefetch tiles exceed the 512 KiB L1 budget");
+  TileMatL1<float, K_DIM, V_DIM, K_DIM, V_DIM> s_prefetch_l1;
+  TASSIGN(s_prefetch_l1, PREFETCH_S_L1_ADDR);
+  TileMatL1<float, C, C, C, C> qkm_prefetch_l1;
+  TASSIGN(qkm_prefetch_l1, PREFETCH_QKM_L1_ADDR);
+  TileMatL1<float, C, V_DIM, C, V_DIM> v_prefetch_l1;
+  TASSIGN(v_prefetch_l1, PREFETCH_V_L1_ADDR);
+#endif
+
   // Separate L0C accumulators: QS at C*C*4 bytes, Aqk @ V_corr at zero.
   TileAcc<float, C, V_DIM, C, V_DIM> qs_l0;
   TASSIGN(qs_l0, C * C * sizeof(float));
@@ -188,8 +211,74 @@ AICORE void chunk_o_kda_kernel(
     if (pid >= total_work) break;
 
     int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
+#if __CCE_AICORE__ == 310
+    // Keep the AIC work-item decode identical to the AIV path below.  The
+    // flattened id is chunk-major, then head-major; `ci` is reduced to the
+    // sequence-local chunk and `chunk_offset` remains the global snapshot
+    // chunk index used by S_handle.
+    int64_t head = pid % H;
+    int64_t ci = pid / H, bos = 0, slen = 0, chunk_offset = 0;
+    for (int64_t seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+      bos = cu_seqlens ? cu_seqlens[seq_idx] : seq_idx * seq_len;
+      slen = cu_seqlens ? cu_seqlens[seq_idx + 1] - bos : seq_len;
+      int64_t count = (slen + C - 1) / C;
+      if (ci < count) break;
+      ci -= count;
+      chunk_offset += count;
+    }
+    int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
+    int64_t valid = slen - static_cast<int64_t>(ci) * C;
+    if (valid > C) valid = C;
+    const int32_t valid_rows = static_cast<int32_t>(valid);
+#endif
     {
-      // ── Wait Vec phase A: q_eff, Aqk(masked), V_corr, S all in workspace ─
+#if __CCE_AICORE__ == 310
+      // The H→O entry rendezvous already makes these GM products visible.
+      // Fence the previous GEMM's MTE1 consumers before reusing the separate
+      // prefetch slots; the paired event is deliberately distinct from the
+      // GEMM one'shot WAR event (EVENT_ID0+1).
+      set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+      wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+
+      // Issue all immutable-input loads before waiting for q_eff.  The
+      // MTE2→MTE1 event is set after the three TLOADs and consumed below, after
+      // the q_eff rendezvous, so tail padding never races an input load.
+      {
+        const int64_t s_in_offset =
+            (chunk_offset + static_cast<int64_t>(ci)) * H * KV +
+            static_cast<int64_t>(head) * KV;
+        GmShape2D s_shape(K_DIM, V_DIM);
+        GmStride2D s_stride(V_DIM);
+        GmTensor2D<float> s_global(S_handle + s_in_offset, s_shape, s_stride);
+        DynMatL1<float, K_DIM, V_DIM> s_load(K_DIM, V_DIM);
+        TASSIGN(s_load, PREFETCH_S_L1_ADDR);
+        TLOAD(s_load, s_global);
+      }
+      {
+        const int64_t v_offset =
+            (chunk_start * H + static_cast<int64_t>(head)) * V_DIM;
+        GmShape2D v_shape(valid_rows, V_DIM);
+        GmStride2D v_stride(BSND_STRIDE);
+        GmTensor2D<float> v_global(V_handle + v_offset, v_shape, v_stride);
+        DynMatL1<float, C, V_DIM> v_load(valid_rows, V_DIM);
+        TASSIGN(v_load, PREFETCH_V_L1_ADDR);
+        TLOAD(v_load, v_global);
+      }
+      {
+        const int64_t aqk_offset =
+            (chunk_start * H + static_cast<int64_t>(head)) * C;
+        GmShape2D aqk_shape(valid_rows, C);
+        GmStride2D aqk_stride(H * C);
+        GmTensor2D<float> aqk_global(Mask_handle + aqk_offset, aqk_shape,
+                                     aqk_stride);
+        DynMatL1<float, C, C> qkm_load(valid_rows, C);
+        TASSIGN(qkm_load, PREFETCH_QKM_L1_ADDR);
+        TLOAD(qkm_load, aqk_global);
+      }
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+#endif
+
+      // ── Wait Vec phase A: q_eff is published in workspace ─────────────
       // A2: Cube and Vec are separate cores → FFTS cross-core flag.
       // A5: Cube and both Vec sub-blocks share ONE core → intra-block flags,
       //     with each Vec sub-block signalling its own flag (base, base+16).
@@ -198,6 +287,20 @@ AICORE void chunk_o_kda_kernel(
 #else
       WaitBothVecOnA5<PIPE_MTE2>(0);
       pipe_barrier(PIPE_ALL);
+#endif
+
+#if __CCE_AICORE__ == 310
+      // Complete the prefetch before touching a tail tile.  Full tiles need no
+      // fill; partial V/Aqk rows are zero-padded exactly as in the old path.
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+      if (valid_rows != C) {
+        DynMatL1<float, C, V_DIM> v_load(valid_rows, V_DIM);
+        TASSIGN(v_load, PREFETCH_V_L1_ADDR);
+        TFILLPAD(v_load, v_load);
+        DynMatL1<float, C, C> qkm_load(valid_rows, C);
+        TASSIGN(qkm_load, PREFETCH_QKM_L1_ADDR);
+        TFILLPAD(qkm_load, qkm_load);
+      }
 #endif
 
       // Load q_eff [C, K] from WS_Q.
@@ -210,6 +313,11 @@ AICORE void chunk_o_kda_kernel(
         TASSIGN(q_l1_load, 0);
         TLOAD(q_l1_load, q_global);
       }
+#if __CCE_AICORE__ == 310
+      // The immutable S/Aqk/V tiles were prefetched above into independent
+      // L1 slots while q_eff was pending.  The H→O rendezvous and the paired
+      // MTE2→MTE1 event protects their GM visibility and tail padding.
+#else
       // Load S [K, V] from WS_S.
       {
         GmShape2D s_shape(K_DIM, V_DIM);
@@ -241,13 +349,19 @@ AICORE void chunk_o_kda_kernel(
         TASSIGN(qkm_l1_load, (C * K_DIM + C * K_DIM + KV) * sizeof(float));
         TLOAD(qkm_l1_load, qkm_global);
       }
+#endif
 
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       // GEMM2: QS = q_eff @ S — [C, K] @ [K, V] → [C, V]  (inter-chunk term).
+#if __CCE_AICORE__ == 310
+      gemm_oneshot<float, float, C, V_DIM, K_DIM, /*transpose_B=*/false>(
+          q_l1, s_prefetch_l1, qs_l0);
+#else
       gemm_oneshot<float, float, C, V_DIM, K_DIM, /*transpose_B=*/false>(
           q_l1, s_l1, qs_l0);
+#endif
 
       // Store QS fp32 → WS_QS.
       {
@@ -264,8 +378,13 @@ AICORE void chunk_o_kda_kernel(
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       // GEMM3: QKV = Aqk_masked @ V_corr — [C, C] @ [C, V] → [C, V].
+#if __CCE_AICORE__ == 310
+      gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(
+          qkm_prefetch_l1, v_prefetch_l1, qkv_l0);
+#else
       gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(
           qkm_l1, v_l1, qkv_l0);
+#endif
 
       // Store QKV fp32 → WS_QKV.
       {
@@ -414,6 +533,7 @@ AICORE void chunk_o_kda_kernel(
         TSTORE(q_global, q_store);
       }
 
+#if __CCE_AICORE__ != 310
       // Consume the jointly computed Gram, with zero padding for tail rows.
       pipe_barrier(PIPE_ALL);
       {
@@ -527,6 +647,11 @@ AICORE void chunk_o_kda_kernel(
         TASSIGN(s_store, SLOT_A_ADDR);
         TSTORE(sw_global, s_store);
       }
+#else
+      // q_store above is the sole A5 Phase-A workspace publication.  Drain
+      // its MTE3 write before signalling Cube; no AIV matrix staging remains.
+      pipe_barrier(PIPE_ALL);
+#endif
 
       // ── (A.6) Signal Cube: phase A workspace ready ───────────────────
       pipe_barrier(PIPE_ALL);

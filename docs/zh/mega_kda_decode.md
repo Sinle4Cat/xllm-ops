@@ -18,7 +18,8 @@ PTO Device 入口、CMake 构建和 ACLNN/Python 测试绑定。尚未接入 xLL
 
 ## 支持范围
 
-目前仅注册 Ascend 910B。BF16 输入、FP32 `[slots,H,V,K]` SSM，D=128，
+注册 Ascend910B 和 Ascend950（A5）；A5 构建指定 `--soc=ascend950`。
+BF16 输入、FP32 `[slots,H,V,K]` SSM，D=128，
 H=1..128，MTP query capacity=1..17。模型 MTP=K 表示 K 个草稿 token，
 验证时还包含当前 token，因此 capacity=K+1；模型 MTP1..16 对应 capacity2..17。
 capacity=1 仍支持单 token MTP verify。普通 decode 的 Conv history 长度为 3，

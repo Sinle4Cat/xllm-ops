@@ -239,7 +239,7 @@ AICORE PTO_INLINE void gemm_v0(
 #endif
 
 template <int32_t HiddenSize, int32_t ChunkSize>
-AICORE void wy_kda_kernel(__gm__ bfloat16_t *K_handle, __gm__ float *V_handle,
+AICORE KDA_ARCH_INLINE void wy_kda_kernel(__gm__ bfloat16_t *K_handle, __gm__ float *V_handle,
                           __gm__ float *Beta_handle, __gm__ float *G_handle,
                           __gm__ float *A_handle,
                           __gm__ float *workspace_a2_handle,
@@ -289,7 +289,9 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t *K_handle, __gm__ float *V_handle,
   constexpr int32_t WsA2Size = ChunkSize * ChunkSize;
   constexpr int32_t WsKeffSize = ChunkSize * HiddenSize;
 
+#if __CCE_AICORE__ == 220
   set_ffts_base_addr(ffts_addr);
+#endif
   auto cid = get_block_idx();
   auto block_num = get_block_num();
   auto vid = get_subblockid();

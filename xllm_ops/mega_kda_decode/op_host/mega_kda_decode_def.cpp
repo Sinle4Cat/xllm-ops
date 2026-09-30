@@ -29,6 +29,7 @@ public:
         Attr("conv_output_slots").AttrType(REQUIRED).Int();
         Attr("ssm_output_slots").AttrType(REQUIRED).Int();
         AICore().AddConfig("ascend910b");
+        AICore().AddConfig("ascend950");
     }
 };
 OP_ADD(MegaKdaDecode);

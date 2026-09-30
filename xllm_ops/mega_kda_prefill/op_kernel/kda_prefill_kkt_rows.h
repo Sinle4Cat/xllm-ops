@@ -16,6 +16,90 @@ using ST = pto::Stride<1, 1, 1, DYNAMIC, 1>;
 template <typename T> using GM = GlobalTensor<T, GS, ST>;
 #endif
 
+#if defined(__DAV_C310_VEC__)
+// Batch alternating query rows per AIV. Keep exp and Q/K products in
+// registers, reproducing TROWSUM's two 64-lane reductions in FP32.
+template <typename Matrix, typename Row, typename Sums, typename Masks, typename Beta>
+__tf__ PTO_INTERNAL void KktProductsA5(
+    typename Sums::TileDType __out__ q_product,
+    typename Sums::TileDType __out__ k_product,
+    typename Matrix::TileDType __in__ g_columns,
+    typename Matrix::TileDType __in__ k_columns,
+    typename Row::TileDType __in__ g_row,
+    typename Row::TileDType __in__ k_row,
+    typename Row::TileDType __in__ q_row,
+    typename Masks::TileDType __in__ masks,
+    typename Beta::TileDType __in__ beta,
+    uint16_t row_count, uint16_t block_n, uint16_t row0, uint16_t col0, uint16_t vid)
+{
+  auto* qp = (__ubuf__ float*)__cce_get_tile_ptr(q_product);
+  auto* kp = (__ubuf__ float*)__cce_get_tile_ptr(k_product);
+  auto* gc = (__ubuf__ float*)__cce_get_tile_ptr(g_columns);
+  auto* kc = (__ubuf__ float*)__cce_get_tile_ptr(k_columns);
+  auto* gr = (__ubuf__ float*)__cce_get_tile_ptr(g_row);
+  auto* kr = (__ubuf__ float*)__cce_get_tile_ptr(k_row);
+  auto* qr = (__ubuf__ float*)__cce_get_tile_ptr(q_row);
+  auto* mp = (__ubuf__ float*)__cce_get_tile_ptr(masks);
+  auto* bp = (__ubuf__ float*)__cce_get_tile_ptr(beta);
+  __VEC_SCOPE__ {
+    RegTensor<float> rg0, rk0, rq0, rg1, rk1, rq1;
+    RegTensor<float> cg0, ck0, cg1, ck1, d0, d1, q0, q1, k0, k1;
+    RegTensor<float> qs, ks, reduced, bv, mv;
+    MaskReg mask = PSetWithType<float>(PAT_ALL);
+    uint32_t one = 1;
+    MaskReg scalar_mask = CreatePredicate<float>(one);
+    constexpr auto dist = std::integral_constant<::DistVST,
+        static_cast<::DistVST>(GetDistVst<float, pto::DistVST::DIST_ONEPT>())>();
+    for (uint16_t local = vid; local < row_count; local += 2) {
+      const uint16_t remaining = row0 + local - col0 + 1;
+      const uint16_t n = remaining < block_n ? remaining : block_n;
+      vlds(bv, bp, row0 + local, BRC_B32);
+      vlds(rg0, gr, local * 128, NORM);
+      vlds(rk0, kr, local * 128, NORM);
+      vlds(rq0, qr, local * 128, NORM);
+      vlds(rg1, gr, local * 128 + 64, NORM);
+      vlds(rk1, kr, local * 128 + 64, NORM);
+      vlds(rq1, qr, local * 128 + 64, NORM);
+      for (uint16_t row = 0; row < n; ++row) {
+        vlds(cg0, gc, row * 128, NORM);
+        vlds(ck0, kc, row * 128, NORM);
+        vlds(cg1, gc, row * 128 + 64, NORM);
+        vlds(ck1, kc, row * 128 + 64, NORM);
+        vsub(d0, rg0, cg0, mask, MODE_ZEROING);
+        vsub(d1, rg1, cg1, mask, MODE_ZEROING);
+        vmins(d0, d0, 0.0f, mask, MODE_ZEROING);
+        vmins(d1, d1, 0.0f, mask, MODE_ZEROING);
+        vexp(d0, d0, mask, MODE_ZEROING);
+        vexp(d1, d1, mask, MODE_ZEROING);
+        vmul(q0, d0, rq0, mask, MODE_ZEROING);
+        vmul(q1, d1, rq1, mask, MODE_ZEROING);
+        vmul(k0, d0, rk0, mask, MODE_ZEROING);
+        vmul(k1, d1, rk1, mask, MODE_ZEROING);
+        vmul(q0, q0, ck0, mask, MODE_ZEROING);
+        vmul(q1, q1, ck1, mask, MODE_ZEROING);
+        vmul(k0, k0, ck0, mask, MODE_ZEROING);
+        vmul(k1, k1, ck1, mask, MODE_ZEROING);
+        vbr(qs, 0);
+        vbr(ks, 0);
+        vcadd(reduced, q0, mask, MODE_ZEROING);
+        vadd(qs, qs, reduced, scalar_mask, MODE_ZEROING);
+        vcadd(reduced, q1, mask, MODE_ZEROING);
+        vadd(qs, qs, reduced, scalar_mask, MODE_ZEROING);
+        vcadd(reduced, k0, mask, MODE_ZEROING);
+        vadd(ks, ks, reduced, scalar_mask, MODE_ZEROING);
+        vcadd(reduced, k1, mask, MODE_ZEROING);
+        vadd(ks, ks, reduced, scalar_mask, MODE_ZEROING);
+        vlds(mv, mp, local * 64 + row, BRC_B32);
+        vmul(ks, ks, bv, scalar_mask, MODE_ZEROING);
+        vmul(ks, ks, mv, scalar_mask, MODE_ZEROING);
+        vsts(qs, qp, (local / 2) * 64 + row, dist, scalar_mask);
+        vsts(ks, kp, (local / 2) * 64 + row, dist, scalar_mask);
+      }
+    }
+  }
+}
+#endif
+
 AICORE inline void launch_kkt_rows(
     __gm__ bfloat16_t *keys, __gm__ float *gates, __gm__ float *beta,
     __gm__ float *mask, __gm__ float *out, __gm__ bfloat16_t *queries,
@@ -54,8 +138,17 @@ AICORE inline void launch_kkt_rows(
     GM<float> beta_gm(beta + int64_t(head) * tokens + first, GS(1,1,1,1,valid), ST(C));
     TLOAD(beta_f, beta_gm);
     SetWaitFlag<PIPE_MTE2, PIPE_S>(0);
+#if defined(__DAV_C310_VEC__)
+    for (int col0 = row_group * ROWS; col0 < valid && col0 < (row_group + 1) * ROWS; col0 += N) {
+#else
     for (int col0 = 0; col0 < valid && col0 < (row_group + 1) * ROWS; col0 += N) {
+#endif
+#if defined(__DAV_C310_VEC__)
+      // A5 computes only this diagonal block here; off-diagonal blocks use Cube.
+      int block_n = valid - col0 < ROWS ? valid - col0 : ROWS;
+#else
       int block_n = valid - col0 < N ? valid - col0 : N;
+#endif
       ND<float, N, D, DYNAMIC> columns_g(block_n), columns_k(block_n);
       ND<bfloat16_t, N, D, DYNAMIC> columns_kh(block_n);
       TASSIGN(columns_g, 0); TASSIGN(columns_k, 32768); TASSIGN(columns_kh, 98304);
@@ -64,7 +157,9 @@ AICORE inline void launch_kkt_rows(
       TLOAD(columns_g, gcols); TLOAD(columns_kh, kcols);
       SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
       TCVT(columns_k, columns_kh, RoundMode::CAST_NONE); PipeBarrierVec();
+#if !defined(__DAV_C310_VEC__)
       TMULS(columns_g, columns_g, -1.0f); PipeBarrierVec();
+#endif
       for (int row0 = row_group * ROWS; row0 < valid && row0 < (row_group + 1) * ROWS; row0 += ROWS) {
         int rows = valid - row0 < ROWS ? valid - row0 : ROWS;
         // Load 32 row operands at once; each AIV consumes alternating rows.
@@ -77,8 +172,36 @@ AICORE inline void launch_kkt_rows(
         GM<bfloat16_t> krow(keys + hbase + row0 * D, GS(1,1,1,rows,D), ST(D));
         GM<bfloat16_t> qrow(queries + hbase + row0 * D, GS(1,1,1,rows,D), ST(D));
         GM<float> mrow(mask + row0 * C + col0, GS(1,1,1,rows,block_n), ST(C));
+#if defined(__DAV_C310_VEC__)
+        // Diagonal rows and columns share the same Q/K/gate token range.
+        TASSIGN(row_g, 0);
+        TLOAD(row_q, qrow); TLOAD(row_mask, mrow);
+#else
         TLOAD(row_g, grow); TLOAD(row_k, krow); TLOAD(row_q, qrow); TLOAD(row_mask, mrow);
+#endif
         SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+#if defined(__DAV_C310_VEC__)
+        ND<float, ROWS, D, DYNAMIC> row_kf(rows), row_qf(rows);
+        const int owned_rows = (rows + 1 - vid) / 2;
+        ND<float, ROWS / 2, N, DYNAMIC, DYNAMIC> qvalues(owned_rows, block_n), kvalues(owned_rows, block_n);
+        TASSIGN(row_kf, 32768); TASSIGN(row_qf, 81920);
+        TASSIGN(qvalues, 98304); TASSIGN(kvalues, 106496);
+        if (owned_rows > 0) {
+        TCVT(row_qf, row_q, RoundMode::CAST_NONE);
+        TEXPANDS(qvalues, 0.0f); TEXPANDS(kvalues, 0.0f);
+        PipeBarrierVec();
+          KktProductsA5<decltype(columns_g), decltype(row_g), decltype(qvalues), decltype(row_mask), decltype(beta_f)>(
+              qvalues.data(), kvalues.data(), columns_g.data(), columns_k.data(),
+              row_g.data(), row_kf.data(), row_qf.data(), row_mask.data(), beta_f.data(),
+              rows, block_n, row0, col0, vid);
+          SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
+          GM<float> qdst(aqk + ((first + row0 + vid) * heads + head) * C + col0,
+                        GS(1,1,1,owned_rows,block_n), ST(2 * heads * C));
+          GM<float> kdst(out + ((first + row0 + vid) * heads + head) * C + col0,
+                        GS(1,1,1,owned_rows,block_n), ST(2 * heads * C));
+          TSTORE(qdst, qvalues); TSTORE(kdst, kvalues);
+        }
+#else
         for (int local = vid; local < rows; local += 2) {
           int r = row0 + local;
           int n = r - col0 + 1 < block_n ? r - col0 + 1 : block_n;
@@ -121,6 +244,7 @@ AICORE inline void launch_kkt_rows(
                        GS(1,1,1,1,block_n), ST(N));
           TSTORE(dst, values);
         }
+#endif
         pipe_barrier(PIPE_ALL);
       }
       pipe_barrier(PIPE_ALL);

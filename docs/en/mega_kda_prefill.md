@@ -1,6 +1,6 @@
 # MegaKdaPrefill
 
-Ascend910B mixed AIC/AIV single-launch vector-gated KDA prefill. The native
+Ascend910B/Ascend950 mixed AIC/AIV single-launch vector-gated KDA prefill. The native
 operator follows `mega_gdn_prefill_op` packaging and launch conventions, with
 FP32 KKT/inverse/WY/H/O numerical stages. It does not use the GDN
 scalar-gate recurrence and is not a decode/MTP implementation.
@@ -35,7 +35,13 @@ K/V dimensions and chunk size are 128. Conv width is four.
 
 ACLNN attributes are `conv_output_slots`, `ssm_output_slots`, `ffts_addr`, in
 that order. The Python C++ binding derives capacities and obtains the FFTS
-address from the active runtime. It never copies Device metadata to CPU.
+address from the active runtime on A2. On Ascend950 (A5), it passes zero:
+PTO MIX hardware barriers do not consume an FFTS address. It never copies
+Device metadata to CPU. Build for A5 with `--soc=ascend950`.
+
+The A5 WY/H/O stage templates are forced inline so that the mixed-image
+linker cannot merge architecture-dependent AIC/AIV bodies under one weak
+symbol. A2 retains its original stage linkage and FFTS synchronization.
 
 ```python
 output, conv_out, ssm_out = custom_ops_lib.mega_kda_prefill(

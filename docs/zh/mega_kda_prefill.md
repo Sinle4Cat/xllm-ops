@@ -25,7 +25,10 @@ norm/projection，不修改模型路由，也不提供 decode/MTP 兼容分支�
 
 ## 验证边界
 
-支持 Ascend910B、chunk/head dimension 128、Conv width 4。
+支持 Ascend910B 和 Ascend950（A5）、chunk/head dimension 128、Conv width 4。
+构建 A5 时指定 `--soc=ascend950`。A5 使用 PTO MIX 硬件同步，`ffts_addr`
+保留为 0；A2 仍要求有效 FFTS 地址。A5 的 WY/H/O 阶段强制内联，避免
+AIC/AIV 的同名模板弱符号在合并二进制时被错误共用。
 与既有 MegaGDN 绑定一致，调用前须将输入所在 NPU 设为当前设备。
 CPU golden 使用 FP64 递推和明确的 BF16 舍入边界，正常值相对误差、近零值
 绝对误差及超限比例分别报告。测试包含空序列、尾块、独立池容量、输入不变、

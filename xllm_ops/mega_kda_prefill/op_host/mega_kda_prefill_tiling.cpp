@@ -37,7 +37,8 @@ static ge::graphStatus MegaKdaPrefillTiling(gert::TilingContext* context)
     TilingData t{cu.GetDim(0) - 1, qkv.GetDim(0), ssm.GetDim(1), conv.GetDim(0),
         *attrs->GetInt(kConvOutputSlots), ssm.GetDim(0), *attrs->GetInt(kSsmOutputSlots),
         platform.GetCoreNumAic(), static_cast<uint64_t>(*attrs->GetInt(kFftsAddr))};
-    if (!ValidTiling(t)) return ge::GRAPH_FAILED;
+    if (!ValidTiling(t, platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950))
+        return ge::GRAPH_FAILED;
     const auto c = t.heads * 384;
     auto input = [&](size_t i, std::initializer_list<int64_t> dims, ge::DataType dtype) {
         const auto* desc = i == kConvBias ? context->GetOptionalInputDesc(i) : context->GetRequiredInputDesc(i);
