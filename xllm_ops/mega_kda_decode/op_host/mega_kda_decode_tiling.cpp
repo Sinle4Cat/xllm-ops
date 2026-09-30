@@ -1,5 +1,6 @@
 /* Copyright 2026 The xLLM Authors. All Rights Reserved. */
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -9,7 +10,8 @@ namespace optiling {
 namespace {
 bool Optional(size_t index)
 {
-    return index == mega_kda::kConvBias || index == mega_kda::kAcceptedTokens;
+    return index == mega_kda::kConvBias || index == mega_kda::kAcceptedTokens ||
+           index == mega_kda::kOutputGate || index == mega_kda::kNormWeight;
 }
 
 const gert::StorageShape* InputShape(gert::TilingContext* context, size_t index)
@@ -44,6 +46,8 @@ static ge::graphStatus MegaKdaDecodeTiling(gert::TilingContext* context)
             return ge::GRAPH_FAILED;
         }
     }
+    const auto* norm_eps = attrs->GetFloat(kNormEps);
+    if (!norm_eps || !std::isfinite(*norm_eps) || *norm_eps <= 0) return ge::GRAPH_FAILED;
     for (size_t i = 0; i < kInputCount; ++i) {
         if (!Optional(i) && !InputShape(context, i)) {
             return ge::GRAPH_FAILED;
@@ -59,8 +63,12 @@ static ge::graphStatus MegaKdaDecodeTiling(gert::TilingContext* context)
     }
     TilingData t{offsets.GetDim(0) - 1, qkv.GetDim(0), ssm.GetDim(1),
         *attrs->GetInt(kMaxQueryTokens), conv.GetDim(1), conv.GetDim(0),
-        *attrs->GetInt(kConvOutputSlots), ssm.GetDim(0), *attrs->GetInt(kSsmOutputSlots)};
-    const auto key = SelectKey(*attrs->GetInt(kMode), InputShape(context, kAcceptedTokens) != nullptr, t);
+        *attrs->GetInt(kConvOutputSlots), ssm.GetDim(0), *attrs->GetInt(kSsmOutputSlots),
+        *norm_eps, 0};
+    const bool fused_norm = InputShape(context, kOutputGate) != nullptr;
+    if (fused_norm != (InputShape(context, kNormWeight) != nullptr)) return ge::GRAPH_FAILED;
+    const auto key = SelectKey(*attrs->GetInt(kMode), InputShape(context, kAcceptedTokens) != nullptr,
+                               t, fused_norm);
     if (!key) {
         return ge::GRAPH_FAILED;
     }
@@ -85,7 +93,9 @@ static ge::graphStatus MegaKdaDecodeTiling(gert::TilingContext* context)
         !input(kSsmReadIndices, {t.batch, t.max_query_tokens}, ge::DT_INT32) ||
         !input(kSsmWriteIndices, {t.batch, t.max_query_tokens}, ge::DT_INT32) ||
         (InputShape(context, kConvBias) && !input(kConvBias, {c}, ge::DT_BF16)) ||
-        (InputShape(context, kAcceptedTokens) && !input(kAcceptedTokens, {t.batch}, ge::DT_INT32))) {
+        (InputShape(context, kAcceptedTokens) && !input(kAcceptedTokens, {t.batch}, ge::DT_INT32)) ||
+        (fused_norm && (!input(kOutputGate, {t.tokens, t.heads, 128}, ge::DT_BF16) ||
+                        !input(kNormWeight, {128}, ge::DT_BF16)))) {
         return ge::GRAPH_FAILED;
     }
     auto output = [&](size_t i, std::initializer_list<int64_t> dims, ge::DataType dtype) {
@@ -100,7 +110,8 @@ static ge::graphStatus MegaKdaDecodeTiling(gert::TilingContext* context)
     }
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const auto cores = platform.GetCoreNumAiv();
-    const uint32_t blocks = std::min<int64_t>(cores, t.batch * t.heads * 8);
+    const uint32_t blocks = std::min<int64_t>(cores, t.batch * t.heads *
+                                                    (fused_norm ? 1 : 4));
     auto* raw = context->GetRawTilingData();
     auto* workspace = context->GetWorkspaceSizes(1);
     if (!blocks || !raw || !raw->GetData() || raw->GetCapacity() < sizeof(t) || !workspace) {

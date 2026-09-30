@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from mega_kda_prefill_reference import OUTPUTS, make_case, reference
+from mega_kda_output_norm_reference import gated_rms_norm
 from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,7 +25,7 @@ def test_host_policy(tmp_path):
 #include "mega_kda_prefill_policy.h"
 int main() {
     using namespace kda_prefill;
-    TilingData t{3, 132, 2, 4, 6, 5, 7, 24, 1};
+    TilingData t{3, 132, 2, 4, 6, 5, 7, 24, 1, 1e-5f, 0};
     assert(ValidTiling(t));
     Workspace w(t);
     assert(w.q == 0 && w.k > w.q && w.bytes % 512 == 0);
@@ -113,7 +114,30 @@ def test_tp_reference_shape(tp):
     for name, value in zip(OUTPUTS, result):
         assert value.shape == data[name].shape and value.dtype == data[name].dtype
         assert torch.isfinite(value).all(), name
-    assert result[2].shape[1:] == (heads, 128, 128)
+
+
+def test_gated_output_norm_reference():
+    data = make_case((3, 0, 2), heads=2)
+    raw = reference(data)
+    data["output_gate"] = torch.linspace(-2, 2, data["output"].numel()).reshape_as(data["output"]).bfloat16()
+    data["norm_weight"] = torch.linspace(0.8, 1.2, 128).bfloat16()
+    data["norm_eps"] = 1e-5
+    fused = reference(data)
+    torch.testing.assert_close(fused[0], gated_rms_norm(raw[0], data["output_gate"],
+                                                     data["norm_weight"], data["norm_eps"]),
+                               rtol=0, atol=0)
+    assert all(bitwise_equal(a, b) for a, b in zip(fused[1:], raw[1:]))
+
+
+@NATIVE
+def test_native_gated_output_norm():
+    data = make_case((3, 0, 2), heads=2)
+    data["output_gate"] = torch.linspace(-2, 2, data["output"].numel()).reshape_as(data["output"]).bfloat16()
+    data["norm_weight"] = torch.linspace(0.8, 1.2, 128).bfloat16()
+    data["norm_eps"] = 1e-5
+    lib, actual = native_case(data)
+    lib.mega_kda_prefill(**actual)
+    check(data, actual, "gated-output-norm")
 
 
 @pytest.mark.parametrize("invalid", ["offsets", "read", "write", "duplicate", "alias"])

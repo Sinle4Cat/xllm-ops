@@ -1,5 +1,6 @@
 /* Copyright 2026 The xLLM Authors. All Rights Reserved. */
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -21,12 +22,17 @@ static ge::graphStatus MegaKdaPrefillTiling(gert::TilingContext* context)
     const auto* attrs = context->GetAttrs();
     if (!attrs || !context->GetPlatformInfo()) return ge::GRAPH_FAILED;
     for (size_t i = 0; i < 3; ++i) if (!attrs->GetInt(i)) return ge::GRAPH_FAILED;
+    const auto* norm_eps = attrs->GetFloat(kNormEps);
+    if (!norm_eps || !std::isfinite(*norm_eps) || *norm_eps <= 0) return ge::GRAPH_FAILED;
     auto shape = [&](size_t i) {
-        return i == kConvBias ? context->GetOptionalInputShape(i) : context->GetRequiredInputShape(i);
+        return i == kConvBias || i == kOutputGate || i == kNormWeight
+            ? context->GetOptionalInputShape(i) : context->GetRequiredInputShape(i);
     };
     for (size_t i = 0; i < kInputCount; ++i) {
-        if (i != kConvBias && !shape(i)) return ge::GRAPH_FAILED;
+        if (i != kConvBias && i != kOutputGate && i != kNormWeight && !shape(i)) return ge::GRAPH_FAILED;
     }
+    const bool fused_norm = shape(kOutputGate) != nullptr;
+    if (fused_norm != (shape(kNormWeight) != nullptr)) return ge::GRAPH_FAILED;
     const auto& qkv = shape(kQkv)->GetStorageShape();
     const auto& conv = shape(kConvStateIn)->GetStorageShape();
     const auto& ssm = shape(kSsmStateIn)->GetStorageShape();
@@ -36,11 +42,13 @@ static ge::graphStatus MegaKdaPrefillTiling(gert::TilingContext* context)
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     TilingData t{cu.GetDim(0) - 1, qkv.GetDim(0), ssm.GetDim(1), conv.GetDim(0),
         *attrs->GetInt(kConvOutputSlots), ssm.GetDim(0), *attrs->GetInt(kSsmOutputSlots),
-        platform.GetCoreNumAic(), static_cast<uint64_t>(*attrs->GetInt(kFftsAddr))};
+        platform.GetCoreNumAic(), static_cast<uint64_t>(*attrs->GetInt(kFftsAddr)),
+        *norm_eps, static_cast<uint32_t>(fused_norm)};
     if (!ValidTiling(t)) return ge::GRAPH_FAILED;
     const auto c = t.heads * 384;
     auto input = [&](size_t i, std::initializer_list<int64_t> dims, ge::DataType dtype) {
-        const auto* desc = i == kConvBias ? context->GetOptionalInputDesc(i) : context->GetRequiredInputDesc(i);
+        const auto* desc = i == kConvBias || i == kOutputGate || i == kNormWeight
+            ? context->GetOptionalInputDesc(i) : context->GetRequiredInputDesc(i);
         return shape(i) && desc && desc->GetDataType() == dtype && Match(shape(i)->GetStorageShape(), dims);
     };
     if (!input(kQkv, {t.tokens, c}, ge::DT_BF16) ||
@@ -52,7 +60,9 @@ static ge::graphStatus MegaKdaPrefillTiling(gert::TilingContext* context)
         (shape(kConvBias) && !input(kConvBias, {c}, ge::DT_BF16)) ||
         !input(kConvStateIn, {t.conv_input_slots, 3, c}, ge::DT_BF16) ||
         !input(kSsmStateIn, {t.ssm_input_slots, t.heads, 128, 128}, ge::DT_FLOAT) ||
-        !input(kCuSeqlens, {t.batch + 1}, ge::DT_INT32)) return ge::GRAPH_FAILED;
+        !input(kCuSeqlens, {t.batch + 1}, ge::DT_INT32) ||
+        (fused_norm && (!input(kOutputGate, {t.tokens, t.heads, 128}, ge::DT_BF16) ||
+                        !input(kNormWeight, {128}, ge::DT_BF16)))) return ge::GRAPH_FAILED;
     for (auto i : {kConvReadIndices, kConvWriteIndices, kSsmReadIndices, kSsmWriteIndices}) {
         if (!input(i, {t.batch}, ge::DT_INT32)) return ge::GRAPH_FAILED;
     }

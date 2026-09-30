@@ -14,6 +14,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
     GM_ADDR conv_weight, GM_ADDR conv_bias, GM_ADDR conv_state_in, GM_ADDR ssm_state_in,
     GM_ADDR cu_seqlens, GM_ADDR conv_read_indices, GM_ADDR conv_write_indices,
     GM_ADDR ssm_read_indices, GM_ADDR ssm_write_indices,
+    GM_ADDR output_gate, GM_ADDR norm_weight,
     GM_ADDR output, GM_ADDR conv_state_out, GM_ADDR ssm_state_out,
     GM_ADDR workspace, GM_ADDR tiling)
 {
@@ -31,6 +32,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
         reinterpret_cast<__gm__ float*>(ssm_state_in), reinterpret_cast<__gm__ int32_t*>(cu_seqlens),
         reinterpret_cast<__gm__ int32_t*>(conv_read_indices), reinterpret_cast<__gm__ int32_t*>(conv_write_indices),
         reinterpret_cast<__gm__ int32_t*>(ssm_read_indices), reinterpret_cast<__gm__ int32_t*>(ssm_write_indices),
+        reinterpret_cast<__gm__ bfloat16_t*>(output_gate), reinterpret_cast<__gm__ bfloat16_t*>(norm_weight),
         reinterpret_cast<__gm__ bfloat16_t*>(output), reinterpret_cast<__gm__ bfloat16_t*>(conv_state_out),
         reinterpret_cast<__gm__ float*>(ssm_state_out)};
     // Every core validates the same immutable metadata before any publication or barrier.

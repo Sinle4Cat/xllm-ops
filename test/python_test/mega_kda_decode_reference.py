@@ -1,6 +1,7 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
 """FP64 CPU formula oracle for the GLM vector-gate KDA decode ABI."""
 import torch
+from mega_kda_output_norm_reference import gated_rms_norm
 
 
 OUTPUTS = ("output", "conv_state_out", "ssm_state_out")
@@ -70,6 +71,9 @@ def reference(data):
             delta = (v - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = state + delta[:, :, None] * k[:, None, :]
             out[token] = (state * q[:, None, :]).sum(-1).bfloat16()
+            if data.get("output_gate") is not None:
+                out[token] = gated_rms_norm(out[token], data["output_gate"][token],
+                                             data["norm_weight"], data["norm_eps"])
             if writes[i] >= 0:
                 ssm_out[writes[i]] = state
         if cw >= 0:

@@ -21,6 +21,8 @@ public:
         Input("ssm_read_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         Input("ssm_write_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         Input("num_accepted_tokens").ParamType(OPTIONAL).DataType({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
+        Input("output_gate").ParamType(OPTIONAL).DataType({ge::DT_BF16}).FormatList({ge::FORMAT_ND});
+        Input("norm_weight").ParamType(OPTIONAL).DataType({ge::DT_BF16}).FormatList({ge::FORMAT_ND});
         Output("output").ParamType(REQUIRED).DataType({ge::DT_BF16}).FormatList({ge::FORMAT_ND});
         Output("conv_state_out").ParamType(REQUIRED).DataType({ge::DT_BF16}).FormatList({ge::FORMAT_ND});
         Output("ssm_state_out").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).FormatList({ge::FORMAT_ND});
@@ -28,6 +30,7 @@ public:
         Attr("max_query_tokens").AttrType(OPTIONAL).Int(1);
         Attr("conv_output_slots").AttrType(REQUIRED).Int();
         Attr("ssm_output_slots").AttrType(REQUIRED).Int();
+        Attr("norm_eps").AttrType(OPTIONAL).Float(1e-5f);
         AICore().AddConfig("ascend910b");
     }
 };

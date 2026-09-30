@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <torch/library.h>
+#include <cmath>
 
 #include <dlfcn.h>
 
@@ -1927,14 +1928,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_prefill(
     const at::Tensor& ssm_write_indices,
     at::Tensor& output,
     at::Tensor& conv_state_out,
-    at::Tensor& ssm_state_out) {
+    at::Tensor& ssm_state_out,
+    const c10::optional<at::Tensor>& output_gate,
+    const c10::optional<at::Tensor>& norm_weight,
+    double norm_eps) {
   TORCH_CHECK(qkv.device().type() == c10::DeviceType::PrivateUse1,
               "MegaKdaPrefill requires NPU tensors");
+  TORCH_CHECK(output_gate.has_value() == norm_weight.has_value() &&
+              std::isfinite(norm_eps) && norm_eps > 0,
+              "MegaKdaPrefill requires a gate and weight pair with positive norm epsilon");
+  if (output_gate) {
+    TORCH_CHECK(output_gate->sizes() == output.sizes() &&
+                norm_weight->numel() == 128 && norm_weight->dim() == 1 &&
+                output_gate->scalar_type() == at::kBFloat16 &&
+                norm_weight->scalar_type() == at::kBFloat16,
+                "MegaKdaPrefill output norm shapes/dtypes must match BF16 [T,H,128]/[128]");
+  }
   std::vector<at::Tensor> inputs = {
       qkv, gate, beta, a_log, gate_bias, conv_weight, conv_state_in,
       ssm_state_in, cu_seqlens, conv_read_indices, conv_write_indices,
       ssm_read_indices, ssm_write_indices};
   if (conv_bias) inputs.push_back(*conv_bias);
+  if (output_gate) { inputs.push_back(*output_gate); inputs.push_back(*norm_weight); }
   std::vector<at::Tensor> outputs = {output, conv_state_out, ssm_state_out};
   for (const auto& tensor : inputs) {
     TORCH_CHECK(tensor.defined() && tensor.device() == qkv.device() && tensor.is_contiguous(),
@@ -1972,7 +1987,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_prefill(
   EXEC_NPU_CMD(aclnnMegaKdaPrefill, qkv, gate, beta, a_log, gate_bias,
                conv_weight, conv_bias, conv_state_in, ssm_state_in, cu_seqlens,
                conv_read_indices, conv_write_indices, ssm_read_indices,
-               ssm_write_indices, conv_output_slots, ssm_output_slots, ffts_attr,
+               ssm_write_indices, output_gate, norm_weight,
+               conv_output_slots, ssm_output_slots, ffts_attr, norm_eps,
                output, conv_state_out, ssm_state_out);
   return std::make_tuple(output, conv_state_out, ssm_state_out);
 }
@@ -1997,9 +2013,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_decode(
     int64_t max_query_tokens,
     at::Tensor& output,
     at::Tensor& conv_state_out,
-    at::Tensor& ssm_state_out) {
+    at::Tensor& ssm_state_out,
+    const c10::optional<at::Tensor>& output_gate,
+    const c10::optional<at::Tensor>& norm_weight,
+    double norm_eps) {
   TORCH_CHECK(qkv.device().type() == c10::DeviceType::PrivateUse1,
               "MegaKdaDecode requires NPU tensors");
+  TORCH_CHECK(output_gate.has_value() == norm_weight.has_value() &&
+              std::isfinite(norm_eps) && norm_eps > 0,
+              "MegaKdaDecode requires a gate and weight pair with positive norm epsilon");
+  if (output_gate) {
+    TORCH_CHECK(output_gate->sizes() == output.sizes() &&
+                norm_weight->numel() == 128 && norm_weight->dim() == 1 &&
+                output_gate->scalar_type() == at::kBFloat16 &&
+                norm_weight->scalar_type() == at::kBFloat16,
+                "MegaKdaDecode output norm shapes/dtypes must match BF16 [T,H,128]/[128]");
+  }
   TORCH_CHECK((mode == 0 && max_query_tokens == 1 && !num_accepted_tokens) ||
               (mode == 1 && max_query_tokens >= 1 && max_query_tokens <= 17 && num_accepted_tokens),
               "invalid MegaKdaDecode mode/capacity/accepted-count combination");
@@ -2009,6 +2038,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_decode(
       ssm_read_indices, ssm_write_indices};
   if (conv_bias) inputs.push_back(*conv_bias);
   if (num_accepted_tokens) inputs.push_back(*num_accepted_tokens);
+  if (output_gate) { inputs.push_back(*output_gate); inputs.push_back(*norm_weight); }
   std::vector<at::Tensor> outputs = {output, conv_state_out, ssm_state_out};
   for (const auto& tensor : inputs) {
     TORCH_CHECK(tensor.defined() && tensor.device() == qkv.device() && tensor.is_contiguous(),
@@ -2033,8 +2063,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_decode(
   EXEC_NPU_CMD(aclnnMegaKdaDecode, qkv, gate, beta, a_log, gate_bias,
                conv_weight, conv_bias, conv_state_in, ssm_state_in, cu_seqlens,
                conv_read_indices, conv_write_indices, ssm_read_indices,
-               ssm_write_indices, num_accepted_tokens, mode, max_query_tokens,
-               conv_output_slots, ssm_output_slots, output, conv_state_out, ssm_state_out);
+               ssm_write_indices, num_accepted_tokens, output_gate, norm_weight,
+               mode, max_query_tokens, conv_output_slots, ssm_output_slots, norm_eps,
+               output, conv_state_out, ssm_state_out);
   return std::make_tuple(output, conv_state_out, ssm_state_out);
 }
 
@@ -2223,7 +2254,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("cu_seqlens"), pybind11::arg("conv_read_indices"),
         pybind11::arg("conv_write_indices"), pybind11::arg("ssm_read_indices"),
         pybind11::arg("ssm_write_indices"), pybind11::arg("output"),
-        pybind11::arg("conv_state_out"), pybind11::arg("ssm_state_out"));
+        pybind11::arg("conv_state_out"), pybind11::arg("ssm_state_out"),
+        pybind11::arg("output_gate") = pybind11::none(),
+        pybind11::arg("norm_weight") = pybind11::none(),
+        pybind11::arg("norm_eps") = 1e-5);
   m.def("mega_kda_decode", &mega_kda_decode, "mega_kda_decode",
         pybind11::arg("qkv"), pybind11::arg("gate"), pybind11::arg("beta"),
         pybind11::arg("a_log"), pybind11::arg("gate_bias"), pybind11::arg("conv_weight"),
@@ -2232,7 +2266,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("conv_write_indices"), pybind11::arg("ssm_read_indices"),
         pybind11::arg("ssm_write_indices"), pybind11::arg("num_accepted_tokens"),
         pybind11::arg("mode"), pybind11::arg("max_query_tokens"), pybind11::arg("output"),
-        pybind11::arg("conv_state_out"), pybind11::arg("ssm_state_out"));
+        pybind11::arg("conv_state_out"), pybind11::arg("ssm_state_out"),
+        pybind11::arg("output_gate") = pybind11::none(),
+        pybind11::arg("norm_weight") = pybind11::none(),
+        pybind11::arg("norm_eps") = 1e-5);
   m.def("mega_gdn_decode",
         &mega_gdn_decode,
         "mega_gdn_decode",

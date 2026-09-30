@@ -18,7 +18,8 @@ inline bool FitsBytes(std::initializer_list<int64_t> dims)
     return true;
 }
 
-inline uint64_t SelectKey(int64_t mode, bool hasAccepted, const TilingData& t)
+inline uint64_t SelectKey(int64_t mode, bool hasAccepted, const TilingData& t,
+                          bool fusedNorm = false)
 {
     for (int64_t dim : {t.batch, t.tokens, t.heads, t.max_query_tokens,
                         t.conv_history, t.conv_input_slots, t.conv_output_slots,
@@ -39,10 +40,10 @@ inline uint64_t SelectKey(int64_t mode, bool hasAccepted, const TilingData& t)
     }
     if (mode == 0 && !hasAccepted && t.max_query_tokens == 1 &&
         t.tokens == t.batch && t.conv_history == 3) {
-        return kPlainKey;
+        return fusedNorm ? kPlainNormKey : kPlainKey;
     }
     if (mode == 1 && hasAccepted && t.conv_history == t.max_query_tokens + 2) {
-        return kMtpKey;
+        return fusedNorm ? kMtpNormKey : kMtpKey;
     }
     return 0;
 }

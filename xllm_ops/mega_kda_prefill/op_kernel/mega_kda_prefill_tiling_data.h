@@ -12,13 +12,16 @@ constexpr int64_t kHeadDim = 128;
 enum Input : unsigned {
     kQkv, kGate, kBeta, kALog, kGateBias, kConvWeight, kConvBias,
     kConvStateIn, kSsmStateIn, kCuSeqlens, kConvReadIndices,
-    kConvWriteIndices, kSsmReadIndices, kSsmWriteIndices, kInputCount
+    kConvWriteIndices, kSsmReadIndices, kSsmWriteIndices,
+    kOutputGate, kNormWeight, kInputCount
 };
-enum Attr : unsigned { kConvOutputSlots, kSsmOutputSlots, kFftsAddr };
+enum Attr : unsigned { kConvOutputSlots, kSsmOutputSlots, kFftsAddr, kNormEps };
 struct TilingData {
     int64_t batch, tokens, heads;
     int64_t conv_input_slots, conv_output_slots, ssm_input_slots, ssm_output_slots;
     uint64_t blocks, ffts_addr;
+    float norm_eps;
+    uint32_t fuse_output_norm;
 };
 
 // Shared host/device layout. Every buffer starts on a DMA-safe boundary.

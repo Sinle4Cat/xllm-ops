@@ -6,6 +6,8 @@
 namespace mega_kda {
 constexpr uint64_t kPlainKey = 1;
 constexpr uint64_t kMtpKey = 2;
+constexpr uint64_t kPlainNormKey = 3;
+constexpr uint64_t kMtpNormKey = 4;
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kValueTile = 16;
 
@@ -20,14 +22,17 @@ struct TilingData {
     int64_t conv_output_slots;
     int64_t ssm_input_slots;
     int64_t ssm_output_slots;
+    float norm_eps;
+    uint32_t reserved;
 };
-static_assert(sizeof(TilingData) == 72, "MegaKdaDecode tiling ABI changed");
+static_assert(sizeof(TilingData) == 80, "MegaKdaDecode tiling ABI changed");
 
 enum Input : uint32_t {
     kQkv, kGate, kBeta, kALog, kGateBias, kConvWeight, kConvBias,
     kConvStateIn, kSsmStateIn, kCuSeqlens, kConvReadIndices,
     kConvWriteIndices, kSsmReadIndices, kSsmWriteIndices, kAcceptedTokens,
+    kOutputGate, kNormWeight,
     kInputCount
 };
-enum Attr : uint32_t { kMode, kMaxQueryTokens, kConvOutputSlots, kSsmOutputSlots };
+enum Attr : uint32_t { kMode, kMaxQueryTokens, kConvOutputSlots, kSsmOutputSlots, kNormEps };
 } // namespace mega_kda

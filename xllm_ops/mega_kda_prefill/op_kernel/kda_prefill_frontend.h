@@ -36,6 +36,7 @@ struct Args {
     __gm__ bfloat16_t *weight, *bias, *conv_in;
     __gm__ float* ssm_in;
     __gm__ int32_t *cu, *conv_read, *conv_write, *ssm_read, *ssm_write;
+    __gm__ bfloat16_t *output_gate, *norm_weight;
     __gm__ bfloat16_t *output, *conv_out;
     __gm__ float* ssm_out;
 };
@@ -76,6 +77,9 @@ AICORE inline void Rendezvous()
 
 struct FrontScratch {
     ND<float, 1, 128> acc, x, weight, tmp, norm_broadcast, gate, cumulative;
+    ND<float, 1, 128> gate_bias_cache, gate_scale_cache;
+    ND<float, 1, 128> conv_weight_cache[12], conv_bias_cache[3];
+    ND<float, 1, 128> conv_input_cache[12];
     ND<bfloat16_t, 1, 128> bf;
     ND<half, 1, 128> fp16;
     ND<float, 1, 64> reduce;
@@ -87,6 +91,10 @@ struct FrontScratch {
         TASSIGN(norm_broadcast, 2048); TASSIGN(gate, 2560); TASSIGN(cumulative, 3072);
         TASSIGN(bf, 3584); TASSIGN(fp16, 3840); TASSIGN(reduce, 4096);
         TASSIGN(scalar, 4352); TASSIGN(column, 4352);
+        TASSIGN(gate_bias_cache, 4608); TASSIGN(gate_scale_cache, 5120);
+        for (int i = 0; i < 12; ++i) TASSIGN(conv_weight_cache[i], 5632 + i * 512);
+        for (int i = 0; i < 3; ++i) TASSIGN(conv_bias_cache[i], 11776 + i * 512);
+        for (int i = 0; i < 12; ++i) TASSIGN(conv_input_cache[i], 13312 + i * 512);
     }
     AICORE inline void BfLoad(ND<float, 1, 128>& dst, __gm__ bfloat16_t* src)
     {
@@ -95,24 +103,26 @@ struct FrontScratch {
     }
 };
 
-AICORE inline void Conv(FrontScratch& s, const Args& a, const TilingData& t,
-                        int64_t b, int64_t token, int64_t channel)
+AICORE inline void LoadConvInput(FrontScratch& s, ND<float, 1, 128>& dst, const Args& a,
+                                 int64_t pos, int64_t begin, int64_t read, int64_t c,
+                                 int64_t channel)
 {
-    const int64_t c = t.heads * 384, read = a.conv_read[b], begin = a.cu[b];
-    if (a.bias) s.BfLoad(s.acc, a.bias + channel);
+    if (pos < begin && read < 0) { TEXPANDS(dst, 0.0f); PipeBarrierVec(); }
+    else {
+        auto* p = pos < begin ? a.conv_in + (read * 3 + pos - begin + 3) * c + channel
+                             : a.qkv + pos * c + channel;
+        s.BfLoad(dst, p);
+    }
+    TCVT(s.fp16, dst, RoundMode::CAST_RINT); PipeBarrierVec();
+    TCVT(dst, s.fp16, RoundMode::CAST_NONE); PipeBarrierVec();
+}
+
+AICORE inline void Conv(FrontScratch& s, const Args& a, int part)
+{
+    if (a.bias) { TMOV(s.acc, s.conv_bias_cache[part]); PipeBarrierVec(); }
     else { TEXPANDS(s.acc, 0.0f); PipeBarrierVec(); }
     for (int tap = 0; tap < 4; ++tap) {
-        const int64_t pos = token + tap - 3;
-        if (pos < begin && read < 0) { TEXPANDS(s.x, 0.0f); PipeBarrierVec(); }
-        else {
-            auto* p = pos < begin ? a.conv_in + (read * 3 + pos - begin + 3) * c + channel
-                                 : a.qkv + pos * c + channel;
-            s.BfLoad(s.x, p);
-        }
-        TCVT(s.fp16, s.x, RoundMode::CAST_RINT); PipeBarrierVec();
-        TCVT(s.x, s.fp16, RoundMode::CAST_NONE); PipeBarrierVec();
-        s.BfLoad(s.weight, a.weight + tap * c + channel);
-        TMUL(s.tmp, s.x, s.weight); PipeBarrierVec();
+        TMUL(s.tmp, s.conv_input_cache[part * 4 + tap], s.conv_weight_cache[part * 4 + tap]); PipeBarrierVec();
         TADD(s.acc, s.acc, s.tmp); PipeBarrierVec();
     }
     TMULS(s.tmp, s.acc, -1.0f); PipeBarrierVec();
@@ -153,10 +163,23 @@ AICORE inline void Prepare(const Args& a, const TilingData& t, __gm__ uint8_t* w
         }
         const int64_t start = a.cu[b] + chunk * 128;
         const int64_t end = start + 128 < a.cu[b + 1] ? start + 128 : a.cu[b + 1];
+        const int64_t begin = a.cu[b], read = a.conv_read[b], c = t.heads * 384;
+        Load(s.gate_bias_cache, a.gate_bias + h * 128, 1, 128, 128);
+        TEXPANDS(s.gate_scale_cache, a.a_log[h]); PipeBarrierVec();
+        TEXP(s.gate_scale_cache, s.gate_scale_cache); PipeBarrierVec();
+        for (int part = 0; part < 3; ++part) {
+            const int64_t channel = (part * t.heads + h) * 128;
+            if (a.bias) s.BfLoad(s.conv_bias_cache[part], a.bias + channel);
+            for (int tap = 0; tap < 4; ++tap)
+                s.BfLoad(s.conv_weight_cache[part * 4 + tap], a.weight + tap * t.heads * 384 + channel);
+            for (int tap = 0; tap < 4; ++tap)
+                LoadConvInput(s, s.conv_input_cache[part * 4 + tap], a,
+                              start + tap - 3, begin, read, c, channel);
+        }
         TEXPANDS(s.cumulative, 0.0f); PipeBarrierVec();
         for (int64_t token = start; token < end; ++token) {
             for (int part = 0; part < 3; ++part) {
-                Conv(s, a, t, b, token, (part * t.heads + h) * 128);
+                Conv(s, a, part);
                 if (part < 2) {
                     Normalize(s);
                     Store(reinterpret_cast<__gm__ bfloat16_t*>(ws + (part == 0 ? w.q : w.k)) +
@@ -167,11 +190,8 @@ AICORE inline void Prepare(const Args& a, const TilingData& t, __gm__ uint8_t* w
                 }
             }
             s.BfLoad(s.gate, a.gate + (token * t.heads + h) * 128);
-            Load(s.tmp, a.gate_bias + h * 128, 1, 128, 128);
-            TADD(s.gate, s.gate, s.tmp); PipeBarrierVec();
-            TEXPANDS(s.tmp, a.a_log[h]); PipeBarrierVec();
-            TEXP(s.tmp, s.tmp); PipeBarrierVec();
-            TMUL(s.gate, s.gate, s.tmp); PipeBarrierVec();
+            TADD(s.gate, s.gate, s.gate_bias_cache); PipeBarrierVec();
+            TMUL(s.gate, s.gate, s.gate_scale_cache); PipeBarrierVec();
             TMULS(s.gate, s.gate, -1.0f); PipeBarrierVec();
             TEXP(s.gate, s.gate); PipeBarrierVec();
             TADDS(s.gate, s.gate, 1.0f); PipeBarrierVec();
@@ -185,6 +205,16 @@ AICORE inline void Prepare(const Args& a, const TilingData& t, __gm__ uint8_t* w
             TEXPANDS(s.tmp, 0.0f); PipeBarrierVec();
             Store(reinterpret_cast<__gm__ float*>(ws + w.lower) + (token * t.heads + h) * 128, s.tmp, 1, 128, 128);
             Store(reinterpret_cast<__gm__ float*>(ws + w.aqk) + (token * t.heads + h) * 128, s.tmp, 1, 128, 128);
+            if (token + 1 < end) {
+                for (int part = 0; part < 3; ++part) {
+                    auto* input = &s.conv_input_cache[part * 4];
+                    TMOV(input[0], input[1]); PipeBarrierVec();
+                    TMOV(input[1], input[2]); PipeBarrierVec();
+                    TMOV(input[2], input[3]); PipeBarrierVec();
+                    LoadConvInput(s, input[3], a, token + 1, begin, read, c,
+                                  (part * t.heads + h) * 128);
+                }
+            }
         }
         if (end == a.cu[b + 1] && a.conv_write[b] >= 0) {
             for (int part = 0; part < 3; ++part) {
@@ -256,13 +286,41 @@ AICORE inline void Output(const Args& a, const TilingData& t, __gm__ uint8_t* ws
 {
 #if defined(__DAV_VEC__)
     ND<float, 1, 128> x;
+    ND<float, 1, 128> tmp, gate, weight;
     ND<bfloat16_t, 1, 128> y;
-    TASSIGN(x, 0); TASSIGN(y, 512);
+    ND<float, 1, 64> reduce;
+    ND<float, 1, 8, 1, 1> scalar;
+    Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, 1, 1> column;
+    TASSIGN(x, 0); TASSIGN(tmp, 512); TASSIGN(gate, 1024); TASSIGN(weight, 1536);
+    TASSIGN(y, 2048); TASSIGN(reduce, 2304); TASSIGN(scalar, 2560); TASSIGN(column, 2560);
     const int64_t cores = get_block_num() * 2;
     for (int64_t task = get_block_idx() * 2 + get_subblockid(); task < t.tokens * t.heads; task += cores) {
         Load(x, reinterpret_cast<__gm__ float*>(ws + w.output) + task * 128, 1, 128, 128);
         TMULS(x, x, 0.08838834764831845f); PipeBarrierVec();
         TCVT(y, x, RoundMode::CAST_RINT); PipeBarrierVec();
+        if (t.fuse_output_norm) {
+            // Match the public BF16 KDA output before RMSNorm and sigmoid gate.
+            TCVT(x, y, RoundMode::CAST_NONE); PipeBarrierVec();
+            TMUL(tmp, x, x); PipeBarrierVec();
+            TROWSUM(column, tmp, reduce); PipeBarrierVec();
+            TMULS(scalar, scalar, 0.0078125f); PipeBarrierVec();
+            TADDS(scalar, scalar, t.norm_eps); PipeBarrierVec();
+            TSQRT(scalar, scalar); PipeBarrierVec();
+            TROWEXPAND(tmp, column); PipeBarrierVec();
+            TDIV(x, x, tmp); PipeBarrierVec();
+            Load(y, a.norm_weight, 1, 128, 128);
+            TCVT(weight, y, RoundMode::CAST_NONE); PipeBarrierVec();
+            TMUL(x, x, weight); PipeBarrierVec();
+            Load(y, a.output_gate + task * 128, 1, 128, 128);
+            TCVT(gate, y, RoundMode::CAST_NONE); PipeBarrierVec();
+            TMULS(tmp, gate, -1.0f); PipeBarrierVec();
+            TEXP(tmp, tmp); PipeBarrierVec();
+            TADDS(tmp, tmp, 1.0f); PipeBarrierVec();
+            TEXPANDS(gate, 1.0f); PipeBarrierVec();
+            TDIV(gate, gate, tmp); PipeBarrierVec();
+            TMUL(x, x, gate); PipeBarrierVec();
+            TCVT(y, x, RoundMode::CAST_RINT); PipeBarrierVec();
+        }
         Store(a.output + task * 128, y, 1, 128, 128);
     }
 #endif

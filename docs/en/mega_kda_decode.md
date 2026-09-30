@@ -16,6 +16,8 @@ There is one global Device entry, `mega_kda_decode`:
 | --- | --- | --- |
 | 0 | 1 | Dense ordinary decode, one token per request |
 | 1 | 2 | MTP verify, restore accepted checkpoint, publish every query checkpoint |
+| 0 | 3 | Ordinary decode with gated output RMSNorm |
+| 1 | 4 | MTP verify with gated output RMSNorm |
 
 A one-token MTP call still uses key 2. Host selects the key from the explicit
 mode and static capacity, not from accepted-count values. Token offsets,
@@ -47,6 +49,8 @@ Packed QKV order is all Q heads, all K heads, all V heads.
 | conv_read_indices, conv_write_indices | [B] | int32 |
 | ssm_read_indices, ssm_write_indices | [B,M] | int32 |
 | num_accepted_tokens (MTP only) | [B] | int32 |
+| output_gate (optional) | [N,H,128] | BF16 |
+| norm_weight (optional) | [128] | BF16 |
 | output | [N,H,128] | BF16 |
 | conv_state_out | [conv_output_slots,L,C] | BF16 |
 | ssm_state_out | [ssm_output_slots,H,128,128] | FP32 |
@@ -61,6 +65,13 @@ The PyBind entry `custom_ops_lib.mega_kda_decode` takes inputs in table order,
 then `mode`, `max_query_tokens`, `output`, `conv_state_out`, `ssm_state_out`.
 Pass `None` for absent Conv bias and, in ordinary decode, accepted counts.
 It returns the same three output tensors without cloning state or projected QKV.
+`output_gate` and `norm_weight` are optional trailing binding arguments and
+must be supplied together; `norm_eps` defaults to `1e-5`. The fused path first
+rounds each raw KDA output to BF16, then applies FP32 RMSNorm with the supplied
+weight and sigmoid gate, and rounds the result to BF16. The original tile32
+path is selected when the optional inputs are absent. The fused path processes
+all four V shards on one task per head before normalization; its performance
+requires fresh validation.
 
 Unlike `MegaKdaPrefill`, beta here is the raw BF16 projection and sigmoid is
 computed inside the operator. Prefill consumes FP32 post-sigmoid beta. A decode

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from mega_kda_decode_reference import OUTPUTS, make_case, reference
+from mega_kda_output_norm_reference import gated_rms_norm
 from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics
 
 
@@ -25,9 +26,11 @@ def test_native_host_policy(tmp_path):
 #include "mega_kda_decode_policy.h"
 int main() {
     using namespace mega_kda;
-    TilingData t{2, 2, 8, 1, 3, 4, 7, 5, 9};
+    TilingData t{2, 2, 8, 1, 3, 4, 7, 5, 9, 1e-5f, 0};
     assert(SelectKey(0, false, t) == 1);
     assert(SelectKey(1, true, t) == 2);
+    assert(SelectKey(0, false, t, true) == 3);
+    assert(SelectKey(1, true, t, true) == 4);
     assert(SelectKey(0, true, t) == 0);
     assert(SelectKey(1, false, t) == 0);
     assert(SelectKey(2, false, t) == 0);
@@ -111,6 +114,43 @@ def test_reference_checkpoint_restore_and_discard():
     assert torch.equal(restored[0], discarded[0])
     assert torch.equal(discarded[1], data["conv_state_out"])
     assert torch.equal(discarded[2], data["ssm_state_out"])
+
+
+@pytest.mark.parametrize("mode,capacity", [(0, 1), (1, 4)])
+def test_gated_output_norm_reference(mode, capacity):
+    data = make_case(batch=3, heads=2, mode=mode, capacity=capacity, ragged=True, padding=True)
+    raw = reference(data)
+    data["output_gate"] = torch.linspace(-2, 2, data["output"].numel()).reshape_as(data["output"]).bfloat16()
+    data["norm_weight"] = torch.linspace(0.8, 1.2, 128).bfloat16()
+    data["norm_eps"] = 1e-5
+    fused = reference(data)
+    active = raw[0] != 37
+    expected = gated_rms_norm(raw[0], data["output_gate"], data["norm_weight"], data["norm_eps"])
+    assert bitwise_equal(fused[0][active], expected[active])
+    assert bitwise_equal(fused[0][~active], raw[0][~active])
+    assert all(bitwise_equal(a, b) for a, b in zip(fused[1:], raw[1:]))
+
+
+@NPU_TEST
+@pytest.mark.parametrize("mode,capacity", [(0, 1), (1, 4)])
+def test_native_gated_output_norm(mode, capacity):
+    data = make_case(batch=3, heads=2, mode=mode, capacity=capacity, ragged=True, padding=True)
+    data["output_gate"] = torch.linspace(-2, 2, data["output"].numel()).reshape_as(data["output"]).bfloat16()
+    data["norm_weight"] = torch.linspace(0.8, 1.2, 128).bfloat16()
+    data["norm_eps"] = 1e-5
+    ops, actual = npu_case(data)
+    ops.mega_kda_decode(**actual)
+    assert_native(data, actual)
+
+
+@NPU_TEST
+@pytest.mark.parametrize("mode,capacity", [(0, 1), (1, 4)])
+def test_native_raw_output_smoke(mode, capacity):
+    data = make_case(batch=3, heads=2, mode=mode, capacity=capacity,
+                     ragged=True, padding=True)
+    ops, actual = npu_case(data)
+    ops.mega_kda_decode(**actual)
+    assert_native(data, actual)
 
 
 @pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")

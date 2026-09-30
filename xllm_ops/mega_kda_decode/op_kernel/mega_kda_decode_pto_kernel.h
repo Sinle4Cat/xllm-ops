@@ -44,6 +44,7 @@ struct Args {
     __gm__ bfloat16_t *conv_weight, *conv_bias, *conv_in;
     __gm__ float* ssm_in;
     __gm__ int32_t *offsets, *conv_read, *conv_write, *ssm_read, *ssm_write, *accepted;
+    __gm__ bfloat16_t *output_gate, *norm_weight;
     __gm__ bfloat16_t *output, *conv_out;
     __gm__ float* ssm_out;
 };
@@ -97,6 +98,51 @@ struct Scratch {
         TASSIGN(out, scalars + 96);
     }
 };
+
+struct NormScratch {
+    TileND<float, 1, 128> x, tmp, gate, weight;
+    TileND<bfloat16_t, 1, 128> bf16;
+    TileND<float, 1, 64> reduce_work;
+    Column<8, 1> column;
+    TileND<float, 1, 8, 1, 1> scalar;
+
+    AICORE inline void Init()
+    {
+        TASSIGN(x, 0); TASSIGN(tmp, 512); TASSIGN(gate, 1024); TASSIGN(weight, 1536);
+        TASSIGN(bf16, 2048); TASSIGN(reduce_work, 2304);
+        TASSIGN(column, 2560); TASSIGN(scalar, 2560);
+    }
+};
+
+AICORE inline void NormalizeOutput(const Args& a, const TilingData& t,
+                                  int64_t token, int64_t head)
+{
+    const int64_t offset = (token * t.heads + head) * 128;
+    NormScratch s;
+    s.Init();
+    Load<bfloat16_t, 1, 128>(s.bf16, a.output + offset);
+    TCVT(s.x, s.bf16, RoundMode::CAST_NONE); VBarrier();
+    TMUL(s.tmp, s.x, s.x); VBarrier();
+    TROWSUM(s.column, s.tmp, s.reduce_work); VBarrier();
+    TMULS(s.scalar, s.scalar, 0.0078125f); VBarrier();
+    TADDS(s.scalar, s.scalar, t.norm_eps); VBarrier();
+    TSQRT(s.scalar, s.scalar); VBarrier();
+    TROWEXPAND(s.tmp, s.column); VBarrier();
+    TDIV(s.x, s.x, s.tmp); VBarrier();
+    Load<bfloat16_t, 1, 128>(s.bf16, a.norm_weight);
+    TCVT(s.weight, s.bf16, RoundMode::CAST_NONE); VBarrier();
+    TMUL(s.x, s.x, s.weight); VBarrier();
+    Load<bfloat16_t, 1, 128>(s.bf16, a.output_gate + offset);
+    TCVT(s.gate, s.bf16, RoundMode::CAST_NONE); VBarrier();
+    TMULS(s.tmp, s.gate, -1.0f); VBarrier();
+    TEXP(s.tmp, s.tmp); VBarrier();
+    TADDS(s.tmp, s.tmp, 1.0f); VBarrier();
+    TEXPANDS(s.gate, 1.0f); VBarrier();
+    TDIV(s.gate, s.gate, s.tmp); VBarrier();
+    TMUL(s.x, s.x, s.gate); VBarrier();
+    TCVT(s.bf16, s.x, RoundMode::CAST_RINT); VBarrier();
+    Store<bfloat16_t, 1, 128>(a.output + offset, s.bf16);
+}
 
 AICORE inline void LoadBf16(Scratch& s, TileND<float, 1, 128>& dst, __gm__ bfloat16_t* ptr)
 {
@@ -232,17 +278,17 @@ AICORE inline void Recurrent(Scratch& s, const Args& a, const TilingData& t,
     VBarrier();
 }
 
-template <bool Mtp>
+template <bool Mtp, bool FusedNorm = false>
 AICORE inline void Run(const Args& a, const TilingData& t)
 {
 #if defined(__DAV_C220_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
     const int64_t channels = 384 * t.heads;
-    for (int64_t task = get_block_idx(); task < t.batch * t.heads * kVShards; task += get_block_num()) {
-        const int64_t batch = task / (t.heads * kVShards);
-        const int64_t head = task / kVShards % t.heads;
-        const int64_t vStart = task % kVShards * kVRows;
+    const int64_t tasks = t.batch * t.heads * (FusedNorm ? 1 : kVShards);
+    for (int64_t task = get_block_idx(); task < tasks; task += get_block_num()) {
+        const int64_t batch = task / (t.heads * (FusedNorm ? 1 : kVShards));
+        const int64_t head = FusedNorm ? task % t.heads : task / kVShards % t.heads;
         const int64_t begin = a.offsets[batch], end = a.offsets[batch + 1];
         const int64_t count = end - begin;
         const int64_t accepted = Mtp ? a.accepted[batch] : 1;
@@ -266,32 +312,41 @@ AICORE inline void Run(const Args& a, const TilingData& t)
         if (!valid) {
             continue;
         }
-        Scratch s;
-        s.Init(vStart);
-        Load<float, kVRows, 128>(s.state, a.ssm_in + (ssmRead * t.heads + head) * 16384 + vStart * 128);
-        for (int64_t token = begin; token < end; ++token) {
-            Conv(s, a, t, convRead, token, begin, accepted - 1, head * 128, s.q);
-            Conv(s, a, t, convRead, token, begin, accepted - 1, (t.heads + head) * 128, s.k);
-            Conv(s, a, t, convRead, token, begin, accepted - 1, (2 * t.heads + head) * 128, s.v);
-            Recurrent(s, a, t, token, head);
-            const int64_t slot = a.ssm_write[batch * t.max_query_tokens + token - begin];
-            if (slot >= 0) {
-                Store<float, kVRows, 128>(a.ssm_out + (slot * t.heads + head) * 16384 + vStart * 128, s.state);
-            }
-            Store<bfloat16_t, 1, kVRows>(a.output + (token * t.heads + head) * 128 + vStart, s.out);
-        }
-        if (vStart == 0 && convWrite >= 0) {
-            // Width four: keep two accepted history tokens, then append raw QKV.
-            // Ragged MTP writes count+2 positions and preserves the capacity tail.
-            for (int64_t part = 0; part < 3; ++part) {
-                const int64_t channel = (part * t.heads + head) * 128;
-                for (int64_t i = 0; i < count + 2; ++i) {
-                    __gm__ bfloat16_t* src = i < 2
-                        ? a.conv_in + (convRead * t.conv_history + accepted + i) * channels + channel
-                        : a.qkv + (begin + i - 2) * channels + channel;
-                    Load<bfloat16_t, 1, 128>(s.bf16, src);
-                    Store<bfloat16_t, 1, 128>(a.conv_out + (convWrite * t.conv_history + i) * channels + channel, s.bf16);
+        for (int64_t shard = 0; shard < (FusedNorm ? kVShards : 1); ++shard) {
+            const int64_t vStart = (FusedNorm ? shard : task % kVShards) * kVRows;
+            Scratch s;
+            s.Init(vStart);
+            Load<float, kVRows, 128>(s.state, a.ssm_in + (ssmRead * t.heads + head) * 16384 + vStart * 128);
+            for (int64_t token = begin; token < end; ++token) {
+                Conv(s, a, t, convRead, token, begin, accepted - 1, head * 128, s.q);
+                Conv(s, a, t, convRead, token, begin, accepted - 1, (t.heads + head) * 128, s.k);
+                Conv(s, a, t, convRead, token, begin, accepted - 1, (2 * t.heads + head) * 128, s.v);
+                Recurrent(s, a, t, token, head);
+                const int64_t slot = a.ssm_write[batch * t.max_query_tokens + token - begin];
+                if (slot >= 0) {
+                    Store<float, kVRows, 128>(a.ssm_out + (slot * t.heads + head) * 16384 + vStart * 128, s.state);
                 }
+                Store<bfloat16_t, 1, kVRows>(a.output + (token * t.heads + head) * 128 + vStart, s.out);
+            }
+            if (vStart == 0 && convWrite >= 0) {
+                // Width four: keep two accepted history tokens, then append raw QKV.
+                // Ragged MTP writes count+2 positions and preserves the capacity tail.
+                for (int64_t part = 0; part < 3; ++part) {
+                    const int64_t channel = (part * t.heads + head) * 128;
+                    for (int64_t i = 0; i < count + 2; ++i) {
+                        __gm__ bfloat16_t* src = i < 2
+                            ? a.conv_in + (convRead * t.conv_history + accepted + i) * channels + channel
+                            : a.qkv + (begin + i - 2) * channels + channel;
+                        Load<bfloat16_t, 1, 128>(s.bf16, src);
+                        Store<bfloat16_t, 1, 128>(a.conv_out + (convWrite * t.conv_history + i) * channels + channel, s.bf16);
+                    }
+                }
+            }
+        }
+        if constexpr (FusedNorm) {
+            pipe_barrier(PIPE_ALL);
+            for (int64_t token = begin; token < end; ++token) {
+                NormalizeOutput(a, t, token, head);
             }
         }
     }

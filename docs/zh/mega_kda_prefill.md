@@ -5,7 +5,8 @@ vector KDA prefill。完整参数和边界见 [英文接口文档](../en/mega_kd
 
 融合范围为 Conv/SiLU、Q/K L2 归一化、vector gate、chunk cumsum，以及
 KKT、FP32 inverse、WY、H、O。保留 FP32 A2、K_eff/W 和状态计算；不包含输出
-norm/projection，不修改模型路由，也不提供 decode/MTP 兼容分支。
+projection；可选的输出 gated RMSNorm 在最终写回阶段融合。不修改模型路由，
+也不提供 decode/MTP 兼容分支。
 
 ## 输入输出
 
@@ -16,6 +17,10 @@ norm/projection，不修改模型路由，也不提供 decode/MTP 兼容分支�
 - Conv 输入/输出池分别为 `[Ci,3,3*H*128]`、`[Co,3,3*H*128]` BF16。
 - SSM 输入/输出池分别为 `[Si,H,V=128,K=128]`、`[So,H,128,128]` FP32。
 - 输出 `[T,H,128]` 为 BF16，三个输出均由调用者提前分配。
+- 可选 `output_gate [T,H,128]` 与 `norm_weight [128]` 均为 BF16，必须同时提供；
+  `norm_eps` 默认 `1e-5`。融合路径先保留原 KDA 输出 BF16 舍入，再用 FP32
+  计算 RMSNorm、乘权重与 sigmoid gate，最后舍入为 BF16。未提供时输出仍为
+  原始 KDA 结果。
 - `cu_seqlens [B+1]` 和四组独立读写索引 `[B]` 都是 Device int32。
 
 读索引 `-1` 表示零初态，写索引 `-1` 表示不发布该类状态；空序列不写状态，

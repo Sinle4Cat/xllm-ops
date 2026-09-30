@@ -8,6 +8,7 @@ PTO Device 入口、CMake 构建和 ACLNN/Python 测试绑定。尚未接入 xLL
 
 - 仅一个 `MegaKdaDecode` 算子，Host 根据显式 mode 设置 tilingKey。
 - `mode=0/key=1` 为普通单 token decode；`mode=1/key=2` 为 MTP verify。
+  同一语义的输出 gated RMSNorm 融合路径分别使用 key 3 和 key 4。
   单 token 的 MTP 仍走 key 2，不根据 token 数量猜测语义。
 - Conv 与 SSM 各自有独立输入池、输出池和读写映射，输入输出容量允许不同。
   Python 绑定拒绝输出与输入共享 storage，Device 不修改输入状态或 QKV。
@@ -27,6 +28,11 @@ MTP 为 capacity+2。Conv 权重按 MegaGDN 的 `[4,C]` 布局预打包，不能
 与 `MegaKdaPrefill` 不同，decode 的 beta 是 sigmoid 前的 BF16 投影，sigmoid
 在算子内部计算；prefill 接收 sigmoid 后的 FP32 beta。decode 的读 slot -1
 表示 inactive，不是 prefill 的零初态。阶段切换时必须分别遵守各自接口契约。
+可选的 BF16 `output_gate [N,H,128]` 与 `norm_weight [128]` 必须同时提供；
+`norm_eps` 默认 `1e-5`。融合路径先将 KDA 输出舍入为 BF16，再用 FP32
+执行 RMSNorm、乘权重及 sigmoid gate，最后舍入为 BF16。未提供时保留原
+tile32 输出路径；融合路径每个 head 的四个 V 分片由同一 task 顺序处理，
+性能仍需独立验收。
 
 数学边界保留 SiLU Conv、BF16 Conv 输出舍入、Q/K L2 norm、KDA 向量 gate、
 sigmoid beta 与逐 token FP32 状态更新，不复用 GDN 的标量 decay 公式。

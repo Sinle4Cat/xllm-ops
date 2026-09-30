@@ -29,11 +29,19 @@ K/V dimensions and chunk size are 128. Conv width is four.
 | conv_write_indices | `[B]` | int32 | Conv destination slots |
 | ssm_read_indices | `[B]` | int32 | SSM source slots |
 | ssm_write_indices | `[B]` | int32 | SSM destination slots |
+| output_gate (optional) | `[T,H,128]` | BF16 | Raw sigmoid output gate |
+| norm_weight (optional) | `[128]` | BF16 | Output RMSNorm weight |
 | output | `[T,H,128]` | BF16 | Caller-allocated attention output |
 | conv_state_out | `[Co,3,C]` | BF16 | Caller-allocated independent Conv pool |
 | ssm_state_out | `[So,H,128,128]` | FP32 | Caller-allocated independent **VK** pool |
 
-ACLNN attributes are `conv_output_slots`, `ssm_output_slots`, `ffts_addr`, in
+`output_gate` and `norm_weight` must be supplied together. When present, the
+operator applies gated RMSNorm after the public BF16 KDA output rounding:
+`BF16(FP32(core_bf16) * rsqrt(mean(FP32(core_bf16)^2) + norm_eps) *
+FP32(norm_weight) * sigmoid(FP32(output_gate)))`. The default `norm_eps` is
+`1e-5`; without the optional inputs, output retains its original raw KDA meaning.
+
+ACLNN attributes are `conv_output_slots`, `ssm_output_slots`, `ffts_addr`, `norm_eps`, in
 that order. The Python C++ binding derives capacities and obtains the FFTS
 address from the active runtime. It never copies Device metadata to CPU.
 
@@ -43,6 +51,7 @@ output, conv_out, ssm_out = custom_ops_lib.mega_kda_prefill(
     conv_state_in, ssm_state_in, cu_seqlens,
     conv_read_indices, conv_write_indices, ssm_read_indices, ssm_write_indices,
     output, conv_state_out, ssm_state_out,
+    output_gate=output_gate, norm_weight=norm_weight, norm_eps=1e-5,
 )
 ```
 
