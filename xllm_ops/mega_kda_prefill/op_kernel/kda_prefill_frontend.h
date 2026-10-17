@@ -393,6 +393,25 @@ AICORE inline void ConvRowsA5(const Args& a, const TilingData& t, __gm__ uint8_t
 // history-independent rows; the first three tokens continue through Conv(),
 // which handles conv_state_in and sequence boundaries exactly as before.
 #if defined(__DAV_C310_VEC__)
+AICORE inline void WaitConvPrefetchA5(uint32_t id)
+{
+    wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(id));
+}
+
+template <typename TileT>
+AICORE inline void LoadConvPrefetchA5(TileT& tile, __gm__ bfloat16_t* ptr,
+                                      int rows, int cols, int stride, uint32_t id)
+{
+    // Unlike Load(), this deliberately only posts the two pipe dependencies.
+    // The MTE2->V wait is deferred until the tile is consumed by VF code.
+    const event_t event = static_cast<event_t>(id);
+    set_flag(PIPE_V, PIPE_MTE2, event);
+    wait_flag(PIPE_V, PIPE_MTE2, event);
+    GM<bfloat16_t> gm(ptr, GS(1, 1, 1, rows, cols), ST(stride));
+    TLOAD(tile, gm);
+    set_flag(PIPE_MTE2, PIPE_V, event);
+}
+
 AICORE inline void ConvRowsRegbaseA5(const Args& a, const TilingData& t, __gm__ uint8_t* ws,
                                      const Workspace& w, int64_t head, int64_t token, int rows)
 {
@@ -402,25 +421,39 @@ AICORE inline void ConvRowsRegbaseA5(const Args& a, const TilingData& t, __gm__ 
     constexpr int Base = 24576;
     constexpr int InputRows = R + 3;
     constexpr int InputBytes = InputRows * 128 * sizeof(bfloat16_t);
+    constexpr int Prefetch0 = 155648;
+    constexpr int Prefetch1 = Prefetch0 + InputBytes;
+    constexpr int UBBytes = 256 * 1024;
     static_assert(InputBytes <= F, "ConvRowsRegbaseA5 input tile exceeds its UB slot");
+    static_assert(Prefetch0 % 256 == 0 && Prefetch1 % 256 == 0,
+                  "ConvRowsRegbaseA5 prefetch tiles must be 256B aligned");
+    static_assert(Prefetch1 + InputBytes <= UBBytes,
+                  "ConvRowsRegbaseA5 prefetch tiles exceed the A5 UB");
 
     ND<float, R, 128, DYNAMIC> acc(rows), low(rows), tmp(rows);
-    ND<bfloat16_t, InputRows, 128, DYNAMIC> bf_input(rows + 3);
+    ND<bfloat16_t, InputRows, 128, DYNAMIC> bf_prefetch0(rows + 3);
+    ND<bfloat16_t, InputRows, 128, DYNAMIC> bf_prefetch1(rows + 3);
     ND<bfloat16_t, R, 128, DYNAMIC> bf_output(rows);
     ND<float, R, 64, DYNAMIC> reduce(rows);
     Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, DYNAMIC, 1> column(rows);
     ND<float, 1, 128> parameter;
     TASSIGN(acc, Base);
     TASSIGN(low, Base + F);
-    // bf_input and tmp deliberately share this lifetime-disjoint slot.  The
-    // BF16 tile is consumed before tmp is used for normalization.
-    TASSIGN(bf_input, Base + 2 * F);
+    TASSIGN(bf_prefetch0, Prefetch0);
+    TASSIGN(bf_prefetch1, Prefetch1);
     TASSIGN(bf_output, Base + 2 * F);
+    // bf_output and tmp deliberately share this lifetime-disjoint slot.  The
+    // BF16 tile is produced/consumed before tmp is used for normalization.
     TASSIGN(tmp, Base + 2 * F);
     TASSIGN(reduce, Base + 3 * F);
     TASSIGN(column, Base + 3 * F + B);
 
     const int64_t channels = t.heads * 384;
+    // The first part has no predecessor to overlap.  Its completion is
+    // awaited only immediately before ConvertConvRowsRegbaseA5.
+    LoadConvPrefetchA5(bf_prefetch0,
+                       a.qkv + (token - 3) * channels + (head) * 128,
+                       rows + 3, 128, channels, 1);
     for (int part = 0; part < 3; ++part) {
         TASSIGN(parameter, 14336 + part * 512);
         // Bias remains the first addend, matching ConvRowsA5 and Conv().
@@ -429,15 +462,44 @@ AICORE inline void ConvRowsRegbaseA5(const Args& a, const TilingData& t, __gm__ 
         TEXPANDS(low, 0.0f);
         PipeBarrierVec();
 
+        if (part == 0) {
+            LoadConvPrefetchA5(
+                bf_prefetch1,
+                a.qkv + (token - 3) * channels + (t.heads + head) * 128,
+                rows + 3, 128, channels, 2);
+        } else if (part == 1) {
+            LoadConvPrefetchA5(
+                bf_prefetch0,
+                a.qkv + (token - 3) * channels + (2 * t.heads + head) * 128,
+                rows + 3, 128, channels, 1);
+        }
+
         // batched_start >= sequence_start + 3, hence this GM span never
         // crosses a sequence or consults conv_state_in.
-        Load(bf_input, a.qkv + (token - 3) * channels +
-                 (part * t.heads + head) * 128,
-             rows + 3, 128, channels);
+        if (part == 0) {
+            WaitConvPrefetchA5(1);
+        } else if (part == 1) {
+            WaitConvPrefetchA5(2);
+        } else {
+            WaitConvPrefetchA5(1);
+        }
         TASSIGN(parameter, 8192 + part * 4 * 512);
-        ConvertConvRowsRegbaseA5<decltype(acc), decltype(low), decltype(bf_input),
-                                 decltype(parameter)>(
-            acc.data(), low.data(), acc.data(), low.data(), bf_input.data(), parameter.data(), rows);
+        if (part == 0) {
+            ConvertConvRowsRegbaseA5<decltype(acc), decltype(low), decltype(bf_prefetch0),
+                                     decltype(parameter)>(
+                acc.data(), low.data(), acc.data(), low.data(), bf_prefetch0.data(),
+                parameter.data(), rows);
+        } else if (part == 1) {
+            ConvertConvRowsRegbaseA5<decltype(acc), decltype(low), decltype(bf_prefetch1),
+                                     decltype(parameter)>(
+                acc.data(), low.data(), acc.data(), low.data(), bf_prefetch1.data(),
+                parameter.data(), rows);
+        } else {
+            ConvertConvRowsRegbaseA5<decltype(acc), decltype(low), decltype(bf_prefetch0),
+                                     decltype(parameter)>(
+                acc.data(), low.data(), acc.data(), low.data(), bf_prefetch0.data(),
+                parameter.data(), rows);
+        }
 
         // SiLU retains its full TwoSum renormalization and compensated small-
         // argument path; only the convolution's intermediate UB traffic is

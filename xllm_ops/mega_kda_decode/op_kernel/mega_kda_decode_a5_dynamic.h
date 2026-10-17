@@ -125,6 +125,81 @@ AICORE inline void Normalize(Scratch<Rows>& s, TileND<float, 1, 128>& x, float s
     VBarrier();
 }
 
+// A5-specific VF path for a column broadcast followed by FP32 multiply.
+// Load each 64-lane column chunk once, then reuse it for every V row.  The
+// generic TCOLEXPANDMUL implementation reloads the broadcast source inside
+// its row loop, which can cost more than the UB round trip it removes here.
+template <typename DstTile, typename SrcTile, typename ColumnTile>
+__tf__ PTO_INTERNAL void ColExpandMulReuseVf(
+    typename DstTile::TileDType __out__ dst, typename SrcTile::TileDType __in__ src,
+    typename ColumnTile::TileDType __in__ column, uint16_t rows)
+{
+    auto* dstPtr = (__ubuf__ float*)__cce_get_tile_ptr(dst);
+    auto* srcPtr = (__ubuf__ float*)__cce_get_tile_ptr(src);
+    auto* columnPtr = (__ubuf__ float*)__cce_get_tile_ptr(column);
+    __VEC_SCOPE__ {
+        RegTensor<float> columnReg, srcReg, dstReg;
+        MaskReg mask = PSetWithType<float>(PAT_ALL);
+        constexpr auto dist = std::integral_constant<::DistVST,
+            static_cast<::DistVST>(GetDistVst<float, pto::DistVST::DIST_NORM>())>();
+        for (uint16_t half = 0; half < 2; ++half) {
+            const uint32_t columnOffset = half * 64;
+            vlds(columnReg, columnPtr, columnOffset, NORM);
+            for (uint16_t row = 0; row < rows; ++row) {
+                const uint32_t offset = row * 128 + columnOffset;
+                vlds(srcReg, srcPtr, offset, NORM);
+                vmul(dstReg, srcReg, columnReg, mask, MODE_ZEROING);
+                vsts(dstReg, dstPtr, offset, dist, mask);
+            }
+        }
+    }
+}
+
+// Direct row-by-column product for the recurrent update.  Load the K vector
+// once per 64-lane chunk, then form the outer product with one delta scalar
+// per row; no expanded K or expanded delta tile is materialized in UB.
+template <typename DstTile, typename KeyTile, typename RowScaleTile>
+__tf__ PTO_INTERNAL void RowMulKReuseVf(
+    typename DstTile::TileDType __out__ dst, typename KeyTile::TileDType __in__ key,
+    typename RowScaleTile::TileDType __in__ rowScale, uint16_t rows)
+{
+    auto* dstPtr = (__ubuf__ float*)__cce_get_tile_ptr(dst);
+    auto* keyPtr = (__ubuf__ float*)__cce_get_tile_ptr(key);
+    auto* rowScalePtr = (__ubuf__ float*)__cce_get_tile_ptr(rowScale);
+    __VEC_SCOPE__ {
+        RegTensor<float> rowReg, keyReg, dstReg;
+        MaskReg mask = PSetWithType<float>(PAT_ALL);
+        constexpr auto dist = std::integral_constant<::DistVST,
+            static_cast<::DistVST>(GetDistVst<float, pto::DistVST::DIST_NORM>())>();
+        for (uint16_t half = 0; half < 2; ++half) {
+            const uint32_t columnOffset = half * 64;
+            vlds(keyReg, keyPtr, columnOffset, NORM);
+            for (uint16_t row = 0; row < rows; ++row) {
+                const uint32_t offset = row * 128 + columnOffset;
+                vlds(rowReg, rowScalePtr, row, BRC_B32);
+                vmul(dstReg, keyReg, rowReg, mask, MODE_ZEROING);
+                vsts(dstReg, dstPtr, offset, dist, mask);
+            }
+        }
+    }
+}
+
+template <int Rows>
+AICORE inline void ColExpandMulReuse(
+    TileND<float, Rows, 128>& dst, TileND<float, Rows, 128>& src, TileND<float, 1, 128>& column)
+{
+    ColExpandMulReuseVf<TileND<float, Rows, 128>, TileND<float, Rows, 128>, TileND<float, 1, 128>>(
+        dst.data(), src.data(), column.data(), Rows);
+}
+
+template <int Rows>
+AICORE inline void RowMulKReuse(
+    TileND<float, Rows, 128>& dst, TileND<float, 1, 128>& key, Column<Rows>& rowScale)
+{
+    RowMulKReuseVf<TileND<float, Rows, 128>, TileND<float, 1, 128>, Column<Rows>>(
+        dst.data(), key.data(), rowScale.data(), Rows);
+}
+
 template <int Rows>
 AICORE inline void Recurrent(Scratch<Rows>& s, const Args& a, const TilingData& t,
                              int64_t token, int64_t head)
@@ -161,13 +236,12 @@ AICORE inline void Recurrent(Scratch<Rows>& s, const Args& a, const TilingData& 
     TEXPANDS(s.norm, 1.0f);
     VBarrier();
     TDIV(s.beta_scalar, s.norm, s.beta_scalar);
-    TCOLEXPAND(s.expanded, s.g);
+    // Keep each column chunk in a VF register and use a standalone vmul
+    // (rather than a fused multiply-add) to preserve the original FP32
+    // operation and order without the expanded UB tile.
+    ColExpandMulReuse(s.state, s.state, s.g);
     VBarrier();
-    TMUL(s.state, s.state, s.expanded);
-    VBarrier();
-    TCOLEXPAND(s.expanded, s.k);
-    VBarrier();
-    TMUL(s.product, s.state, s.expanded);
+    ColExpandMulReuse(s.product, s.state, s.k);
     VBarrier();
     TROWSUM(s.reduced_col, s.product, s.reduce_work);
     VBarrier();
@@ -178,14 +252,13 @@ AICORE inline void Recurrent(Scratch<Rows>& s, const Args& a, const TilingData& 
     const float beta = s.beta_scalar.GetValue(0);
     TMULS(s.delta, s.delta, beta);
     VBarrier();
-    TROWEXPAND(s.product, s.delta_col);
-    VBarrier();
-    TMUL(s.product, s.product, s.expanded);
+    // Direct row-by-column VF multiply performs delta*K without either
+    // expanded temporary.  Keep TADD separate to preserve non-FMA order.
+    RowMulKReuse(s.product, s.k, s.delta_col);
     VBarrier();
     TADD(s.state, s.state, s.product);
-    TCOLEXPAND(s.expanded, s.q);
     VBarrier();
-    TMUL(s.product, s.state, s.expanded);
+    ColExpandMulReuse(s.product, s.state, s.q);
     VBarrier();
     TROWSUM(s.reduced_col, s.product, s.reduce_work);
     VBarrier();
