@@ -93,4 +93,28 @@ AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
           ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
 }
 
+#if __CCE_AICORE__ == 310
+AICORE inline void SyncAllMixA5() {
+#if __CCE_AICORE__ != 220
+  pipe_barrier(PIPE_ALL);
+#if defined(__DAV_CUBE__)
+  // 1. Wait for both paired AIVs: one flag ID per subblock (base, base +
+  // SYNC_FLAG_ID_MAX).
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+  // 2. Global all-AIC barrier.
+  ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
+  // 3. Release both paired AIVs.
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+#elif defined(__DAV_VEC__)
+  // Set on MTE3 so prior stores drain; wait on PIPE_S.
+  set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+#endif
+
 }  // namespace mega_kda_prefill_utils
