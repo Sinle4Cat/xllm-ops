@@ -38,6 +38,8 @@ To address this, we designed XLLM OPS, a domestic chip operator library focused 
 bash build.sh
 ```
 
+Ascend910B KDA interfaces: [prefill](docs/en/mega_kda_prefill.md) and [decode, including MTP](docs/en/mega_kda_decode.md).
+
 ## 3. Test
 ```bash
 cd test

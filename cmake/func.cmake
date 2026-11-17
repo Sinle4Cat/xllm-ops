@@ -246,6 +246,18 @@ function(add_ops_info_target)
     set(OPS_INFO_INNER_INI    ${base_aclnn_binary_dir}/inner/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
     set(OPS_INFO_EXCLUDE_INI  ${base_aclnn_binary_dir}/exc/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
 
+    # Only selected registry groups generate an ops-info ini file.
+    set(OPS_INFO_DEPENDENCIES)
+    if (generate_aclnn_srcs)
+        list(APPEND OPS_INFO_DEPENDENCIES ${OPS_INFO_INI})
+    endif()
+    if (generate_aclnn_inner_srcs)
+        list(APPEND OPS_INFO_DEPENDENCIES ${OPS_INFO_INNER_INI})
+    endif()
+    if (generate_exclude_proto_srcs)
+        list(APPEND OPS_INFO_DEPENDENCIES ${OPS_INFO_EXCLUDE_INI})
+    endif()
+
     add_custom_command(OUTPUT ${OPS_INFO_JSON}
             COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/parse_ini_to_json.py
             ${OPS_INFO_INI}
@@ -254,7 +266,7 @@ function(add_ops_info_target)
             ${OPS_INFO_JSON}
             COMMAND mkdir -p ${CUSTOM_OPS_INFO_DIR}
             COMMAND cp -f ${OPS_INFO_JSON} ${CUSTOM_OPS_INFO_DIR}
-            DEPENDS ${OPS_INFO_INI} ${OPS_INFO_INNER_INI} ${OPS_INFO_EXCLUDE_INI}
+            DEPENDS ${OPS_INFO_DEPENDENCIES}
                     ${ASCENDC_CMAKE_UTIL_DIR}/parse_ini_to_json.py
                     ${XLLM_OPS_SOURCE_IDENTITY_DEPENDENCY}
     )

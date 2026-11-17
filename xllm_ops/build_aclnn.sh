@@ -169,6 +169,8 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "onerec_final_beam_select"
         "rec_constrained_top_k"
         "mega_chunk_gdn"
+        "mega_kda_prefill"
+        "mega_kda_decode"
         "laser_attention"
         "layer_norm_fwd"
         "xllm_chunk_kda_fwd_prepare"
