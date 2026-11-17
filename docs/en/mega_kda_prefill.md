@@ -1,5 +1,8 @@
 # MegaKdaPrefill
 
+Ascend910B and Ascend950 (A5) select separate kernels. The 910B backend retains the current FP32 reduction and state publication implementation. On A5, `ffts_addr` may be zero; 910B still requires a valid address.
+
+
 Ascend910B mixed AIC/AIV single-launch vector-gated KDA prefill. The native
 operator follows `mega_gdn_prefill_op` packaging and launch conventions, with
 FP32 KKT/inverse/WY/H/O numerical stages. It does not use the GDN

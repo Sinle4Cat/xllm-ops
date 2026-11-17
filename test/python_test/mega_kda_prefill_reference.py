@@ -1,6 +1,7 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
 """FP64 CPU recurrent oracle; independent of the device's chunk/WY algorithm."""
 import torch
+from mega_kda_test_utils import round_bf16, silu_bf16
 
 OUTPUTS = ("output", "conv_state_out", "ssm_state_out")
 
@@ -53,10 +54,10 @@ def reference(data, *, return_prepared=False):
             acc = (x * data["conv_weight"].double()).sum(0)
             if data["conv_bias"] is not None:
                 acc += data["conv_bias"].double()
-            conv = torch.nn.functional.silu(acc.bfloat16().double()).bfloat16().double().view(3, heads, 128)
+            conv = silu_bf16(round_bf16(acc).double()).double().view(3, heads, 128)
             q, k, v = conv.unbind(0)
-            q = (q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)).bfloat16().double()
-            k = (k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)).bfloat16().double()
+            q = round_bf16(q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)).double()
+            k = round_bf16(k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)).double()
             raw = gate[token].double() + data["gate_bias"].double()
             g = -5 * torch.sigmoid(raw * data["a_log"].double().exp()[:, None])
             for name, value in zip(("q", "k", "v", "g"), (q, k, v, g)):
@@ -64,7 +65,7 @@ def reference(data, *, return_prepared=False):
             state *= g.exp()[:, None, :]
             delta = (v - (state * k[:, None, :]).sum(-1)) * data["beta"][token].double()[:, None]
             state += delta[:, :, None] * k[:, None, :]
-            out[token] = ((state * q[:, None, :]).sum(-1) * 128 ** -0.5).bfloat16()
+            out[token] = round_bf16((state * q[:, None, :]).sum(-1) * 128 ** -0.5)
         if cw >= 0:
             conv_out[cw] = sequence[-3:]
         if sw >= 0:

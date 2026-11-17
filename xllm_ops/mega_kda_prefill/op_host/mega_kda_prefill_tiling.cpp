@@ -63,7 +63,8 @@ static ge::graphStatus mega_kda_prefill_tiling(gert::TilingContext* context) {
                platform.GetCoreNumAic(),
                static_cast<uint64_t>(
                    *attrs->GetInt(static_cast<uint32_t>(Attr::FFTS_ADDR)))};
-  if (!valid_tiling(t)) {
+  if (!valid_tiling(t, platform.GetSocVersion() ==
+                         platform_ascendc::SocVersion::ASCEND950)) {
     return ge::GRAPH_FAILED;
   }
   const int64_t c = t.heads * kQkvParts * kHeadDim;

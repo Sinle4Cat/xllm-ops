@@ -1,5 +1,8 @@
 # MegaKdaPrefill
 
+支持 Ascend910B 和 Ascend950（A5）。两种架构分别选择对应内核；910B 保留当前 FP32 归约和状态提交实现。A5 的 `ffts_addr` 可为 0，910B 仍要求有效地址。
+
+
 参考`mega_gdn_prefill_op`的注册、构建和单次混合核启动结构，新增GLM
 vector KDA prefill。完整参数和边界见[英文接口文档](../en/mega_kda_prefill.md)。
 

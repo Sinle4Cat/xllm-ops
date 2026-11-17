@@ -13,6 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <acl/acl_rt.h>
+#include <string>
+
 #include "mega_kda_ops.h"
 
 #include <dlfcn.h>
@@ -92,8 +95,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_prefill(
     TORCH_CHECK(symbol, "failed to resolve rtGetC2cCtrlAddr: ", dlerror());
     return reinterpret_cast<GetC2c>(symbol);
   }();
+  const char* soc = aclrtGetSocName();
+  const bool is_a5 = soc && std::string(soc).find("Ascend950") != std::string::npos;
+  if (!is_a5) {
   TORCH_CHECK(get_c2c(&ffts_addr, &ffts_len) == 0 && ffts_addr,
               "MegaKdaPrefill requires the Ascend910B FFTS address");
+  }
   const int64_t ffts_attr = static_cast<int64_t>(ffts_addr);
   // No metadata D2H: replay reads current device tensors and caller-owned
   // outputs.

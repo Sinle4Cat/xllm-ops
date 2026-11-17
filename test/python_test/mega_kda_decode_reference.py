@@ -7,6 +7,7 @@ does not emulate device FP32 accumulation or reduction trees bit for bit.
 from typing import Any
 
 import torch
+from mega_kda_test_utils import round_bf16, silu_bf16
 
 
 OUTPUTS = ("output", "conv_state_out", "ssm_state_out")
@@ -73,7 +74,7 @@ def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.T
             for tap in range(4):
                 acc = acc + x[tap] * data["conv_weight"][tap].double()
             # All modes round Conv accumulation before SiLU, and SiLU before KDA.
-            conv = torch.nn.functional.silu(acc.bfloat16().double()).bfloat16().double().view(3, heads, 128)
+            conv = silu_bf16(round_bf16(acc).double()).double().view(3, heads, 128)
             q, k, v = conv.unbind(0)
             if mode == PUBLIC_COMPAT:
                 # Replacing a zero denominator before division avoids masked 0/0.
@@ -86,11 +87,11 @@ def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.T
                 k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
             raw_g = data["gate"][token].double() + data["gate_bias"].double()
             decay = (-5.0 * torch.sigmoid(raw_g * data["a_log"].double().exp()[:, None])).exp()
-            beta = torch.sigmoid(data["beta"][token].double()).bfloat16().double()
+            beta = round_bf16(torch.sigmoid(data["beta"][token].double())).double()
             state = state * decay[:, None, :]
             delta = (v - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = state + delta[:, :, None] * k[:, None, :]
-            out[token] = (state * q[:, None, :]).sum(-1).bfloat16()
+            out[token] = round_bf16((state * q[:, None, :]).sum(-1))
             if writes[i] >= 0:
                 ssm_out[writes[i]] = state
         if cw >= 0:

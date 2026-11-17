@@ -77,6 +77,7 @@ class MegaKdaPrefill : public OpDef {
     Attr("ssm_output_slots").AttrType(REQUIRED).Int();
     Attr("ffts_addr").AttrType(REQUIRED).Int();
     AICore().AddConfig("ascend910b");
+    AICore().AddConfig("ascend950");
   }
 };
 OP_ADD(MegaKdaPrefill);

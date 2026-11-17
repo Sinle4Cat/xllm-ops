@@ -1,5 +1,8 @@
 # MegaKdaDecode
 
+Ascend910B and Ascend950 (A5) select separate kernels. The 910B backend retains the current FP32 reduction and state publication implementation. A5 supports native mode=0 and MTP mode=1. Public compatibility mode=3 remains 910B-only and is rejected by host tiling on A5.
+
+
 Experimental GLM-5.3-Flash vector KDA Conv + recurrent decode operator for
 Ascend 910B. It follows `mega_gdn_prefill_op`'s OpDef, separate shape inference,
 Host tiling, PTO Device entry, CMake discovery and generated ACLNN integration.

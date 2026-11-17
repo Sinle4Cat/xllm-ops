@@ -1,5 +1,8 @@
 # MegaKdaDecode
 
+支持 Ascend910B 和 Ascend950（A5）。两种架构分别选择对应内核；910B 保留当前 FP32 归约和状态提交实现。A5 支持 native（mode=0）与 MTP（mode=1）；mode=3 公版兼容模式仅支持 910B，A5 在 host tiling 阶段拒绝。
+
+
 GLM-5.3-Flash vector KDA的实验性Conv + recurrent decode融合算子。
 接入结构参考`mega_gdn_prefill_op`，包含独立的OpDef、Shape推导、Host tiling、
 PTO Device入口、CMake构建和ACLNN/Python测试绑定。

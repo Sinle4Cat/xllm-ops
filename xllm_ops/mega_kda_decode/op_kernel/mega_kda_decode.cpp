@@ -45,6 +45,13 @@ extern "C" __global__ __aicore__ void mega_kda_decode(
                       reinterpret_cast<__gm__ bfloat16_t*>(output),
                       reinterpret_cast<__gm__ bfloat16_t*>(conv_state_out),
                       reinterpret_cast<__gm__ float*>(ssm_state_out)};
+#if __CCE_AICORE__ == 310
+  if constexpr (TILING_KEY_IS(1)) {
+    mega_kda::Run<false>(args, t);
+  } else if constexpr (TILING_KEY_IS(2)) {
+    mega_kda::Run<true>(args, t);
+  }
+#else
   if constexpr (TILING_KEY_IS(1)) {
     mega_kda::run<false>(args, t);
   } else if constexpr (TILING_KEY_IS(2)) {
@@ -52,4 +59,5 @@ extern "C" __global__ __aicore__ void mega_kda_decode(
   } else if constexpr (TILING_KEY_IS(3)) {
     mega_kda::run<false, true>(args, t);
   }
+#endif
 }

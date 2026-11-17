@@ -147,6 +147,10 @@ static ge::graphStatus mega_kda_decode_tiling(gert::TilingContext* context) {
     return ge::GRAPH_FAILED;
   }
   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+  if (platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
+      *attrs->GetInt(static_cast<uint32_t>(Attr::MODE)) == 3) {
+    return ge::GRAPH_FAILED;
+  }
   const uint32_t cores = platform.GetCoreNumAiv();
   const uint32_t blocks = std::min<int64_t>(cores, t.batch * t.heads * 8);
   auto* raw = context->GetRawTilingData();

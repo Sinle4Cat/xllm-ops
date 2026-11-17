@@ -10,6 +10,20 @@ GLM_KDA_HEADS = 64
 TP_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 
+def round_bf16(value):
+    """Round FP64 directly to the BF16 grid, avoiding CPU double rounding."""
+    if value.dtype != torch.float64:
+        return value.bfloat16()
+    _, exponent = torch.frexp(value)
+    quantum = torch.ldexp(torch.ones_like(value), (exponent - 8).clamp_min(-133))
+    return (torch.round(value / quantum) * quantum).bfloat16()
+
+
+def silu_bf16(value):
+    """Evaluate SiLU at the declared precision, then perform one BF16 cast."""
+    return round_bf16(torch.nn.functional.silu(value))
+
+
 def bitwise_equal(actual, expected):
     return (actual.shape == expected.shape and actual.dtype == expected.dtype
             and torch.equal(actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8),

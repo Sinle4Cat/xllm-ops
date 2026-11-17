@@ -1,6 +1,9 @@
 /* Copyright 2026 The xLLM Authors. All Rights Reserved. */
 #include "kernel_operator.h"
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "kda_prefill_pipeline_a5.h"
+#else
 // Parse CANN definitions before PTO exports its compatibility names.
 #include "kda_prefill_chunk_h.h"
 #include "kda_prefill_chunk_o.h"
@@ -9,6 +12,7 @@
 #include "kda_prefill_kkt_rows.h"
 #include "kda_prefill_wy.h"
 #include "lib/matmul_intf.h"
+#endif
 
 using MegaKdaPrefillTilingData = kda_prefill::TilingData;
 
@@ -55,6 +59,9 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
            reinterpret_cast<__gm__ bfloat16_t*>(output),
            reinterpret_cast<__gm__ bfloat16_t*>(conv_state_out),
            reinterpret_cast<__gm__ float*>(ssm_state_out)};
+#if __CCE_AICORE__ == 310
+    run_pipeline_a5(a, t, workspace);
+#else
     // Every core validates the same immutable metadata before any publication
     // or barrier.
     if (!valid_metadata(a, t)) {
@@ -143,6 +150,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
     rendezvous();
 #undef KDA_F32
 #undef KDA_BF16
+#endif
   }
 #endif
 }

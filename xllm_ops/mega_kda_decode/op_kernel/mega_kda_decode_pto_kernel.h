@@ -14,13 +14,17 @@ using TileND = Tile<TileType::Vec, T, R, C, BLayout::RowMajor, VR, VC>;
 template <int R, int VR = R>
 using Column = Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, VR, 1>;
 
-AICORE inline void v_barrier() { pipe_barrier(PIPE_V); }
+AICORE inline void v_barrier() {
+#if __CCE_AICORE__ == 220
+  pipe_barrier(PIPE_V);
+#endif
+}
 
 template <typename T, int R, int C, typename TileT>
 AICORE inline void load(TileT& tile, __gm__ T* ptr) {
   set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-  GlobalTensor<T, Shape<1, 1, 1, R, C>, Stride<R * C, R * C, R * C, C, 1>> gm(
+  GlobalTensor<T, Shape<1, 1, 1, R, C>, pto::Stride<R * C, R * C, R * C, C, 1>> gm(
       ptr);
   TLOAD(tile, gm);
   set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -31,7 +35,7 @@ template <typename T, int R, int C, typename TileT>
 AICORE inline void store(__gm__ T* ptr, TileT& tile) {
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-  GlobalTensor<T, Shape<1, 1, 1, R, C>, Stride<R * C, R * C, R * C, C, 1>> gm(
+  GlobalTensor<T, Shape<1, 1, 1, R, C>, pto::Stride<R * C, R * C, R * C, C, 1>> gm(
       ptr);
   TSTORE(gm, tile);
   // A subsequent token/task may reuse every UB address below.
@@ -60,6 +64,9 @@ struct Args {
   __gm__ float* ssm_out;
 };
 
+#if __CCE_AICORE__ == 310
+#include "mega_kda_decode_a5_dynamic.h"
+#else
 // Byte offsets shared by scalar Conv, batched Conv and split reductions.
 // value aliases a subrow of v; column tiles alias their row-vector storage.
 template <int VRows>
@@ -748,4 +755,5 @@ AICORE inline void run(const Args& a, const TilingData& t) {
   }
 #endif
 }
+#endif
 }  // namespace mega_kda

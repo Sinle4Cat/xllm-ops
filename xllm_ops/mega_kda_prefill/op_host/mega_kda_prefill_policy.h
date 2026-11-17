@@ -5,11 +5,11 @@
 #include "../op_kernel/mega_kda_prefill_tiling_data.h"
 
 namespace kda_prefill {
-inline bool valid_tiling(const TilingData& t) {
+inline bool valid_tiling(const TilingData& t, bool is_a5 = false) {
   // Bound all products before constructing workspace offsets or int32 metadata.
   if (t.batch < 1 || t.batch > 1024 || t.tokens < 1 || t.tokens > 131072 ||
       t.heads < 1 || t.heads > 128 || t.blocks < 1 || t.blocks > 32 ||
-      !t.ffts_addr) {
+      (!is_a5 && !t.ffts_addr)) {
     return false;
   }
   for (int64_t n : {t.conv_input_slots,
