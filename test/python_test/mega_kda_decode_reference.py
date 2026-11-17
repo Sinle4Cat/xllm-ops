@@ -1,6 +1,7 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
 """FP64 CPU formula oracle for the GLM vector-gate KDA decode ABI."""
 import torch
+from mega_kda_test_utils import round_bf16, silu_bf16
 
 
 OUTPUTS = ("output", "conv_state_out", "ssm_state_out")
@@ -59,7 +60,7 @@ def reference(data):
             acc = torch.zeros_like(x[0]) if data["conv_bias"] is None else data["conv_bias"].double().clone()
             for tap in range(4):
                 acc = acc + x[tap] * data["conv_weight"][tap].double()
-            conv = torch.nn.functional.silu(acc).bfloat16().double().view(3, heads, 128)
+            conv = silu_bf16(acc).double().view(3, heads, 128)
             q, k, v = conv.unbind(0)
             q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * 128 ** -0.5
             k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
@@ -69,7 +70,7 @@ def reference(data):
             state = state * decay[:, None, :]
             delta = (v - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = state + delta[:, :, None] * k[:, None, :]
-            out[token] = (state * q[:, None, :]).sum(-1).bfloat16()
+            out[token] = round_bf16((state * q[:, None, :]).sum(-1))
             if writes[i] >= 0:
                 ssm_out[writes[i]] = state
         if cw >= 0:
