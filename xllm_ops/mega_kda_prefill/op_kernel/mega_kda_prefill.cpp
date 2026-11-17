@@ -1,5 +1,8 @@
 /* Copyright 2026 The xLLM Authors. All Rights Reserved. */
 #include "kda_prefill_frontend.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "kda_prefill_short_a5.h"
+#endif
 #include "kda_prefill_kkt_rows.h"
 #include "kda_prefill_inverse_fp32.h"
 #include "kda_prefill_wy.h"
@@ -37,6 +40,12 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
         reinterpret_cast<__gm__ float*>(ssm_state_out)};
     // Every core validates the same immutable metadata before any publication or barrier.
     if (!ValidMetadata(a, t)) return;
+#if __CCE_AICORE__ == 310
+    if (t.batch == 1 && t.tokens > 0 && t.tokens <= 4 && t.heads == 8) {
+        RunShortA5(a, t);
+        return;
+    }
+#endif
 #if __CCE_AICORE__ == 220
     set_ffts_base_addr(t.ffts_addr);
 #endif

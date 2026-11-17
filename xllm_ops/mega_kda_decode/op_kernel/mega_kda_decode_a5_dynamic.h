@@ -9,12 +9,14 @@ struct Scratch {
     static constexpr int kStateBytes = Rows * 128 * sizeof(float);
     static constexpr int kVectors = 3 * kStateBytes + Rows * 64 * sizeof(float);
     static constexpr int kScalars = kVectors + 4608 + 2 * Rows * sizeof(float);
-    static constexpr int kUbEnd = kScalars + 96 + Rows * sizeof(bfloat16_t);
+    static constexpr int kParameterBase = (kScalars + 96 + Rows * sizeof(bfloat16_t) + 511) / 512 * 512;
+    static constexpr int kUbEnd = kParameterBase + 17 * 512;
     static_assert(kUbEnd <= 262144, "A5 decode Scratch exceeds 256 KiB UB");
 
     TileND<float, Rows, 128> state, expanded, product;
     TileND<float, Rows, 64> reduce_work;
     TileND<float, 1, 128> q, k, v, g, tmp, x, weight, acc;
+    TileND<float, 1, 128> parameter, gate_bias_cached, a_exp_cached;
     TileND<bfloat16_t, 1, 128> bf16;
     TileND<half, 1, 128> fp16;
     TileND<float, 1, Rows> reduced, delta, value;
@@ -53,6 +55,8 @@ struct Scratch {
         TASSIGN(beta_scalar, scalars + 32);
         TASSIGN(beta_bf16, scalars + 64);
         TASSIGN(out, scalars + 96);
+        TASSIGN(gate_bias_cached, kParameterBase + 15 * 512);
+        TASSIGN(a_exp_cached, kParameterBase + 16 * 512);
     }
 };
 
@@ -65,13 +69,84 @@ AICORE inline void LoadBf16(Scratch<Rows>& s, TileND<float, 1, 128>& dst,
     VBarrier();
 }
 
+template <typename TileT>
+__tf__ PTO_INTERNAL void SiluStableVf(typename TileT::TileDType __out__ output,
+                                     typename TileT::TileDType __in__ input)
+{
+    auto* source = (__ubuf__ float*)__cce_get_tile_ptr(input);
+    auto* destination = (__ubuf__ float*)__cce_get_tile_ptr(output);
+    __VEC_SCOPE__ {
+        RegTensor<float> x, exponential, denominator, numerator, result, positive_result;
+        MaskReg mask = PSetWithType<float>(PAT_ALL), positive, large;
+        constexpr auto dist = std::integral_constant<::DistVST,
+            static_cast<::DistVST>(GetDistVst<float, pto::DistVST::DIST_NORM>())>();
+        for (uint16_t half = 0; half < 2; ++half) {
+            vlds(x, source, half * 64, NORM);
+            vmuls(exponential, x, -1.0f, mask, MODE_ZEROING);
+            vexp(exponential, exponential, mask, MODE_ZEROING);
+            vadds(denominator, exponential, 1.0f, mask, MODE_ZEROING);
+            vmul(numerator, x, exponential, mask, MODE_ZEROING);
+            vcmps_gt(positive, x, 8.0f, mask);
+            vsel(numerator, numerator, x, positive);
+            vdiv(result, numerator, denominator, mask, MODE_ZEROING);
+            vsub(positive_result, x, result, mask, MODE_ZEROING);
+            vsel(result, positive_result, result, positive);
+            // SiLU rounds to x in FP32 here; also preserve positive infinity.
+            vcmps_gt(large, x, 80.0f, mask);
+            vsel(result, x, result, large);
+            vsts(result, destination, half * 64, dist, mask);
+        }
+    }
+}
+
 template <int Rows>
+AICORE inline void SiluStable(Scratch<Rows>& s)
+{
+    // For positive x use x - x*exp(-x)/(1+exp(-x)); its small quotient
+    // avoids losing the activation tail when the denominator rounds near 1.
+    // All arithmetic is ordinary FP32, with one exp and one division.
+    SiluStableVf<decltype(s.acc)>(s.acc.data(), s.acc.data());
+    VBarrier();
+}
+
+template <int Rows>
+AICORE inline void LoadParameters(Scratch<Rows>& s, const Args& a, const TilingData& t,
+                                  int64_t head)
+{
+    const int64_t channels = 384 * t.heads;
+    for (int64_t part = 0; part < 3; ++part) {
+        const int64_t channel = (part * t.heads + head) * 128;
+        for (int64_t tap = 0; tap < 4; ++tap) {
+            TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (part * 4 + tap) * 512);
+            LoadBf16(s, s.parameter, a.conv_weight + tap * channels + channel);
+        }
+        TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (12 + part) * 512);
+        if (a.conv_bias) {
+            LoadBf16(s, s.parameter, a.conv_bias + channel);
+        } else {
+            TEXPANDS(s.parameter, 0.0f);
+            VBarrier();
+        }
+    }
+    Load<float, 1, 128>(s.gate_bias_cached, a.gate_bias + head * 128);
+    TEXPANDS(s.a_exp_cached, a.a_log[head]);
+    VBarrier();
+    TEXP(s.a_exp_cached, s.a_exp_cached);
+    VBarrier();
+}
+
+template <bool Cached, int Rows>
 AICORE inline void Conv(Scratch<Rows>& s, const Args& a, const TilingData& t,
                         int64_t row, int64_t token, int64_t begin, int64_t historyOffset,
                         int64_t channel, TileND<float, 1, 128>& dst)
 {
     const int64_t channels = 384 * t.heads;
-    if (a.conv_bias) {
+    const int64_t part = channel / (t.heads * 128);
+    if constexpr (Cached) {
+        TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (12 + part) * 512);
+        TMOV(s.acc, s.parameter);
+        VBarrier();
+    } else if (a.conv_bias) {
         LoadBf16(s, s.acc, a.conv_bias + channel);
     } else {
         TEXPANDS(s.acc, 0.0f);
@@ -86,20 +161,18 @@ AICORE inline void Conv(Scratch<Rows>& s, const Args& a, const TilingData& t,
         TCVT(s.fp16, s.x, RoundMode::CAST_RINT);
         VBarrier();
         TCVT(s.x, s.fp16, RoundMode::CAST_NONE);
-        LoadBf16(s, s.weight, a.conv_weight + tap * channels + channel);
-        TMUL(s.tmp, s.x, s.weight);
+        if constexpr (Cached) {
+            TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (part * 4 + tap) * 512);
+            TMUL(s.tmp, s.x, s.parameter);
+        } else {
+            LoadBf16(s, s.weight, a.conv_weight + tap * channels + channel);
+            TMUL(s.tmp, s.x, s.weight);
+        }
         VBarrier();
         TADD(s.acc, s.acc, s.tmp);
         VBarrier();
     }
-    TMULS(s.tmp, s.acc, -1.0f);
-    VBarrier();
-    TEXP(s.tmp, s.tmp);
-    VBarrier();
-    TADDS(s.tmp, s.tmp, 1.0f);
-    VBarrier();
-    TDIV(s.acc, s.acc, s.tmp);
-    VBarrier();
+    SiluStable(s);
     TCVT(s.bf16, s.acc, RoundMode::CAST_RINT);
     VBarrier();
     TCVT(dst, s.bf16, RoundMode::CAST_NONE);
@@ -200,20 +273,61 @@ AICORE inline void RowMulKReuse(
         dst.data(), key.data(), rowScale.data(), Rows);
 }
 
+template <typename StateTile, typename KeyTile, typename RowScaleTile>
+__tf__ PTO_INTERNAL void StateFmaVf(
+    typename StateTile::TileDType __out__ output, typename StateTile::TileDType __in__ input,
+    typename KeyTile::TileDType __in__ key, typename RowScaleTile::TileDType __in__ row_scale,
+    uint16_t rows)
+{
+    auto* out = (__ubuf__ float*)__cce_get_tile_ptr(output);
+    auto* state = (__ubuf__ float*)__cce_get_tile_ptr(input);
+    auto* keys = (__ubuf__ float*)__cce_get_tile_ptr(key);
+    auto* scales = (__ubuf__ float*)__cce_get_tile_ptr(row_scale);
+    __VEC_SCOPE__ {
+        RegTensor<float> value, key_reg, scale_reg;
+        MaskReg mask = PSetWithType<float>(PAT_ALL);
+        constexpr auto dist = std::integral_constant<::DistVST,
+            static_cast<::DistVST>(GetDistVst<float, pto::DistVST::DIST_NORM>())>();
+        for (uint16_t half = 0; half < 2; ++half) {
+            vlds(key_reg, keys, half * 64, NORM);
+            for (uint16_t row = 0; row < rows; ++row) {
+                const uint32_t offset = row * 128 + half * 64;
+                vlds(value, state, offset, NORM);
+                vlds(scale_reg, scales, row, BRC_B32);
+                vmula(value, key_reg, scale_reg, mask, MODE_ZEROING);
+                vsts(value, out, offset, dist, mask);
+            }
+        }
+    }
+}
+
 template <int Rows>
+AICORE inline void StateFma(Scratch<Rows>& s)
+{
+    StateFmaVf<decltype(s.state), decltype(s.k), decltype(s.delta_col)>(
+        s.state.data(), s.state.data(), s.k.data(), s.delta_col.data(), Rows);
+}
+
+template <bool Cached, int Rows>
 AICORE inline void Recurrent(Scratch<Rows>& s, const Args& a, const TilingData& t,
                              int64_t token, int64_t head)
 {
     Normalize(s, s.q, 0.08838834764831845f);
     Normalize(s, s.k, 1.0f);
     LoadBf16(s, s.g, a.gate + (token * t.heads + head) * 128);
-    Load<float, 1, 128>(s.tmp, a.gate_bias + head * 128);
-    TADD(s.g, s.g, s.tmp);
-    TEXPANDS(s.tmp, a.a_log[head]);
-    VBarrier();
-    TEXP(s.tmp, s.tmp);
-    VBarrier();
-    TMUL(s.g, s.g, s.tmp);
+    if constexpr (Cached) {
+        TADD(s.g, s.g, s.gate_bias_cached);
+        VBarrier();
+        TMUL(s.g, s.g, s.a_exp_cached);
+    } else {
+        Load<float, 1, 128>(s.tmp, a.gate_bias + head * 128);
+        TADD(s.g, s.g, s.tmp);
+        TEXPANDS(s.tmp, a.a_log[head]);
+        VBarrier();
+        TEXP(s.tmp, s.tmp);
+        VBarrier();
+        TMUL(s.g, s.g, s.tmp);
+    }
     VBarrier();
     TMULS(s.g, s.g, -1.0f);
     VBarrier();
@@ -252,11 +366,8 @@ AICORE inline void Recurrent(Scratch<Rows>& s, const Args& a, const TilingData& 
     const float beta = s.beta_scalar.GetValue(0);
     TMULS(s.delta, s.delta, beta);
     VBarrier();
-    // Direct row-by-column VF multiply performs delta*K without either
-    // expanded temporary.  Keep TADD separate to preserve non-FMA order.
-    RowMulKReuse(s.product, s.k, s.delta_col);
-    VBarrier();
-    TADD(s.state, s.state, s.product);
+    // One FP32 FMA avoids the rounded outer-product temporary.
+    StateFma(s);
     VBarrier();
     ColExpandMulReuse(s.product, s.state, s.q);
     VBarrier();
@@ -303,12 +414,16 @@ AICORE inline void RunImpl(const Args& a, const TilingData& t)
         }
         Scratch<Rows> s;
         s.Init(vStart);
+        if constexpr (Mtp) {
+            // These parameters are immutable across this sequence's tokens.
+            LoadParameters(s, a, t, head);
+        }
         Load<float, Rows, 128>(s.state, a.ssm_in + (ssmRead * t.heads + head) * 16384 + vStart * 128);
         for (int64_t token = begin; token < end; ++token) {
-            Conv(s, a, t, convRead, token, begin, accepted - 1, head * 128, s.q);
-            Conv(s, a, t, convRead, token, begin, accepted - 1, (t.heads + head) * 128, s.k);
-            Conv(s, a, t, convRead, token, begin, accepted - 1, (2 * t.heads + head) * 128, s.v);
-            Recurrent(s, a, t, token, head);
+            Conv<Mtp>(s, a, t, convRead, token, begin, accepted - 1, head * 128, s.q);
+            Conv<Mtp>(s, a, t, convRead, token, begin, accepted - 1, (t.heads + head) * 128, s.k);
+            Conv<Mtp>(s, a, t, convRead, token, begin, accepted - 1, (2 * t.heads + head) * 128, s.v);
+            Recurrent<Mtp>(s, a, t, token, head);
             const int64_t slot = a.ssm_write[batch * t.max_query_tokens + token - begin];
             if (slot >= 0) {
                 Store<float, Rows, 128>(a.ssm_out + (slot * t.heads + head) * 16384 + vStart * 128, s.state);
