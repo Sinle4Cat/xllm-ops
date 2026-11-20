@@ -87,7 +87,7 @@ def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.T
                 k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
             raw_g = data["gate"][token].double() + data["gate_bias"].double()
             decay = (-5.0 * torch.sigmoid(raw_g * data["a_log"].double().exp()[:, None])).exp()
-            beta = round_bf16(torch.sigmoid(data["beta"][token].double())).double()
+            beta = torch.sigmoid(data["beta"][token].float()).double()
             state = state * decay[:, None, :]
             delta = (v - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = state + delta[:, :, None] * k[:, None, :]
@@ -122,7 +122,7 @@ def public_compat_stages(data: dict[str, Any], sequence: torch.Tensor,
     scaled_gate = (data["gate"][token].float() + data["gate_bias"].float()) * data["a_log"].float().exp()[:, None]
     sigmoid = 1.0 / (1.0 + torch.exp(-scaled_gate))
     gate = sigmoid * -5.0
-    beta = torch.sigmoid(data["beta"][token].float()).bfloat16().float()
+    beta = torch.sigmoid(data["beta"][token].float())
     return {"pre_silu": pre_silu, "conv": activation, "q": normalized[0] * 128 ** -0.5,
             "k": normalized[1], "v": v, "gate": gate, "decay": gate.exp(), "beta": beta}
 

@@ -580,11 +580,7 @@ AICORE inline void recurrent(Scratch<VRows>& s,
   v_barrier();
   TDIV(s.beta_scalar, s.norm, s.beta_scalar);
   v_barrier();
-  // The public projection applies sigmoid in BF16 before recurrence.
-  TCVT(s.beta_bf16, s.beta_scalar, RoundMode::CAST_RINT);
-  v_barrier();
-  TCVT(s.beta_scalar, s.beta_bf16, RoundMode::CAST_NONE);
-  v_barrier();
+  // Keep sigmoid(beta_raw.float()) in FP32 for the recurrence.
   TCOLEXPAND(s.expanded, s.g);
   v_barrier();
   TMUL(s.state, s.state, s.expanded);

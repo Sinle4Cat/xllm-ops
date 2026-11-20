@@ -84,9 +84,9 @@ Pass `None` for absent Conv bias and, in ordinary decode, accepted counts.
 It returns the same three output tensors without cloning state or projected QKV.
 
 Unlike `MegaKdaPrefill`, beta here is the raw BF16 projection and sigmoid is
-computed inside the operator. Prefill consumes FP32 post-sigmoid beta. A decode
-read slot of -1 means inactive, not prefill's zero initial state. Callers must
-honor each operator's contract when switching between phases.
+computed in FP32 inside the operator. Prefill consumes FP32 post-sigmoid beta.
+A decode read slot of -1 means inactive, not prefill's zero initial state.
+Callers must honor each operator's contract when switching between phases.
 
 ## State And Numerical Semantics
 
@@ -99,8 +99,8 @@ honor each operator's contract when switching between phases.
   SSM comes from `ssm_read_indices[b, accepted-1]`; Conv starts at history offset
   `accepted-1`. The scheduler must provide valid previous checkpoints/history.
 - Width-four Conv accumulates in FP32, rounds the accumulation to BF16 before
-  SiLU, then rounds SiLU to BF16 before recurrence. Beta sigmoid also rounds to
-  BF16 before returning to FP32. Q scale is `128**-0.5`; state is FP32 `[V,K]`.
+  SiLU, then rounds SiLU to BF16 before recurrence. Beta sigmoid and its result
+  stay in FP32 through recurrence. Q scale is `128**-0.5`; state is FP32 `[V,K]`.
   Decay is mathematically `exp(-5 * sigmoid(exp(a_log) * (gate + gate_bias)))`.
   This is KDA vector decay, not GDN scalar decay. The mode differences below
   are floating-point contracts, including operation order.
@@ -129,7 +129,7 @@ honor each operator's contract when switching between phases.
 The FP16 omission permits finite BF16 inputs outside the FP16 range. No epsilon
 changes the treatment of very small nonzero vectors as well as exact zeros.
 These four differences are selected together by mode 3/key 3; they are not four
-independent switches. Shared BF16 Conv/SiLU/beta boundaries still apply.
+independent switches. Shared BF16 Conv and SiLU boundaries still apply.
 
 The Device uses only AIV and zero user workspace. Each task owns 32 or 64 V
 rows and processes a request serially, with 62,368 or 120,032bytes of explicitly
@@ -167,10 +167,9 @@ CPU/NPU state carry20, changed-metadata Graph replay, padding, different pool
 capacities, accepted-prefix restoration and alias rejection. Conv copies and
 untouched values require byte equality, including signed zero. The independent
 CPU oracle accumulates Conv, normalization, gate and recurrence in FP64, retaining
-the mode-specific FP16 boundary and common BF16 accumulation-before-SiLU,
-SiLU-output and beta-sigmoid boundaries. It is a mathematical oracle rather
-than a bitwise model of device FP32 reductions. Independent FP32 stage checks
-cover reciprocal-then-multiply gate order, beta rounding, zero/near-zero norms
+the mode-specific FP16 boundary and common BF16 Conv and SiLU boundaries.
+It evaluates beta sigmoid in FP32. Independent FP32 stage checks cover
+reciprocal-then-multiply gate order, FP32 beta, zero/near-zero norms
 and finite BF16 inputs above the FP16 range. Shape/dtype mismatch
 or nonfinite outputs, golden values or derived errors fail closed.
 Normal relative errors and near-zero absolute errors (split at `1e-3`) and their

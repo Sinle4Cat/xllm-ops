@@ -253,7 +253,7 @@ def test_public_compat_fp32_stages(variant: str) -> None:
 
 
 @pytest.mark.parametrize("mode", [NATIVE, MTP, PUBLIC_COMPAT])
-def test_reference_preserves_common_bf16_activation_boundaries(mode: int) -> None:
+def test_reference_preserves_conv_rounding_and_fp32_beta(mode: int) -> None:
     data = make_case(batch=1, heads=1, mode=mode)
     data["qkv"].fill_(1)
     data["conv_state_in"].fill_(1)
@@ -265,10 +265,9 @@ def test_reference_preserves_common_bf16_activation_boundaries(mode: int) -> Non
     actual = reference(data)
     # 1+1/256 is the BF16 midpoint and rounds to 1 before SiLU.
     value = torch.nn.functional.silu(torch.tensor(1.0, dtype=torch.float64)).bfloat16().double()
-    beta = torch.sigmoid(data["beta"][0, 0].double()).bfloat16().double()
+    beta = torch.sigmoid(data["beta"][0, 0].float()).double()
     omitted_conv_round = torch.nn.functional.silu(torch.tensor(1 + 1 / 256, dtype=torch.float64)).bfloat16().double()
-    omitted_beta_round = torch.sigmoid(data["beta"][0, 0].double())
-    assert value != omitted_conv_round and beta != omitted_beta_round
+    assert value != omitted_conv_round and beta != beta.bfloat16().double()
     square_norm = 128 * value.square() + (0 if mode == PUBLIC_COMPAT else 1e-6)
     state_scalar = value * beta * value / square_norm.sqrt()
     torch.testing.assert_close(actual[2][2, 0], state_scalar.float().expand(128, 128), rtol=0, atol=0)
@@ -290,7 +289,7 @@ def test_public_compat_fp32_gate_reciprocal_then_multiply() -> None:
     # Tensor/Tensor div supplies an independent direct-division counterfactual.
     direct_division = torch.div(torch.full_like(denominator, -5.0), denominator)
     assert not bitwise_equal(want, direct_division)
-    assert bitwise_equal(stages["beta"], torch.sigmoid(data["beta"][0].float()).bfloat16().float())
+    assert bitwise_equal(stages["beta"], torch.sigmoid(data["beta"][0].float()))
 
 
 def npu_case(data):

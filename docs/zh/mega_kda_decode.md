@@ -40,11 +40,11 @@ capacity=1仍支持单token MTP verify。普通decode的Conv history长度为3�
 MTP为capacity+2。Conv权重按MegaGDN的`[4,C]`布局预打包，不能逐次转置。
 
 与`MegaKdaPrefill`不同，decode的beta是sigmoid前的BF16投影，sigmoid
-在算子内部计算；prefill接收sigmoid后的FP32 beta。decode的读slot -1
+在算子内部以FP32计算；prefill接收sigmoid后的FP32 beta。decode的读slot -1
 表示inactive，不是prefill的零初态。阶段切换时必须分别遵守各自接口契约。
 
 共同数学边界为Conv累加后先舍入BF16，再计算SiLU并再次舍入BF16；
-beta sigmoid也先舍入BF16，再转回FP32递推。Q缩放为`128**-0.5`，
+beta sigmoid以FP32计算，递推时保留FP32。Q缩放为`128**-0.5`，
 SSM使用FP32 `[V,K]`，不复用GDN的标量decay公式。
 
 | 数值阶段 | native/MTP（mode0/1） | 公开兼容（mode3） |
@@ -73,9 +73,9 @@ Conv、Q/K和gate计算减半，只有首个V分片发布Conv state，状态读�
 padding、不同状态池容量和alias拒绝。
 fixed20使用图模式并按原始字节比较，区分正零与负零。
 独立CPU golden的Conv、归一化、gate和递推使用FP64，保留模式对应的FP16
-转换与共同的Conv累加、SiLU输出、beta sigmoid的BF16舍入边界。
+转换与共同的Conv累加、SiLU输出的BF16舍入边界，beta sigmoid使用FP32。
 它是数学参考，不逐比特模拟Device FP32累加或归约树。额外FP32阶段检查覆盖
-gate先倒数后乘法、beta舍入、零/近零norm和超出FP16范围的有限输入。
+gate先倒数后乘法、FP32 beta、零/近零norm和超出FP16范围的有限输入。
 shape/dtype不匹配或输出、golden、派生误差出现
 NaN/Inf一律失败。按`abs(golden)=1e-3`分组报告正常值相对误差、近零值
 绝对误差及超限比例，作为额外诊断；原逐元素验收阈值不变：输出
