@@ -514,11 +514,11 @@ AICORE inline void normalize(Scratch<VRows>& s,
   v_barrier();
 }
 
-// match the ordinary 32-row reduction order while retaining the 64-row
-// state/conv tile. The historical key1/key2 specializations remain unchanged.
-template <int VRows, bool PublicCompat>
+// Ordinary decode uses the same FP32 reduction order for both tile sizes.
+// Keep the 64-row state/conv tile when it fills the device.
+template <int VRows, bool Mtp>
 AICORE inline void recurrent_row_sum(Scratch<VRows>& s) {
-  if constexpr (PublicCompat && VRows == 64) {
+  if constexpr (!Mtp && VRows == 64) {
     using Layout = ScratchLayout<VRows>;
     TileND<float, 32, 128> product_half;
     TileND<float, 32, 64> work_half;
@@ -537,7 +537,7 @@ AICORE inline void recurrent_row_sum(Scratch<VRows>& s) {
   }
 }
 
-template <int VRows, bool PublicCompat = false>
+template <int VRows, bool Mtp, bool PublicCompat>
 AICORE inline void recurrent(Scratch<VRows>& s,
                              const Args& a,
                              const TilingData& t,
@@ -589,7 +589,7 @@ AICORE inline void recurrent(Scratch<VRows>& s,
   v_barrier();
   TMUL(s.product, s.state, s.expanded);
   v_barrier();
-  recurrent_row_sum<VRows, PublicCompat>(s);
+  recurrent_row_sum<VRows, Mtp>(s);
   v_barrier();
   TSUB(s.delta, s.value, s.reduced);
   v_barrier();
@@ -607,7 +607,7 @@ AICORE inline void recurrent(Scratch<VRows>& s,
   v_barrier();
   TMUL(s.product, s.state, s.expanded);
   v_barrier();
-  recurrent_row_sum<VRows, PublicCompat>(s);
+  recurrent_row_sum<VRows, Mtp>(s);
   v_barrier();
   TCVT(s.out, s.reduced, RoundMode::CAST_RINT);
   v_barrier();
@@ -691,7 +691,7 @@ AICORE inline void run_tiled(const Args& a, const TilingData& t) {
                                   (2 * t.heads + head) * 128,
                                   s.v);
       }
-      recurrent<VRows, PublicCompat>(s, a, t, token, head);
+      recurrent<VRows, Mtp, PublicCompat>(s, a, t, token, head);
       const int64_t slot =
           a.ssm_write[batch * t.max_query_tokens + token - begin];
       if (slot >= 0) {

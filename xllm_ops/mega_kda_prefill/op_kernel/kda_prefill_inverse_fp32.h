@@ -85,6 +85,7 @@ AICORE inline void subtract_pair_tree(__ubuf__ float* result,
 }
 #endif
 
+template <int C>
 AICORE inline void inverse_fp32(__gm__ float* lower,
                                 __gm__ float* out,
                                 __gm__ float* identity,
@@ -94,11 +95,11 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
                                 int64_t tokens,
                                 int32_t heads) {
 #if defined(__DAV_VEC__)
-  constexpr int C = 128;
+  // A single vector core owns the whole 64-column inverse.
   constexpr int N = 64;
-  const int core = get_block_idx();
-  const int cores = get_block_num();
-  const int col0 = get_subblockid() * N;
+  static_assert(C == N);
+  const int core = get_block_idx() * 2 + get_subblockid();
+  const int cores = get_block_num() * 2;
   set_mask_norm();
   set_vector_mask(-1, -1);
   int64_t total_chunks = 0;
@@ -107,7 +108,7 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
   }
   Vec<C, N> eye;
   TASSIGN(eye, 147456);
-  GM geye(identity + col0, GS(1, 1, 1, C, N), ST(C));
+  GM geye(identity, GS(1, 1, 1, C, N), ST(128));
   TLOAD(eye, geye);
   for (int64_t task = core; task < total_chunks * heads; task += cores) {
     const int head = task % heads;
@@ -158,7 +159,7 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
     }
     Vec<C, N, DYNAMIC> store(valid);
     TASSIGN(store, 65536);
-    GM dst(out + (start * heads + head) * C + col0,
+    GM dst(out + (start * heads + head) * C,
            GS(1, 1, 1, valid, N),
            ST(heads * C));
     SetWaitFlag<PIPE_V, PIPE_MTE3>(0);

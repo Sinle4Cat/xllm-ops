@@ -10,6 +10,7 @@
 namespace kda_prefill {
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kChunkSize = 128;
+constexpr int64_t kAscend910bChunkSize = 64;
 constexpr int64_t kQkvParts = 3;
 constexpr int64_t kConvTaps = 4;
 constexpr int64_t kConvHistory = kConvTaps - 1;
@@ -88,20 +89,22 @@ class Workspace final {
     return (n + kWorkspaceAlignment - 1) / kWorkspaceAlignment *
            kWorkspaceAlignment;
   }
-  KDA_HOST_DEVICE explicit inline Workspace(const TilingData& t) : bytes(0) {
+  KDA_HOST_DEVICE explicit inline Workspace(const TilingData& t,
+                                           int64_t chunk_size = kChunkSize)
+      : bytes(0) {
     const uint64_t n = static_cast<uint64_t>(t.tokens) * t.heads;
     const uint64_t state =
         static_cast<uint64_t>(t.batch) * t.heads * kStateElements * kFloatBytes;
     const uint64_t chunks =
-        (t.tokens + kChunkSize - 1) / kChunkSize + t.batch - 1;
+        (t.tokens + chunk_size - 1) / chunk_size + t.batch - 1;
     q = take(n * kHeadDim * kBf16Bytes);
     k = take(n * kHeadDim * kBf16Bytes);
     beta = take(n * kFloatBytes);
     g = take(n * kHeadDim * kFloatBytes);
     value = take(n * kHeadDim * kFloatBytes);
-    lower = take(n * kChunkSize * kFloatBytes);
-    inverse = take(n * kChunkSize * kFloatBytes);
-    aqk = take(n * kChunkSize * kFloatBytes);
+    lower = take(n * chunk_size * kFloatBytes);
+    inverse = take(n * chunk_size * kFloatBytes);
+    aqk = take(n * chunk_size * kFloatBytes);
     u = take(n * kHeadDim * kFloatBytes);
     w = take(n * kHeadDim * kFloatBytes);
     corrected = take(n * kHeadDim * kFloatBytes);

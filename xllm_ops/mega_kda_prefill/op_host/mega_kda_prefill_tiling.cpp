@@ -63,8 +63,8 @@ static ge::graphStatus mega_kda_prefill_tiling(gert::TilingContext* context) {
                platform.GetCoreNumAic(),
                static_cast<uint64_t>(
                    *attrs->GetInt(static_cast<uint32_t>(Attr::FFTS_ADDR)))};
-  if (!valid_tiling(t, platform.GetSocVersion() ==
-                         platform_ascendc::SocVersion::ASCEND950)) {
+  const bool is_a5 = platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
+  if (!valid_tiling(t, is_a5)) {
     return ge::GRAPH_FAILED;
   }
   const int64_t c = t.heads * kQkvParts * kHeadDim;
@@ -131,7 +131,8 @@ static ge::graphStatus mega_kda_prefill_tiling(gert::TilingContext* context) {
   }
   std::memcpy(raw->GetData(), &t, sizeof(t));
   raw->SetDataSize(sizeof(t));
-  workspace[0] = Workspace(t).bytes + platform.GetLibApiWorkSpaceSize();
+  const int64_t chunk_size = is_a5 ? kChunkSize : kAscend910bChunkSize;
+  workspace[0] = Workspace(t, chunk_size).bytes + platform.GetLibApiWorkSpaceSize();
   context->SetTilingKey(1);
   context->SetBlockDim(t.blocks);
   return ge::GRAPH_SUCCESS;

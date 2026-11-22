@@ -27,7 +27,8 @@ All tensors are contiguous ND on the same NPU. Select that NPU as the current
 device before calling the binding, as for the existing MegaGDN bindings.
 `T` is the total packed token
 count, `B` the number of sequences, `H` the head count, and `C = 384 * H`.
-K/V dimensions and chunk size are 128. Conv width is four.
+K/V dimensions are 128 and Conv width is four. The internal chunk size is
+64 on Ascend910B and 128 on Ascend950.
 
 | Argument | Shape | Dtype | Meaning |
 |---|---|---|---|

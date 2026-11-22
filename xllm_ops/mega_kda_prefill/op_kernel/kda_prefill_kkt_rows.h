@@ -55,6 +55,7 @@ AICORE inline void sum_pair64(__ubuf__ float* dst,
 }
 #endif
 
+template <int C>
 AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
                                    __gm__ float* gates,
                                    __gm__ float* beta,
@@ -67,7 +68,6 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
                                    int64_t tokens,
                                    int32_t heads) {
 #if defined(__DAV_VEC__)
-  constexpr int C = 128;
   constexpr int D = 128;
   constexpr int N = 64;
   constexpr int ROWS = 32;
@@ -230,7 +230,7 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
           SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
           TSTORE(qdst, cached_aqk);
           TSTORE(dst, cached_kk);
-          if (all_full_chunks && col0 == 0 && row0 < N) {
+          if (C > N && all_full_chunks && col0 == 0 && row0 < N) {
             // Complete the zero-only upper right quadrant for the direct
             // Cube load. Wait for the preceding store before reusing its UB.
             SetWaitFlag<PIPE_MTE3, PIPE_V>(0);

@@ -354,6 +354,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   // and the BSND GM stride, never a UB buffer size or tile shape.
   const int32_t H = num_heads;  // HV in KDA terminology
   constexpr int32_t HalfC = C / 2;
+  constexpr int32_t HalfK = K_DIM / 2;
   const int32_t BSND_STRIDE = H * HiddenSize;
   constexpr int32_t HM_STRIDE = HiddenSize;  // head-major K, G stride
   constexpr int32_t KV = K_DIM * V_DIM;
@@ -374,7 +375,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   TASSIGN(w_l1, KV * sizeof(float));
   TileAcc<float, C, V_DIM, C, V_DIM> ws_l0;
   TASSIGN(ws_l0, 0);
-  TileMatL1<float, K_DIM, C, K_DIM, C> k_l1;
+  TileMatL1<float, C, K_DIM, C, K_DIM> k_l1;
   TASSIGN(k_l1, (KV + C * K_DIM) * sizeof(float));
   TileMatL1<float, C, V_DIM, C, V_DIM> v_l1;
   TASSIGN(v_l1, (KV + C * K_DIM + K_DIM * C) * sizeof(float));
@@ -388,11 +389,14 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   // Only the raw K staging tile is BF16. Peak UB: 148224 bytes at D=C=128.
   constexpr int32_t ZERO_UB = 0;
   constexpr int32_t S_UB = ZERO_UB + 64 * sizeof(float);
-  constexpr int32_t GTOTAL_UB = S_UB + HalfC * V_DIM * sizeof(float);
+  constexpr int32_t GTOTAL_UB = S_UB + HalfK * V_DIM * sizeof(float);
   constexpr int32_t K_UB = GTOTAL_UB + K_DIM * sizeof(float);
   constexpr int32_t GCS_UB = K_UB + HalfC * K_DIM * sizeof(float);
-  constexpr int32_t COEFF_UB = GCS_UB + HalfC * K_DIM * sizeof(float);
-  constexpr int32_t K_UB_HALF = COEFF_UB + HalfC * K_DIM * sizeof(float);
+  constexpr int32_t AliasedRows = HalfC * K_DIM > HalfK * V_DIM
+                                    ? HalfC * K_DIM
+                                    : HalfK * V_DIM;
+  constexpr int32_t COEFF_UB = GCS_UB + AliasedRows * sizeof(float);
+  constexpr int32_t K_UB_HALF = COEFF_UB + AliasedRows * sizeof(float);
   // Aliases:
   constexpr int32_t U_UB = GCS_UB;        // load U after g_cs is consumed
   constexpr int32_t KV_FP32_UB = GCS_UB;  // cast KV → fp32 into freed buffer
@@ -402,7 +406,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
 
   TileUbDataND<float, 1, 64, 1, 64> zero_ub;
   TASSIGN(zero_ub, ZERO_UB);
-  TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> s_ub;
+  TileUbDataND<float, HalfK, V_DIM, HalfK, V_DIM> s_ub;
   TASSIGN(s_ub, S_UB);
   TileUbDataND<float, 1, K_DIM, 1, K_DIM, pto::PadValue::Zero> gtotal_ub;
   TASSIGN(gtotal_ub, GTOTAL_UB);
@@ -416,9 +420,9 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   TASSIGN(u_ub, U_UB);
   TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> ws_ub;
   TASSIGN(ws_ub, WS_UB);
-  TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> exp_gt_2d_ub;
+  TileUbDataND<float, HalfK, V_DIM, HalfK, V_DIM> exp_gt_2d_ub;
   TASSIGN(exp_gt_2d_ub, EXP_GT_2D_UB);
-  TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> kv_ub;
+  TileUbDataND<float, HalfK, V_DIM, HalfK, V_DIM> kv_ub;
   TASSIGN(kv_ub, KV_FP32_UB);
 
   auto vid = get_subblockid();
@@ -539,11 +543,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
 #endif
 
       {
-        GmShape2D k_shape(K_DIM, C);
-        GmStride2D k_stride(C);
+        GmShape2D k_shape(C, K_DIM);
+        GmStride2D k_stride(K_DIM);
         GmTensor2D<float> k_global(
             workspace_handle + ws_base + WS_K, k_shape, k_stride);
-        DynMatL1<float, K_DIM, C> k_l1_load(K_DIM, C);
+        DynMatL1<float, C, K_DIM> k_l1_load(C, K_DIM);
         TASSIGN(k_l1_load,
                 (KV + C * K_DIM) * static_cast<int32_t>(sizeof(float)));
         TLOAD(k_l1_load, k_global);
@@ -635,11 +639,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
     TEXPANDS(s_ub, 0.0f);
     if (initial_state != nullptr) {
       pipe_barrier(PIPE_ALL);
-      GmShape2D initial_shape(HalfC, V_DIM);
+      GmShape2D initial_shape(HalfK, V_DIM);
       GmStride2D initial_stride(FULL_V_DIM);
       GmTensor2D<float> initial_global(
           initial_state + (seq_idx * H + head) * FULL_KV +
-              static_cast<int64_t>(vid) * HalfC * FULL_V_DIM + v_column,
+              static_cast<int64_t>(vid) * HalfK * FULL_V_DIM + v_column,
           initial_shape,
           initial_stride);
       TLOAD(s_ub, initial_global);
@@ -648,13 +652,13 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     {
-      GmShape2D s_shape(HalfC, V_DIM);
+      GmShape2D s_shape(HalfK, V_DIM);
       GmStride2D s_stride(V_DIM);
       GmTensor2D<float> s_global(workspace_handle + ws_base + WS_S +
-                                     static_cast<int64_t>(vid) * HalfC * V_DIM,
+                                     static_cast<int64_t>(vid) * HalfK * V_DIM,
                                  s_shape,
                                  s_stride);
-      DynVecTile<float, HalfC, V_DIM> s_store(HalfC, V_DIM);
+      DynVecTile<float, HalfK, V_DIM> s_store(HalfK, V_DIM);
       TASSIGN(s_store, S_UB);
       TSTORE(s_global, s_store);
     }
@@ -688,12 +692,12 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
         int64_t s_out_offset =
             (chunk_offset + static_cast<int64_t>(ci)) * H * FULL_KV +
             static_cast<int64_t>(head) * FULL_KV +
-            static_cast<int64_t>(vid) * HalfC * FULL_V_DIM + v_column;
-        GmShape2D s_out_shape(HalfC, V_DIM);
+            static_cast<int64_t>(vid) * HalfK * FULL_V_DIM + v_column;
+        GmShape2D s_out_shape(HalfK, V_DIM);
         GmStride2D s_out_stride(FULL_V_DIM);
         GmTensor2D<float> s_out_global(
             S_handle + s_out_offset, s_out_shape, s_out_stride);
-        DynVecTile<float, HalfC, V_DIM> s_out_store(HalfC, V_DIM);
+        DynVecTile<float, HalfK, V_DIM> s_out_store(HalfK, V_DIM);
         TASSIGN(s_out_store, S_UB);
         TSTORE(s_out_global, s_out_store);
       }
@@ -892,13 +896,13 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       TEXP(gtotal_ub, gtotal_ub);
       PipeBarrierVec();
 
-      // This sub-block owns K-rows [vid*HalfC, (vid+1)*HalfC) of the state.
-      // Reinterpret that slice of gtotal_ub as a [HalfC, 1] DN-column vector,
+      // This sub-block owns K-rows [vid*HalfK, (vid+1)*HalfK) of the state.
+      // Reinterpret that slice of gtotal_ub as a [HalfK, 1] DN-column vector,
       // broadcast across V columns via TROWEXPAND, then row-scale s_ub.
       {
-        TileUbDataDN<float, HalfC, 1, HalfC, 1> exp_gt_col;
+        TileUbDataDN<float, HalfK, 1, HalfK, 1> exp_gt_col;
         TASSIGN(exp_gt_col,
-                GTOTAL_UB + static_cast<int32_t>(vid) * HalfC *
+                GTOTAL_UB + static_cast<int32_t>(vid) * HalfK *
                                 static_cast<int32_t>(sizeof(float)));
         TROWEXPAND(exp_gt_2d_ub, exp_gt_col);
       }
@@ -914,14 +918,14 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       pipe_barrier(PIPE_ALL);
 #endif
       {
-        GmShape2D kv_shape(HalfC, V_DIM);
+        GmShape2D kv_shape(HalfK, V_DIM);
         GmStride2D kv_stride(V_DIM);
         GmTensor2D<float> kv_global(
             workspace_handle + ws_base + WS_KV +
-                static_cast<int64_t>(vid) * HalfC * V_DIM,
+                static_cast<int64_t>(vid) * HalfK * V_DIM,
             kv_shape,
             kv_stride);
-        DynVecTile<float, HalfC, V_DIM, pto::PadValue::Zero> kv_load(HalfC,
+        DynVecTile<float, HalfK, V_DIM, pto::PadValue::Zero> kv_load(HalfK,
                                                                      V_DIM);
         TASSIGN(kv_load, KV_FP32_UB);
         TLOAD(kv_load, kv_global);
@@ -936,14 +940,14 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
           ci + 1 == static_cast<int32_t>(num_chunks)) {
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        GmShape2D final_shape(HalfC, V_DIM);
+        GmShape2D final_shape(HalfK, V_DIM);
         GmStride2D final_stride(FULL_V_DIM);
         GmTensor2D<float> final_global(
             final_state + (seq_idx * H + head) * FULL_KV +
-                static_cast<int64_t>(vid) * HalfC * FULL_V_DIM + v_column,
+                static_cast<int64_t>(vid) * HalfK * FULL_V_DIM + v_column,
             final_shape,
             final_stride);
-        DynVecTile<float, HalfC, V_DIM> final_store(HalfC, V_DIM);
+        DynVecTile<float, HalfK, V_DIM> final_store(HalfK, V_DIM);
         TASSIGN(final_store, S_UB);
         TSTORE(final_global, final_store);
         // A later work item reuses S_UB during state initialization.
@@ -958,14 +962,14 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         {
-          GmShape2D s_shape(HalfC, V_DIM);
+          GmShape2D s_shape(HalfK, V_DIM);
           GmStride2D s_stride(V_DIM);
           GmTensor2D<float> s_global(
               workspace_handle + ws_base + WS_S +
-                  static_cast<int64_t>(vid) * HalfC * V_DIM,
+                  static_cast<int64_t>(vid) * HalfK * V_DIM,
               s_shape,
               s_stride);
-          DynVecTile<float, HalfC, V_DIM> s_store(HalfC, V_DIM);
+          DynVecTile<float, HalfK, V_DIM> s_store(HalfK, V_DIM);
           TASSIGN(s_store, S_UB);
           TSTORE(s_global, s_store);
         }

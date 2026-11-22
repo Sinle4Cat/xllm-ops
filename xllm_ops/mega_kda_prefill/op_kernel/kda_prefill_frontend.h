@@ -519,7 +519,8 @@ AICORE inline void prepare(const Args& a,
   const int64_t cores = get_block_num() * 2;
   int64_t chunks = 0;
   for (int64_t b = 0; b < t.batch; ++b) {
-    chunks += (a.cu[b + 1] - a.cu[b] + 127) / 128;
+    chunks += (a.cu[b + 1] - a.cu[b] + kAscend910bChunkSize - 1) /
+                       kAscend910bChunkSize;
   }
   // Split independent Q/K/V work only when chunk/head tasks leave AIVs idle.
   // The V owner also produces gate/beta; every output region keeps one writer.
@@ -535,14 +536,16 @@ AICORE inline void prepare(const Args& a,
     int64_t chunk = logical_task / t.heads;
     int64_t b = 0;
     for (; b < t.batch; ++b) {
-      const int64_t n = (a.cu[b + 1] - a.cu[b] + 127) / 128;
+      const int64_t n = (a.cu[b + 1] - a.cu[b] + kAscend910bChunkSize - 1) /
+                       kAscend910bChunkSize;
       if (chunk < n) {
         break;
       }
       chunk -= n;
     }
-    const int64_t start = a.cu[b] + chunk * 128;
-    const int64_t end = start + 128 < a.cu[b + 1] ? start + 128 : a.cu[b + 1];
+    const int64_t start = a.cu[b] + chunk * kAscend910bChunkSize;
+    const int64_t chunk_end = start + kAscend910bChunkSize;
+    const int64_t end = chunk_end < a.cu[b + 1] ? chunk_end : a.cu[b + 1];
     const int64_t history_end = a.cu[b] + 3 < end ? a.cu[b] + 3 : end;
     for (int64_t token = start; token < history_end; ++token) {
       for (int part = 0; part < 3; ++part) {

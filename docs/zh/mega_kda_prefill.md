@@ -38,7 +38,8 @@ verify width=1。模型MTP verify继续使用FLA V3，decode mode1仅表示算�
 
 ## 验证边界
 
-支持Ascend910B、chunk/head dimension 128、Conv width 4。
+支持 Ascend910B 和 Ascend950，K/V head dimension 为 128，Conv width 为 4。
+Ascend910B 的内部 chunk size 为 64，Ascend950 为 128。
 与既有MegaGDN绑定一致，调用前须将输入所在NPU设为当前设备。
 CPU golden使用FP64递推和明确的BF16舍入边界，正常值相对误差、近零值
 绝对误差及超限比例分别报告。测试包含空序列、尾块、独立池容量、输入不变、
