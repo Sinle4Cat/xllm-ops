@@ -135,14 +135,14 @@ AICORE inline void LoadParameters(Scratch<Rows>& s, const Args& a, const TilingD
     v_barrier();
 }
 
-template <bool Cached, int Rows>
+template <bool Mtp, int Rows>
 AICORE inline void Conv(Scratch<Rows>& s, const Args& a, const TilingData& t,
                         int64_t row, int64_t token, int64_t begin, int64_t historyOffset,
                         int64_t channel, TileND<float, 1, 128>& dst)
 {
     const int64_t channels = 384 * t.heads;
     const int64_t part = channel / (t.heads * 128);
-    if constexpr (Cached) {
+    if constexpr (Mtp) {
         TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (12 + part) * 512);
         TMOV(s.acc, s.parameter);
         v_barrier();
@@ -158,10 +158,10 @@ AICORE inline void Conv(Scratch<Rows>& s, const Args& a, const TilingData& t,
             ? a.conv_in + (row * t.conv_history + historyOffset + relative + 3) * channels + channel
             : a.qkv + (begin + relative) * channels + channel;
         LoadBf16(s, s.x, source);
-        TCVT(s.fp16, s.x, RoundMode::CAST_RINT);
-        v_barrier();
-        TCVT(s.x, s.fp16, RoundMode::CAST_NONE);
-        if constexpr (Cached) {
+        if constexpr (Mtp) {
+            TCVT(s.fp16, s.x, RoundMode::CAST_RINT);
+            v_barrier();
+            TCVT(s.x, s.fp16, RoundMode::CAST_NONE);
             TASSIGN(s.parameter, Scratch<Rows>::kParameterBase + (part * 4 + tap) * 512);
             TMUL(s.tmp, s.x, s.parameter);
         } else {
@@ -170,6 +170,13 @@ AICORE inline void Conv(Scratch<Rows>& s, const Args& a, const TilingData& t,
         }
         v_barrier();
         TADD(s.acc, s.acc, s.tmp);
+        v_barrier();
+    }
+    if constexpr (Mtp) {
+        // xLLM's speculative Conv1d V2 writes BF16 before applying SiLU.
+        TCVT(s.bf16, s.acc, RoundMode::CAST_RINT);
+        v_barrier();
+        TCVT(s.acc, s.bf16, RoundMode::CAST_NONE);
         v_barrier();
     }
     SiluStable(s);
