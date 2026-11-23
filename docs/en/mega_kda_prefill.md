@@ -28,7 +28,8 @@ device before calling the binding, as for the existing MegaGDN bindings.
 `T` is the total packed token
 count, `B` the number of sequences, `H` the head count, and `C = 384 * H`.
 K/V dimensions are 128 and Conv width is four. The internal chunk size is
-64 on Ascend910B and 128 on Ascend950.
+128 on Ascend950 and for eight heads on Ascend910B. Other Ascend910B head
+counts use 64.
 
 | Argument | Shape | Dtype | Meaning |
 |---|---|---|---|

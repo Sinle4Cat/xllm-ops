@@ -40,7 +40,11 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
   REGISTER_TILING_DEFAULT(MegaKdaPrefillTilingData);
   GET_TILING_DATA_WITH_STRUCT(MegaKdaPrefillTilingData, t, tiling);
 #ifdef __CCE_AICORE__
+#if __CCE_AICORE__ == 310
   if constexpr (TILING_KEY_IS(1)) {
+#else
+  if constexpr (TILING_KEY_IS(1) || TILING_KEY_IS(2)) {
+#endif
     using namespace kda_prefill;
     Args a{reinterpret_cast<__gm__ bfloat16_t*>(qkv),
            reinterpret_cast<__gm__ bfloat16_t*>(gate),
@@ -69,14 +73,16 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
     }
     set_ffts_base_addr(t.ffts_addr);
     auto* ws = AscendC::GetUserWorkspace(workspace);
-    const Workspace w(t, kAscend910bChunkSize);
-    prepare(a, t, ws, w);
+    constexpr int chunk_size =
+        TILING_KEY_IS(2) ? kChunkSize : kAscend910bSmallChunkSize;
+    const Workspace w(t, chunk_size);
+    prepare<chunk_size>(a, t, ws, w);
     pipe_barrier(PIPE_ALL);
     state_io<false>(a, t, ws, w);
     rendezvous();
 #define KDA_F32(name) reinterpret_cast<__gm__ float*>(ws + w.name)
 #define KDA_BF16(name) reinterpret_cast<__gm__ bfloat16_t*>(ws + w.name)
-    mega_kda_prefill_kkt_rows::launch_kkt_rows<kAscend910bChunkSize>(KDA_BF16(k),
+    mega_kda_prefill_kkt_rows::launch_kkt_rows<chunk_size>(KDA_BF16(k),
                                                KDA_F32(g),
                                                KDA_F32(beta),
                                                KDA_F32(lower),
@@ -88,7 +94,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
                                                t.tokens,
                                                t.heads);
     rendezvous();
-    mega_kda_prefill_inverse_fp32::inverse_fp32<kAscend910bChunkSize>(KDA_F32(lower),
+    mega_kda_prefill_inverse_fp32::inverse_fp32<chunk_size>(KDA_F32(lower),
                                                 KDA_F32(inverse),
                                                 KDA_F32(eye),
                                                 nullptr,
@@ -97,7 +103,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
                                                 t.tokens,
                                                 t.heads);
     rendezvous();
-    mega_kda_prefill_wy_kda::wy_kda_kernel<128, kAscend910bChunkSize>(KDA_BF16(k),
+    mega_kda_prefill_wy_kda::wy_kda_kernel<128, chunk_size>(KDA_BF16(k),
                                                      KDA_F32(value),
                                                      KDA_F32(beta),
                                                      KDA_F32(g),
@@ -112,7 +118,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
                                                      t.heads,
                                                      t.ffts_addr);
     rendezvous();
-    mega_kda_prefill_chunk_h_kda::chunk_h_kda_kernel<128, kAscend910bChunkSize>(
+    mega_kda_prefill_chunk_h_kda::chunk_h_kda_kernel<128, chunk_size>(
         KDA_BF16(k),
         KDA_F32(w),
         KDA_F32(u),
@@ -129,7 +135,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
         KDA_F32(initial),
         KDA_F32(final));
     rendezvous();
-    mega_kda_prefill_chunk_o_exact::chunk_o_kda_kernel<128, kAscend910bChunkSize>(
+    mega_kda_prefill_chunk_o_exact::chunk_o_kda_kernel<128, chunk_size>(
         KDA_BF16(q),
         KDA_BF16(k),
         KDA_F32(corrected),

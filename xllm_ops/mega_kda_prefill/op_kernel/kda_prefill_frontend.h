@@ -508,6 +508,7 @@ static AICORE __attribute__((noinline)) void gate_rows(const Args& a,
 #endif
 }
 
+template <int ChunkSize>
 AICORE inline void prepare(const Args& a,
                            const TilingData& t,
                            __gm__ uint8_t* ws,
@@ -519,8 +520,7 @@ AICORE inline void prepare(const Args& a,
   const int64_t cores = get_block_num() * 2;
   int64_t chunks = 0;
   for (int64_t b = 0; b < t.batch; ++b) {
-    chunks += (a.cu[b + 1] - a.cu[b] + kAscend910bChunkSize - 1) /
-                       kAscend910bChunkSize;
+    chunks += (a.cu[b + 1] - a.cu[b] + ChunkSize - 1) / ChunkSize;
   }
   // Split independent Q/K/V work only when chunk/head tasks leave AIVs idle.
   // The V owner also produces gate/beta; every output region keeps one writer.
@@ -536,15 +536,14 @@ AICORE inline void prepare(const Args& a,
     int64_t chunk = logical_task / t.heads;
     int64_t b = 0;
     for (; b < t.batch; ++b) {
-      const int64_t n = (a.cu[b + 1] - a.cu[b] + kAscend910bChunkSize - 1) /
-                       kAscend910bChunkSize;
+      const int64_t n = (a.cu[b + 1] - a.cu[b] + ChunkSize - 1) / ChunkSize;
       if (chunk < n) {
         break;
       }
       chunk -= n;
     }
-    const int64_t start = a.cu[b] + chunk * kAscend910bChunkSize;
-    const int64_t chunk_end = start + kAscend910bChunkSize;
+    const int64_t start = a.cu[b] + chunk * ChunkSize;
+    const int64_t chunk_end = start + ChunkSize;
     const int64_t end = chunk_end < a.cu[b + 1] ? chunk_end : a.cu[b + 1];
     const int64_t history_end = a.cu[b] + 3 < end ? a.cu[b] + 3 : end;
     for (int64_t token = start; token < history_end; ++token) {

@@ -10,7 +10,7 @@
 namespace kda_prefill {
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kChunkSize = 128;
-constexpr int64_t kAscend910bChunkSize = 64;
+constexpr int64_t kAscend910bSmallChunkSize = 64;
 constexpr int64_t kQkvParts = 3;
 constexpr int64_t kConvTaps = 4;
 constexpr int64_t kConvHistory = kConvTaps - 1;

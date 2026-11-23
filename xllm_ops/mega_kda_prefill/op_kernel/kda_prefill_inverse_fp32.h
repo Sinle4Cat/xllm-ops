@@ -95,11 +95,17 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
                                 int64_t tokens,
                                 int32_t heads) {
 #if defined(__DAV_VEC__)
-  // A single vector core owns the whole 64-column inverse.
+  // One sub-block owns a 64-column inverse. A 128-column inverse uses
+  // both sub-blocks of the same core.
   constexpr int N = 64;
-  static_assert(C == N);
-  const int core = get_block_idx() * 2 + get_subblockid();
-  const int cores = get_block_num() * 2;
+  static_assert(C == N || C == 2 * N);
+  constexpr int subblocks_per_task = C / N;
+  constexpr int tasks_per_core = 2 / subblocks_per_task;
+  const int subblock = get_subblockid();
+  const int core =
+      get_block_idx() * tasks_per_core + subblock / subblocks_per_task;
+  const int cores = get_block_num() * tasks_per_core;
+  const int col0 = (subblock % subblocks_per_task) * N;
   set_mask_norm();
   set_vector_mask(-1, -1);
   int64_t total_chunks = 0;
@@ -108,7 +114,7 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
   }
   Vec<C, N> eye;
   TASSIGN(eye, 147456);
-  GM geye(identity, GS(1, 1, 1, C, N), ST(128));
+  GM geye(identity + col0, GS(1, 1, 1, C, N), ST(128));
   TLOAD(eye, geye);
   for (int64_t task = core; task < total_chunks * heads; task += cores) {
     const int head = task % heads;
@@ -159,7 +165,7 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
     }
     Vec<C, N, DYNAMIC> store(valid);
     TASSIGN(store, 65536);
-    GM dst(out + (start * heads + head) * C,
+    GM dst(out + (start * heads + head) * C + col0,
            GS(1, 1, 1, valid, N),
            ST(heads * C));
     SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
