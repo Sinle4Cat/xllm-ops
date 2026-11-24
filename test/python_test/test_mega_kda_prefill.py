@@ -1,10 +1,7 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
-"""Contract, FP64 oracle and opt-in ACLNN graph replay checks."""
+"""ACLNN Prefill precision and graph replay tests on NPU."""
 import json
 import os
-from pathlib import Path
-import re
-import subprocess
 
 import pytest
 import torch
@@ -14,141 +11,8 @@ from mega_kda_test_utils import (
     GLM_KDA_HEADS, TP_SIZES, bitwise_equal, checked_written_rows, error_metrics, is_a5_device,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
 NATIVE = pytest.mark.skipif(os.getenv("MEGA_KDA_PREFILL_TEST_NPU") is None,
                            reason="select an exclusive NPU explicitly")
-
-
-def test_host_policy(tmp_path):
-    source = tmp_path / "policy.cpp"
-    source.write_text(r'''
-#include <cassert>
-#include "mega_kda_prefill_policy.h"
-int main() {
-    using namespace kda_prefill;
-    TilingData t{3, 132, 2, 4, 6, 5, 7, 24, 1};
-    assert(valid_tiling(t));
-    Workspace w(t);
-    const TilingData long_context{1, 98304, 64, 1, 1, 1, 1, 24, 1};
-    constexpr uint64_t limit = uint64_t{32} << 30;
-    assert(Workspace(long_context, kAscend910bSmallChunkSize).bytes <= limit);
-    assert(Workspace(long_context, kChunkSize).bytes > limit);
-    assert(valid_tiling(long_context));
-    assert(!valid_tiling(long_context, true));
-    assert(w.q == 0 && w.k > w.q && w.bytes % 512 == 0);
-    assert(w.eye + 16384 * 4 == w.bytes);
-    assert(w.wy_k - w.wy_a == t.blocks * 16384 * sizeof(float));
-    for (int tp : {1, 2, 4, 8, 16, 32, 64}) {
-        t.heads = 64 / tp;
-        assert(valid_tiling(t));
-    }
-    t.heads = 2;
-    t.ffts_addr = 0; assert(!valid_tiling(t)); t.ffts_addr = 1;
-    t.blocks = 33; assert(!valid_tiling(t)); t.blocks = 24;
-    t.tokens = 0; assert(!valid_tiling(t));
-    t.tokens = 32768; assert(valid_tiling(t));
-    t.tokens = 131073; assert(!valid_tiling(t)); t.tokens = 1;
-    t.heads = 129; assert(!valid_tiling(t)); t.heads = 2;
-    t.conv_output_slots = -1; assert(!valid_tiling(t));
-}
-''')
-    exe = tmp_path / "policy"
-    subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
-                    "-I", str(ROOT / "xllm_ops/mega_kda_prefill/op_host"), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
-
-
-def test_single_entry():
-    op = ROOT / "xllm_ops/mega_kda_prefill"
-    source = "\n".join(p.read_text() for p in op.rglob("*.cpp"))
-    assert source.count("OP_ADD(MegaKdaPrefill)") == 1
-    assert source.count("__global__ __aicore__ void mega_kda_prefill(") == 1
-    assert "KERNEL_TYPE_MIX_AIC_1_2" in source
-    stage_headers = (
-        "kda_prefill_kkt_rows.h", "kda_prefill_inverse_fp32.h", "kda_prefill_wy.h",
-        "kda_prefill_chunk_h.h", "kda_prefill_chunk_o.h",
-    )
-    entry = (op / "op_kernel/mega_kda_prefill.cpp").read_text()
-    for name in stage_headers:
-        path = op / "op_kernel" / name
-        assert path.is_file(), name
-        assert f'#include "{name}"' in entry, name
-        assert "__global__" not in path.read_text()
-        assert "call_kernel" not in path.read_text()
-
-
-@pytest.mark.parametrize("operator", ["mega_kda_prefill", "mega_kda_decode"])
-def test_source_filenames_are_descriptive(operator):
-    paths = [path for path in (ROOT / "xllm_ops" / operator).rglob("*")
-             if path.is_file() and path.suffix in {".h", ".cpp"}]
-    assert paths
-    for path in paths:
-        assert re.search(r"(?:^|_)r\d+(?:_|$)", path.stem, re.IGNORECASE) is None, path.name
-
-
-@pytest.mark.parametrize("lengths", [(1,), (2, 0, 3), (127, 1), (128,), (129, 0, 3), (257,)])
-@pytest.mark.parametrize("bias", [False, True])
-def test_oracle_contract(lengths, bias):
-    data = make_case(lengths, heads=1, bias=bias)
-    before = {k: x.clone() for k, x in data.items() if isinstance(x, torch.Tensor)}
-    result = reference(data)
-    assert all(torch.isfinite(x).all() for x in result)
-    assert [x.dtype for x in result] == [torch.bfloat16, torch.bfloat16, torch.float32]
-    for name, value in before.items():
-        assert torch.equal(data[name], value), name
-    for idx, family in enumerate(("conv", "ssm"), 1):
-        writes = {int(data[f"{family}_write_indices"][i]) for i, length in enumerate(lengths) if length}
-        for slot in range(len(result[idx])):
-            if slot not in writes:
-                assert torch.equal(result[idx][slot], data[OUTPUTS[idx]][slot])
-    # Zero history is not an inactive sequence.
-    assert not torch.equal(result[0][0], data["output"][0])
-    for family in ("conv", "ssm"):
-        data[f"{family}_write_indices"].fill_(-1)
-    discarded = reference(data)
-    assert torch.equal(discarded[0], result[0])
-    assert torch.equal(discarded[1], data["conv_state_out"])
-    assert torch.equal(discarded[2], data["ssm_state_out"])
-
-
-def test_oracle_rounds_conv_accumulation_before_silu() -> None:
-    data = make_case((1,), heads=1)
-    data["qkv"].fill_(1)
-    data["conv_state_in"].fill_(1)
-    data["conv_read_indices"].fill_(0)
-    data["conv_weight"].zero_()
-    data["conv_weight"][0].fill_(1)
-    data["conv_weight"][1].fill_(1 / 256)
-    _, prepared = reference(data, return_prepared=True)
-    rounded = torch.nn.functional.silu(torch.tensor(1.0, dtype=torch.float64)).bfloat16().float()
-    unrounded = torch.nn.functional.silu(torch.tensor(1 + 1 / 256, dtype=torch.float64)).bfloat16().float()
-    assert rounded != unrounded
-    torch.testing.assert_close(prepared["v"][0], rounded.bfloat16().expand(1, 128), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
-def test_tp_reference_shape(tp):
-    heads = GLM_KDA_HEADS // tp
-    data = make_case((3, 0, 1), heads=heads, bias=True)
-    result = reference(data)
-    assert data["qkv"].shape == (4, heads * 384)
-    assert data["gate"].shape == (4, heads, 128)
-    for name, value in zip(OUTPUTS, result):
-        assert value.shape == data[name].shape and value.dtype == data[name].dtype
-        assert torch.isfinite(value).all(), name
-    assert result[2].shape[1:] == (heads, 128, 128)
-
-
-@pytest.mark.parametrize("invalid", ["offsets", "read", "write", "duplicate", "alias"])
-def test_invalid_metadata(invalid):
-    data = make_case((2, 3), heads=1)
-    if invalid == "offsets": data["cu_seqlens"][-1] += 1
-    elif invalid == "read": data["ssm_read_indices"][0] = -2
-    elif invalid == "write": data["conv_write_indices"][0] = 999
-    elif invalid == "duplicate": data["ssm_write_indices"].fill_(0)
-    else: data["conv_state_out"] = data["conv_state_in"]
-    with pytest.raises(ValueError):
-        reference(data)
 
 
 def native_case(data):

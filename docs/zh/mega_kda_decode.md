@@ -95,8 +95,8 @@ export ASCEND_CUSTOM_OPP_PATH="$KDA_VENDOR"
 export LD_LIBRARY_PATH="$KDA_VENDOR/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-`test/python_test/test_mega_kda_decode.py` 默认执行 CPU 合同测试。
-真机测试通过 `MEGA_KDA_TEST_NPU` 选择独占设备，覆盖固定输入 fixed20、
+`test/python_test/test_mega_kda_decode.py` 通过 `MEGA_KDA_TEST_NPU`
+选择独占设备，覆盖固定输入 fixed20、
 独立 CPU/NPU carry20、动态 accepted/mapping 图回放、padding、独立池容量
 及别名拒绝。固定输入回放按原始字节比较，区分正零与负零。
 
@@ -107,7 +107,7 @@ Conv 和归一化语义执行 FP64 递推。报告以 `abs(golden)=1e-3` 分组�
 `rtol=1e-2, atol=1e-3`，FP32 SSM 为 `rtol=1e-3, atol=1e-4`。
 同时检查 shape、dtype、有限值及 Conv 和未写区的字节一致性。
 
-共用 KDA pytest 清单含 805 个节点，Decode 模块收集 523 个。A5 跳过
+A5 跳过
 mode 3 的正向真机用例，仍执行非法 accepted counts 和 capacity 的绑定
 拒绝用例。保留的 A5 SiLU 中点用例覆盖 mode 1。上述容差用于算子验证，
 整网精度和性能另行测量。
@@ -116,7 +116,7 @@ TP矩阵按64个KDA heads切分，覆盖TP1/2/4/8/16/32/64，对应每卡
 H=64/32/16/8/4/2/1。每档覆盖普通 mode 0，以及 query capacity 为 1–17
 的 MTP mode 1。910B 另覆盖 mode 3。包含 CPU 标杆、dense fixed20 图回放、
 动态元数据 replay20 和独立状态 carry20。
-原batch/ragged/padding用例保留，Host policy也覆盖全部head数。
+真机用例也覆盖不同 batch、变长序列和 padding。
 可用`pytest -k tp`选择矩阵，`-k tp8`选择单档；这只是单卡分片shape
 测试，不代表多卡TP通信、模型显存容量或整网验证通过。
 

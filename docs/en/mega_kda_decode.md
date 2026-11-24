@@ -173,10 +173,6 @@ KDA_VENDOR="$OPP_ROOT/vendors/custom_xllm_math"
 export ASCEND_CUSTOM_OPP_PATH="$KDA_VENDOR"
 export LD_LIBRARY_PATH="$KDA_VENDOR/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# CPU-only contract and Host policy checks:
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 python -m pytest -q \
-  test/python_test/test_mega_kda_decode.py
-
 # After installing the package in an isolated OPP and building the test extension:
 MEGA_KDA_TEST_NPU=0 python -m pytest -q test/python_test/test_mega_kda_decode.py
 ```
@@ -194,11 +190,9 @@ A5 Conv and normalization behavior. The pointwise thresholds are
 `rtol=1e-2, atol=1e-3` for attention and `rtol=1e-3, atol=1e-4` for FP32 state.
 The report also splits normal relative errors and near-zero absolute errors
 at `abs(golden)=1e-3`. Byte comparisons distinguish positive and negative
-zero. Independent stage tests exercise gate operation order, FP32 beta,
-zero rows and finite BF16 inputs above the FP16 range on supported paths.
+zero.
 
-The shared KDA pytest collection contains 805 nodes, of which 523 belong to
-the Decode module. Ascend950 skips native positive mode 3 cases. The binding
+Ascend950 skips native positive mode 3 cases. The binding
 tests for invalid mode 3 accepted counts and capacity still run on Ascend950.
 The retained A5 SiLU midpoint test covers mode 1.
 
@@ -208,7 +202,7 @@ MTP query capacity from 1 through 17 (model MTP1 through MTP16). Ascend910B
 also covers mode 3. The matrix includes CPU oracle checks, dense fixed20
 graph replay, changed-metadata replay20
 and independent state carry20. Existing batch/ragged/padding cases remain.
-Host policy checks also cover all seven head counts. Select these cases with
+Select the TP cases with
 `pytest -k tp`, or a single size with `-k tp8`. They execute one rank's shape
 on one device; they do not validate distributed TP collectives or model memory.
 Dedicated mode 3 replay/carry/changed-metadata and numerical edge cases cover

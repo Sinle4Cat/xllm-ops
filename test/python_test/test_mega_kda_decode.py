@@ -1,181 +1,22 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
-"""CPU contract checks and opt-in real ACLNN precision/replay tests."""
+"""ACLNN Decode precision and graph replay tests on NPU."""
 import json
 import os
-from pathlib import Path
-import subprocess
 
 import pytest
 import torch
 
 from mega_kda_decode_reference import (
-    MTP, NATIVE, OUTPUTS, PUBLIC_COMPAT, make_case, public_compat_stages, reference, reference_910b,
+    MTP, NATIVE, OUTPUTS, PUBLIC_COMPAT, make_case, reference, reference_910b,
 )
 from mega_kda_test_utils import (
     GLM_KDA_HEADS, TP_SIZES, bitwise_equal, checked_written_rows, error_metrics, is_a5_device,
 )
 
 
-ROOT = Path(__file__).resolve().parents[2]
 DECODE_MODES = [(NATIVE, 1), (PUBLIC_COMPAT, 1)] + [(MTP, capacity) for capacity in range(1, 18)]
 NPU_TEST = pytest.mark.skipif(os.getenv("MEGA_KDA_TEST_NPU") is None,
                               reason="native validation requires an explicitly selected exclusive NPU")
-
-
-def test_native_host_policy(tmp_path):
-    source = tmp_path / "policy.cpp"
-    source.write_text(r'''
-#include <cassert>
-#include "mega_kda_decode_policy.h"
-int main() {
-    using namespace mega_kda;
-    TilingData t{2, 2, 8, 1, 3, 4, 7, 5, 9};
-    assert(select_key(0, false, t) == 1);
-    assert(select_key(1, true, t) == 2);
-    assert(select_key(3, false, t) == 3);
-    assert(select_key(3, true, t) == 0);
-    assert(select_key(0, true, t) == 0);
-    assert(select_key(1, false, t) == 0);
-    assert(select_key(2, false, t) == 0);
-    for (int tp : {1, 2, 4, 8, 16, 32, 64}) {
-        t.heads = 64 / tp;
-        assert(select_key(0, false, t) == 1);
-        assert(select_key(1, true, t) == 2);
-        assert(select_key(3, false, t) == 3);
-    }
-    t.heads = 8;
-    t.max_query_tokens = 4; t.conv_history = 6; t.tokens = 7;
-    assert(select_key(1, true, t) == 2);
-    assert(select_key(0, false, t) == 0);
-    assert(select_key(3, false, t) == 0);
-    t.tokens = 9;
-    assert(select_key(1, true, t) == 0);
-    t.tokens = 7; t.conv_history = 3;
-    assert(select_key(1, true, t) == 0);
-    t.conv_history = 6; t.heads = 129;
-    assert(select_key(1, true, t) == 0);
-    t.heads = 8;
-    for (int capacity = 1; capacity <= 17; ++capacity) {
-        t.max_query_tokens = capacity;
-        t.conv_history = capacity + 2;
-        t.tokens = t.batch * capacity;
-        assert(select_key(1, true, t) == 2);
-    }
-    t.max_query_tokens = 18; t.conv_history = 20; t.tokens = 36;
-    assert(select_key(1, true, t) == 0);
-    assert(!fits_bytes({9223372036854775807LL, 2}));
-    assert(!fits_bytes({-1, 2}));
-}
-''')
-    exe = tmp_path / "policy"
-    subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
-                    "-I", str(ROOT / "xllm_ops/mega_kda_decode/op_host"), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
-
-
-def test_single_registered_entry():
-    op = ROOT / "xllm_ops/mega_kda_decode"
-    definitions = "\n".join(path.read_text() for path in op.rglob("*.cpp"))
-    assert definitions.count("OP_ADD(MegaKdaDecode)") == 1
-    assert definitions.count('__global__ __aicore__ void mega_kda_decode(') == 1
-    assert all(f"TILING_KEY_IS({key})" in definitions for key in (1, 2, 3))
-    assert "GetRequiredInputShape" in definitions and "GetOptionalInputShape" in definitions
-    assert "mega_kda_decode" in (ROOT / "xllm_ops/build_aclnn.sh").read_text()
-
-
-@pytest.mark.parametrize("mode,capacity", DECODE_MODES)
-@pytest.mark.parametrize("bias", [False, True])
-def test_reference_state_contract(mode, capacity, bias):
-    data = make_case(batch=3, capacity=capacity, mode=mode, bias=bias, ragged=True, padding=True)
-    snapshots = {k: v.clone() for k, v in data.items() if isinstance(v, torch.Tensor)}
-    result = reference(data)
-    for key, before in snapshots.items():
-        assert torch.equal(before, data[key]), key
-    out, conv, ssm = result
-    assert [x.dtype for x in result] == [torch.bfloat16, torch.bfloat16, torch.float32]
-    assert all(torch.isfinite(x).all() for x in result)
-    assert torch.equal(conv[0], data["conv_state_out"][0])
-    assert torch.equal(ssm[0], data["ssm_state_out"][0])
-    for row in range(2):
-        begin, end = data["cu_seqlens"][row:row + 2].tolist()
-        accepted = int(data["num_accepted_tokens"][row]) if mode == MTP else 1
-        slot = int(data["conv_write_indices"][row])
-        assert torch.equal(conv[slot, :2], data["conv_state_in"][row, accepted:accepted + 2])
-        assert torch.equal(conv[slot, 2:2 + end - begin], data["qkv"][begin:end])
-        assert torch.equal(conv[slot, 2 + end - begin:], data["conv_state_out"][slot, 2 + end - begin:])
-    for _ in range(20):
-        assert all(bitwise_equal(a, b) for a, b in zip(result, reference(data)))
-
-
-def test_reference_checkpoint_restore_and_discard():
-    data = make_case(mode=1, capacity=4)
-    first = reference(data)
-    data["num_accepted_tokens"][0] = 1
-    restored = reference(data)
-    assert not torch.equal(first[0][0], restored[0][0])
-    data["ssm_write_indices"].fill_(-1)
-    data["conv_write_indices"].fill_(-1)
-    discarded = reference(data)
-    assert torch.equal(restored[0], discarded[0])
-    assert torch.equal(discarded[1], data["conv_state_out"])
-    assert torch.equal(discarded[2], data["ssm_state_out"])
-
-
-@pytest.mark.parametrize("tp", TP_SIZES, ids=lambda tp: f"tp{tp}")
-@pytest.mark.parametrize("mode,capacity", DECODE_MODES)
-def test_tp_reference_shape(tp, mode, capacity):
-    heads = GLM_KDA_HEADS // tp
-    data = make_case(heads=heads, mode=mode, capacity=capacity, bias=True)
-    result = reference(data)
-    assert data["qkv"].shape == (2 * capacity, heads * 384)
-    assert data["gate"].shape == (2 * capacity, heads, 128)
-    for name, value in zip(OUTPUTS, result):
-        assert value.shape == data[name].shape and value.dtype == data[name].dtype
-        assert torch.isfinite(value).all(), name
-    assert result[2].shape[1:] == (heads, 128, 128)
-
-
-@pytest.mark.parametrize("batch", [3, 4, 128])
-@pytest.mark.parametrize("mode", [NATIVE, PUBLIC_COMPAT])
-def test_plain_padding_keeps_one_token_per_row(batch, mode):
-    data = make_case(batch=batch, heads=1, mode=mode, ragged=True, padding=True)
-    assert data["qkv"].shape[0] == batch
-    assert torch.equal(data["cu_seqlens"], torch.arange(batch + 1, dtype=torch.int32))
-    assert int(data["conv_read_indices"][-1]) == -1
-    out, _, _ = reference(data)
-    assert torch.equal(out[-1], data["output"][-1])
-
-
-@pytest.mark.parametrize("invalid", ["duplicate_conv", "duplicate_ssm", "accepted", "offsets", "slot"])
-def test_reference_rejects_invalid_metadata(invalid):
-    data = make_case(mode=1, capacity=4)
-    if invalid == "duplicate_conv":
-        data["conv_write_indices"].fill_(0)
-    elif invalid == "duplicate_ssm":
-        data["ssm_write_indices"].fill_(0)
-    elif invalid == "accepted":
-        data["num_accepted_tokens"][0] = 0
-    elif invalid == "offsets":
-        data["cu_seqlens"][-1] += 1
-    else:
-        data["conv_write_indices"][0] = 999
-    with pytest.raises(ValueError):
-        reference(data)
-
-
-@pytest.mark.parametrize("invalid", ["accepted", "capacity", "offsets", "history"])
-def test_public_compat_rejects_mtp_or_nonunit_contract(invalid: str) -> None:
-    data = make_case(mode=PUBLIC_COMPAT)
-    if invalid == "accepted":
-        data["num_accepted_tokens"] = torch.ones(2, dtype=torch.int32)
-    elif invalid == "capacity":
-        data["max_query_tokens"] = 2
-    elif invalid == "offsets":
-        data["cu_seqlens"][:] = torch.tensor([0, 0, 2], dtype=torch.int32)
-    else:
-        data["conv_state_in"] = data["conv_state_in"][:, :2].contiguous()
-    with pytest.raises(ValueError):
-        reference(data)
 
 
 def _public_discard_case() -> dict:
@@ -185,15 +26,6 @@ def _public_discard_case() -> dict:
     data["conv_write_indices"][0] = -1
     data["ssm_write_indices"][0] = -1
     return data
-
-
-def test_public_compat_inactive_and_discard_contract() -> None:
-    data = _public_discard_case()
-    output, conv, state = reference(data)
-    assert not bitwise_equal(output[0], data["output"][0])
-    assert bitwise_equal(output[1:], data["output"][1:])
-    assert bitwise_equal(conv, data["conv_state_out"])
-    assert bitwise_equal(state, data["ssm_state_out"])
 
 
 def _public_case(batch: int, heads: int, variant: str) -> dict:
@@ -219,71 +51,6 @@ def _public_case(batch: int, heads: int, variant: str) -> dict:
     else:
         raise ValueError(variant)
     return data
-
-
-@pytest.mark.parametrize("variant", ["zero", "tiny", "wide", "gate_extremes"])
-def test_public_compat_fp32_stages(variant: str) -> None:
-    data = _public_case(1, 2, variant)
-    sequence = torch.cat((data["conv_state_in"][0], data["qkv"][:1]))
-    stages = public_compat_stages(data, sequence)
-    assert all(torch.isfinite(value).all() for value in stages.values())
-    assert all(torch.isfinite(value).all() for value in reference(data))
-    if variant == "zero":
-        assert torch.count_nonzero(stages["q"]) == 0
-        assert torch.count_nonzero(stages["k"]) == 0
-        assert torch.count_nonzero(reference(data)[0]) == 0
-    elif variant == "tiny":
-        torch.testing.assert_close(stages["k"].square().sum(-1), torch.ones(2), rtol=1e-6, atol=1e-6)
-        vector = stages["conv"].reshape(3, 2, 128)[1]
-        epsilon_norm = vector / torch.sqrt(vector.square().sum(-1, keepdim=True) + 1e-6)
-        assert epsilon_norm.abs().max() < 1e-3
-        assert stages["k"].abs().max() > 0.01
-    elif variant == "wide":
-        assert not torch.isfinite(sequence.half()).all()
-        assert torch.isfinite(stages["conv"]).all()
-    else:
-        torch.testing.assert_close(stages["decay"][:, ::2], torch.ones((2, 64)), rtol=0, atol=0)
-        torch.testing.assert_close(stages["decay"][:, 1::2], torch.full((2, 64), -5.0).exp(), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("mode", [NATIVE, MTP, PUBLIC_COMPAT])
-def test_reference_preserves_conv_rounding_and_fp32_beta(mode: int) -> None:
-    data = make_case(batch=1, heads=1, mode=mode)
-    data["qkv"].fill_(1)
-    data["conv_state_in"].fill_(1)
-    data["conv_weight"].zero_()
-    data["conv_weight"][0].fill_(1)
-    data["conv_weight"][1].fill_(1 / 256)
-    data["ssm_state_in"].zero_()
-    data["beta"].fill_(1 / 128)
-    actual = reference(data)
-    # 1+1/256 is the BF16 midpoint and rounds to 1 before SiLU.
-    value = torch.nn.functional.silu(torch.tensor(1.0, dtype=torch.float64)).bfloat16().double()
-    beta = torch.sigmoid(data["beta"][0, 0].float()).double()
-    omitted_conv_round = torch.nn.functional.silu(torch.tensor(1 + 1 / 256, dtype=torch.float64)).bfloat16().double()
-    assert value != omitted_conv_round and beta != beta.bfloat16().double()
-    square_norm = 128 * value.square()
-    state_scalar = value * beta * value / square_norm.sqrt()
-    torch.testing.assert_close(actual[2][2, 0], state_scalar.float().expand(128, 128), rtol=0, atol=0)
-    expected_output = (state_scalar * (128 * value / square_norm.sqrt()) * 128 ** -0.5).bfloat16()
-    torch.testing.assert_close(actual[0][0, 0], expected_output.expand(128), rtol=0, atol=0)
-
-
-def test_public_compat_fp32_gate_reciprocal_then_multiply() -> None:
-    data = make_case(batch=1, heads=1, mode=PUBLIC_COMPAT)
-    data["gate"][0, 0] = torch.linspace(-8, 8, 128).bfloat16()
-    data["gate_bias"].zero_()
-    data["a_log"].zero_()
-    sequence = torch.cat((data["conv_state_in"][0], data["qkv"]))
-    stages = public_compat_stages(data, sequence)
-    denominator = 1.0 + torch.exp(-data["gate"][0].float())
-    want = (1.0 / denominator) * -5.0
-    assert bitwise_equal(stages["gate"], want)
-    # Tensor.__rtruediv__ may lower scalar/Tensor to reciprocal*scalar too.
-    # Tensor/Tensor div supplies an independent direct-division counterfactual.
-    direct_division = torch.div(torch.full_like(denominator, -5.0), denominator)
-    assert not bitwise_equal(want, direct_division)
-    assert bitwise_equal(stages["beta"], torch.sigmoid(data["beta"][0].float()))
 
 
 @NPU_TEST

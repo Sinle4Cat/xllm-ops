@@ -49,11 +49,9 @@ B=1、H=8、T=1–4 时走逐 token 递推。调用前将输入所在 NPU 设为
 按 A5 的 Conv 与归一化边界做 FP64 递推。两平台共用 Prefill 容差。
 以 `abs(golden)=1e-3` 分组，正常值相对误差阈值为 1%，近零值绝对误差
 阈值为 `1e-5`，每组超限比例均须不超过 0.1%。还检查 shape、dtype、
-有限值、Conv state 和未写槽位的字节一致性。CPU 指标检查见
-`test_mega_kda_accuracy_checks.py`。
+有限值、Conv state 和未写槽位的字节一致性。
 
-当前共用 KDA pytest 清单含 805 个节点，覆盖 Prefill、Prefill carry500、
-Decode、误差指标及 BF16 舍入。Prefill 保留以下范围。
+Prefill 和 carry500 两个模块覆盖以下 NPU 用例。
 
 - TP1/2/4/8/16/32/64 对应每卡 H=64/32/16/8/4/2/1，覆盖带或不带 Conv
   bias 的尾块、空序列及状态池边界。
@@ -72,9 +70,7 @@ torch_npu 2.9的NPUGraph每次回放前使用
 workspace或状态初始化，算子中不包含这类Fill实现。纯kernel耗时应单列，
 完整图调用性能对比应计入框架开销。
 
-只有CPU测试或编译通过不能宣称NPU精度通过。历史模型结果不能替代
-本次接入的精度、性能或模型验收；正式性能收益另测。
-
+本次接入的整网精度和性能需单独实测。
 
 ## Conv 前端分块
 

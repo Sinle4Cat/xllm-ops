@@ -122,11 +122,11 @@ The exported entry points are `aclnnMegaKdaPrefillGetWorkspaceSize` and
 Torch and CANN environment.
 
 ```bash
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q test/python_test/test_mega_kda_prefill.py
-MEGA_KDA_PREFILL_TEST_NPU=0 python -m pytest -x -s test/python_test/test_mega_kda_prefill.py
+MEGA_KDA_PREFILL_TEST_NPU=0 python -m pytest -x -s \
+  test/python_test/test_mega_kda_prefill.py test/python_test/test_mega_kda_prefill_carry500.py
 ```
 
-The second command requires an exclusively available device and the custom
+The command requires an exclusively available device and the custom
 OPP on the loader path. The native test harness selects `reference_910b(data)`
 on Ascend910B, an independent CPU FP32 C64 reference with BF16 stage boundaries.
 On Ascend950 it selects `reference(data, a5=True)`, the r003 reference with FP64
@@ -140,9 +140,7 @@ limits for attention and written SSM state.
 | `abs(golden) >= 1e-3` | 1% relative | 0.1% |
 | `abs(golden) < 1e-3` | `1e-5` absolute | 0.1% |
 
-The shared KDA pytest collection has 805 nodes across Prefill, Prefill carry500,
-Decode, accuracy checks and BF16 rounding. The retained Prefill coverage
-includes the following cases.
+The Prefill and carry500 modules cover the following NPU cases.
 
 - TP1/2/4/8/16/32/64, representing local H=64/32/16/8/4/2/1 of the model's
   64 heads, with tail and empty sequences, bias variants and state-pool checks.
@@ -163,8 +161,8 @@ NPUGraph replay updates the RNG seed and offset with two Fill kernels before
 executing the graph. These are framework replay overhead, not MegaKdaPrefill
 workspace/state initialization, and no such Fill implementation is included in
 this operator. Report kernel-only time separately; include framework overhead
-when comparing full graph calls. CPU tests/skips are not native acceptance. Performance and
-model accuracy require their own fresh measurements; no speedup is implied.
+when comparing full graph calls. Performance and model accuracy require their own
+fresh measurements.
 
 
 ## Conv Frontend Tiling
