@@ -38,6 +38,8 @@ XLLM OPS 是一个可扩展、高性能的算子库，专为大语言模型设�
 bash build.sh
 ```
 
+Ascend910B 和 Ascend950（A5）的 KDA 算子接口见 [Prefill](docs/zh/mega_kda_prefill.md) 和 [Decode（含 MTP）](docs/zh/mega_kda_decode.md)。
+
 ## 3. 测试
 ```bash
 cd test
