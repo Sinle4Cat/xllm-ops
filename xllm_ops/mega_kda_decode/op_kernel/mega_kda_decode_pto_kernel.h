@@ -67,6 +67,11 @@ struct Args {
 #if __CCE_AICORE__ == 310
 #include "mega_kda_decode_a5_dynamic.h"
 #else
+// FP32 rounding of 1 / sqrt(kHeadDim).
+constexpr float kQueryScale = 0.08838834764831845f;
+static_assert(kHeadDim == 128, "Update the query scale for the head dimension");
+constexpr int64_t kSsmHeadStride = kHeadDim * kHeadDim;
+
 // Byte offsets shared by scalar Conv, batched Conv and split reductions.
 // value aliases a subrow of v; column tiles alias their row-vector storage.
 template <int VRows>
@@ -532,7 +537,7 @@ AICORE inline void recurrent(Scratch<VRows>& s,
                              const TilingData& t,
                              int64_t token,
                              int64_t head) {
-  normalize(s, s.q, 0.08838834764831845f);
+  normalize(s, s.q, kQueryScale);
   normalize(s, s.k, 1.0f);
   load_bf16(s, s.g, a.gate + (token * t.heads + head) * 128);
   load<float, 1, 128>(s.tmp, a.gate_bias + head * 128);
@@ -647,9 +652,10 @@ AICORE inline void run_tiled(const Args& a, const TilingData& t) {
     }
     Scratch<VRows> s;
     s.init(v_start);
-    load<float, kVRows, 128>(
+    load<float, kVRows, kHeadDim>(
         s.state,
-        a.ssm_in + (ssm_read * t.heads + head) * 16384 + v_start * 128);
+        a.ssm_in + (ssm_read * t.heads + head) * kSsmHeadStride +
+            v_start * kHeadDim);
     for (int64_t token = begin; token < end; ++token) {
       if constexpr (BatchConv) {
         if constexpr (Mtp) {
@@ -684,8 +690,9 @@ AICORE inline void run_tiled(const Args& a, const TilingData& t) {
       const int64_t slot =
           a.ssm_write[batch * t.max_query_tokens + token - begin];
       if (slot >= 0) {
-        store<float, kVRows, 128>(
-            a.ssm_out + (slot * t.heads + head) * 16384 + v_start * 128,
+        store<float, kVRows, kHeadDim>(
+            a.ssm_out + (slot * t.heads + head) * kSsmHeadStride +
+                v_start * kHeadDim,
             s.state);
       }
       store<bfloat16_t, 1, kVRows>(

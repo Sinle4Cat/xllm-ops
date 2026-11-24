@@ -39,6 +39,15 @@ def bitwise_equal(actual, expected):
                             expected.detach().cpu().contiguous().reshape(-1).view(torch.uint8)))
 
 
+def checked_written_rows(actual, expected, before, written, name):
+    """Verify preserved rows byte for byte and return the rows subject to arithmetic checks."""
+    if written.all():
+        return actual, expected
+    untouched = ~written
+    assert bitwise_equal(actual[untouched], before[untouched]), f"{name}: modified an unwritten row"
+    return actual[written], expected[written]
+
+
 def error_metrics(actual, expected, *, near=0.01, relative=0.01, absolute=0.0005):
     if actual.shape != expected.shape or actual.dtype != expected.dtype:
         raise ValueError("precision comparison requires identical shapes and dtypes")

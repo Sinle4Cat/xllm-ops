@@ -10,7 +10,9 @@ import pytest
 import torch
 
 from mega_kda_prefill_reference import OUTPUTS, make_case, reference, reference_910b
-from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics, is_a5_device
+from mega_kda_test_utils import (
+    GLM_KDA_HEADS, TP_SIZES, bitwise_equal, checked_written_rows, error_metrics, is_a5_device,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = pytest.mark.skipif(os.getenv("MEGA_KDA_PREFILL_TEST_NPU") is None,
@@ -166,6 +168,11 @@ def check(data, actual, label, input_snapshots=None):
         expected = reference(data, a5=True)
     else:
         expected = reference_910b(data)
+    offsets = data["cu_seqlens"]
+    destinations = data["ssm_write_indices"][offsets[1:] > offsets[:-1]]
+    written = torch.zeros(data["ssm_state_out"].size(0), dtype=torch.bool)
+    written[destinations[destinations >= 0].long()] = True
+    before = data if input_snapshots is None else input_snapshots
     records = {}
     for name, want in zip(OUTPUTS, expected):
         got = actual[name].cpu()
@@ -174,15 +181,14 @@ def check(data, actual, label, input_snapshots=None):
         if name == "conv_state_out":
             assert bitwise_equal(got, want), name
             continue
-        active = want != 37
-        stats = error_metrics(got[active], want[active], near=0.001, absolute=0.00001)
+        if name == "ssm_state_out":
+            got, want = checked_written_rows(got, want, before.get(name, data[name]), written, name)
+        stats = error_metrics(got, want, near=0.001, absolute=0.00001)
         records[name] = stats
         assert stats["finite"], (label, name, stats)
         assert stats["normal_over_fraction"] <= 0.001, (label, name, stats)
         assert stats["near_over_fraction"] <= 0.001, (label, name, stats)
-        untouched = want == 37
-        assert bitwise_equal(got[untouched], want[untouched]), name
-    for k, x in (data if input_snapshots is None else input_snapshots).items():
+    for k, x in before.items():
         if isinstance(x, torch.Tensor) and k not in OUTPUTS:
             assert bitwise_equal(x, actual[k].cpu()), k
     print(json.dumps({"case": label, "errors": records}), flush=True)
@@ -368,7 +374,8 @@ def test_native_graph_100(tp, carry):
         lib.mega_kda_prefill(**actual)
     fixed = None
     for iteration in range(100):
-        snapshots = {k: v.cpu() for k, v in actual.items() if isinstance(v, torch.Tensor) and k not in OUTPUTS}
+        snapshots = {k: v.cpu() for k, v in actual.items()
+                     if isinstance(v, torch.Tensor) and k not in ("output", "conv_state_out")}
         graph.replay()
         expected = check(data, actual, f"TP={tp}/H={heads}/carry={carry}/{iteration}", snapshots)
         current = [actual[name].cpu() for name in OUTPUTS]

@@ -88,7 +88,7 @@ def test_native_carry_500(heads, gate_bias):
             data[name].copy_(bank[name])
             actual[name].copy_(data[name])
         snapshots = {name: value.cpu() for name, value in actual.items()
-                     if isinstance(value, torch.Tensor) and name not in OUTPUTS}
+                     if isinstance(value, torch.Tensor) and name not in ("output", "conv_state_out")}
         if graph is None:
             lib.mega_kda_prefill(**actual)
         else:

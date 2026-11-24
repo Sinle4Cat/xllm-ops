@@ -11,7 +11,9 @@ import torch
 from mega_kda_decode_reference import (
     MTP, NATIVE, OUTPUTS, PUBLIC_COMPAT, make_case, public_compat_stages, reference, reference_910b,
 )
-from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics, is_a5_device
+from mega_kda_test_utils import (
+    GLM_KDA_HEADS, TP_SIZES, bitwise_equal, checked_written_rows, error_metrics, is_a5_device,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -331,9 +333,28 @@ def device_reference(data, actual):
     return reference_910b(data)
 
 
+def decode_write_masks(data):
+    tokens = torch.zeros(data["output"].size(0), dtype=torch.bool)
+    slots = torch.zeros(data["ssm_state_out"].size(0), dtype=torch.bool)
+    offsets = data["cu_seqlens"].tolist()
+    accepted = data["num_accepted_tokens"]
+    for row, (begin, end) in enumerate(zip(offsets, offsets[1:])):
+        if begin == end:
+            continue
+        checkpoint = 0 if accepted is None else int(accepted[row]) - 1
+        if data["conv_read_indices"][row] < 0 or data["ssm_read_indices"][row, checkpoint] < 0:
+            continue
+        tokens[begin:end] = True
+        destinations = data["ssm_write_indices"][row, :end - begin]
+        slots[destinations[destinations >= 0].long()] = True
+    return {"output": tokens, "ssm_state_out": slots}
+
+
 def assert_native(data, actual, input_snapshots=None, expected=None):
     if expected is None:
         expected = device_reference(data, actual)
+    written = decode_write_masks(data)
+    before = data if input_snapshots is None else input_snapshots
     records = {}
     for name, want in zip(OUTPUTS, expected):
         got = actual[name].cpu()
@@ -343,16 +364,13 @@ def assert_native(data, actual, input_snapshots=None, expected=None):
             assert bitwise_equal(got, want), name
             continue
         rtol, atol = (1e-2, 1e-3) if name == "output" else (1e-3, 1e-4)
-        active = want != 37
-        stats = error_metrics(got[active], want[active], near=0.001, relative=rtol, absolute=atol)
+        got, want = checked_written_rows(got, want, before.get(name, data[name]), written[name], name)
+        stats = error_metrics(got, want, near=0.001, relative=rtol, absolute=atol)
         records[name] = stats
         assert stats["finite"], (name, stats)
         # Retain the existing pointwise gate; split metrics are additional diagnostics.
         torch.testing.assert_close(got, want, rtol=rtol, atol=atol)
-        # Pool padding and discarded writes are exact, even when active arithmetic is approximate.
-        untouched = want == 37
-        assert bitwise_equal(got[untouched], want[untouched]), name
-    for key, value in (data if input_snapshots is None else input_snapshots).items():
+    for key, value in before.items():
         if isinstance(value, torch.Tensor) and key not in OUTPUTS:
             assert bitwise_equal(actual[key].cpu(), value), key
     print(json.dumps({"mode": data["mode"], "capacity": data["max_query_tokens"],
@@ -418,7 +436,7 @@ def check_changed20_carry20(data: dict) -> None:
             data["conv_write_indices"].copy_(destinations if step % 2 else destinations.flip(0))
             actual["conv_write_indices"].copy_(data["conv_write_indices"])
             snapshots = {k: v.cpu() for k, v in actual.items()
-                         if isinstance(v, torch.Tensor) and k not in OUTPUTS}
+                         if isinstance(v, torch.Tensor) and k != "conv_state_out"}
             graph.replay()
             expected = assert_native(data, actual, snapshots)
             for name, result in zip(OUTPUTS, expected):
