@@ -320,7 +320,7 @@ AICORE PTO_INLINE void gemm_v0(
 
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize, int32_t VParts>
+template <int32_t HiddenSize, int32_t ChunkSize, int32_t VParts, bool UseLog2Gate>
 AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
                                     __gm__ float* W_handle,
                                     __gm__ float* U_handle,
@@ -400,6 +400,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   // Aliases:
   constexpr int32_t U_UB = GCS_UB;        // load U after g_cs is consumed
   constexpr int32_t KV_FP32_UB = GCS_UB;  // cast KV → fp32 into freed buffer
+  constexpr int32_t SNAPSHOT_UB = K_UB_HALF + HalfC * K_DIM * sizeof(bfloat16_t);
+  constexpr int32_t SNAPSHOT_BF16_UB = SNAPSHOT_UB + HalfK * V_DIM * sizeof(float);
+  constexpr int32_t CORRECTED_BF16_UB = K_UB_HALF;
+  static_assert(!UseLog2Gate ||
+                SNAPSHOT_BF16_UB + HalfK * V_DIM * sizeof(bfloat16_t) <= 192 * 1024);
   constexpr int32_t WS_UB = COEFF_UB;     // load WS into freed coeff buffer
   constexpr int32_t EXP_GT_2D_UB =
       COEFF_UB;  // broadcast exp(g_total) similarly
@@ -408,6 +413,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
   TASSIGN(zero_ub, ZERO_UB);
   TileUbDataND<float, HalfK, V_DIM, HalfK, V_DIM> s_ub;
   TASSIGN(s_ub, S_UB);
+  TileUbDataND<float, HalfK, V_DIM, HalfK, V_DIM> snapshot_fp32;
+  TASSIGN(snapshot_fp32, SNAPSHOT_UB);
+  TileUbDataND<bfloat16_t, HalfK, V_DIM, HalfK, V_DIM> snapshot_bf16;
+  TASSIGN(snapshot_bf16, SNAPSHOT_BF16_UB);
+  constexpr int32_t kSnapshotSource = UseLog2Gate ? SNAPSHOT_UB : S_UB;
   TileUbDataND<float, 1, K_DIM, 1, K_DIM, pto::PadValue::Zero> gtotal_ub;
   TASSIGN(gtotal_ub, GTOTAL_UB);
   TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero> k_ub;
@@ -649,6 +659,10 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       TLOAD(s_ub, initial_global);
       pipe_barrier(PIPE_ALL);
     }
+    if constexpr (UseLog2Gate) {
+      // Use FP32 initial state for decay and BF16 for W @ S and output.
+      round_bf16(snapshot_fp32, s_ub, snapshot_bf16);
+    }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     {
@@ -659,7 +673,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
                                  s_shape,
                                  s_stride);
       DynVecTile<float, HalfK, V_DIM> s_store(HalfK, V_DIM);
-      TASSIGN(s_store, S_UB);
+      TASSIGN(s_store, kSnapshotSource);
       TSTORE(s_global, s_store);
     }
     // Signal Cube: S workspace ready (flag 3)
@@ -698,7 +712,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
         GmTensor2D<float> s_out_global(
             S_handle + s_out_offset, s_out_shape, s_out_stride);
         DynVecTile<float, HalfK, V_DIM> s_out_store(HalfK, V_DIM);
-        TASSIGN(s_out_store, S_UB);
+        TASSIGN(s_out_store, kSnapshotSource);
         TSTORE(s_out_global, s_out_store);
       }
 
@@ -782,12 +796,20 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       PipeBarrierVec();
       TSUB(coeff_2d_ub, coeff_2d_ub, gcs_ub);
       PipeBarrierVec();
-      TEXP(coeff_2d_ub, coeff_2d_ub);
+      if constexpr (UseLog2Gate) {
+        main_gate_exp(coeff_2d_ub, coeff_2d_ub);
+      } else {
+        exp_gate<false>(coeff_2d_ub, coeff_2d_ub);
+      }
       PipeBarrierVec();
 
-      // K_rest = K * coeff_2d (element-wise).
       TMUL(k_ub, k_ub, coeff_2d_ub);
       PipeBarrierVec();
+      if constexpr (UseLog2Gate) {
+        TileUbDataND<bfloat16_t, HalfC, K_DIM, HalfC, K_DIM> key_bf16;
+        TASSIGN(key_bf16, K_UB_HALF);
+        round_bf16(k_ub, k_ub, key_bf16);
+      }
 
       // ── 4. Reuse GCS_UB region to load U (g_cs is now dead) ────────────
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
@@ -843,6 +865,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       PipeBarrierVec();
       TSUB(u_ub, u_ub, ws_ub);
       PipeBarrierVec();
+      if constexpr (UseLog2Gate) {
+        TileUbDataND<bfloat16_t, HalfC, V_DIM, HalfC, V_DIM> corrected_bf16;
+        TASSIGN(corrected_bf16, CORRECTED_BF16_UB);
+        round_bf16(u_ub, u_ub, corrected_bf16);
+      }
 
       // Store FP32 V_corr to both the output and Cube workspace.
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -893,7 +920,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       // ── 7. State decay: S *= exp(g_total) (per-K row, broadcast over V) ─
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-      TEXP(gtotal_ub, gtotal_ub);
+      exp_gate<UseLog2Gate>(gtotal_ub, gtotal_ub);
       PipeBarrierVec();
 
       // This sub-block owns K-rows [vid*HalfK, (vid+1)*HalfK) of the state.
@@ -959,6 +986,11 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
       // (Cube waits flag 3 exactly N times, Vec emits 1× at init + N-1× here).
       // Same pattern as GDN chunk_h.cpp:826-855.
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
+        if constexpr (UseLog2Gate) {
+          // The recurrent state remains FP32 across all chunks. Only the
+          // snapshot read by W @ S and the output matmul is BF16-rounded.
+          round_bf16(snapshot_fp32, s_ub, snapshot_bf16);
+        }
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         {
@@ -970,7 +1002,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
               s_shape,
               s_stride);
           DynVecTile<float, HalfK, V_DIM> s_store(HalfK, V_DIM);
-          TASSIGN(s_store, S_UB);
+          TASSIGN(s_store, kSnapshotSource);
           TSTORE(s_global, s_store);
         }
         // Signal Cube: S workspace ready (flag 3)
@@ -986,7 +1018,7 @@ AICORE void chunk_h_kda_kernel_impl(__gm__ bfloat16_t* K_handle,
 #endif
 }
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize, bool UseLog2Gate>
 AICORE void chunk_h_kda_kernel(__gm__ bfloat16_t* K_handle,
                                __gm__ float* W_handle,
                                __gm__ float* U_handle,
@@ -1007,7 +1039,7 @@ AICORE void chunk_h_kda_kernel(__gm__ bfloat16_t* K_handle,
   // use two cores per head while retaining each complete reduction in K/C.
   if (num_heads == 8 && batch_size == 1 && total_tokens >= 4096 &&
       batch_size * num_heads * 2 <= get_block_num()) {
-    chunk_h_kda_kernel_impl<HiddenSize, ChunkSize, 2>(K_handle,
+    chunk_h_kda_kernel_impl<HiddenSize, ChunkSize, 2, UseLog2Gate>(K_handle,
                                                       W_handle,
                                                       U_handle,
                                                       G_handle,
@@ -1025,7 +1057,7 @@ AICORE void chunk_h_kda_kernel(__gm__ bfloat16_t* K_handle,
     return;
   }
 #endif
-  chunk_h_kda_kernel_impl<HiddenSize, ChunkSize, 1>(K_handle,
+  chunk_h_kda_kernel_impl<HiddenSize, ChunkSize, 1, UseLog2Gate>(K_handle,
                                                     W_handle,
                                                     U_handle,
                                                     G_handle,

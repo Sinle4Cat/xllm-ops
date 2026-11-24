@@ -5,6 +5,10 @@
 #include "../op_kernel/mega_kda_prefill_tiling_data.h"
 
 namespace kda_prefill {
+constexpr int64_t chunk_size_for_soc(bool is_a5) {
+  return is_a5 ? kChunkSize : kAscend910bSmallChunkSize;
+}
+
 inline bool valid_tiling(const TilingData& t, bool is_a5 = false) {
   // Bound all products before constructing workspace offsets or int32 metadata.
   if (t.batch < 1 || t.batch > 1024 || t.tokens < 1 || t.tokens > 131072 ||
@@ -20,6 +24,6 @@ inline bool valid_tiling(const TilingData& t, bool is_a5 = false) {
       return false;
     }
   }
-  return Workspace(t).bytes <= (uint64_t{32} << 30);
+  return Workspace(t, chunk_size_for_soc(is_a5)).bytes <= (uint64_t{32} << 30);
 }
 }  // namespace kda_prefill

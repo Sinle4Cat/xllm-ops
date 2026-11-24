@@ -117,4 +117,38 @@ AICORE inline void SyncAllMixA5() {
 }
 #endif
 
+// xLLM's chunk-local gate is stored in log2 units.
+constexpr float kGateLn2 = 0.6931471805599453f;
+constexpr float kGateInvLn2 = 1.4426950408889634f;
+
+template <bool UseLog2Gate, typename Dst, typename Src>
+AICORE inline void exp_gate(Dst& dst, Src& src) {
+  if constexpr (UseLog2Gate) {
+    pto::TMULS(dst, src, kGateLn2);
+    PipeBarrierVec();
+    pto::TEXP(dst, dst);
+  } else {
+    pto::TEXP(dst, src);
+  }
+}
+
+template <typename Dst, typename Src>
+AICORE inline void main_gate_exp(Dst& dst, Src& src) {
+  pto::TMULS(dst, src, kGateLn2);
+  PipeBarrierVec();
+  pto::TMINS(dst, dst, 80.0f * kGateLn2);
+  PipeBarrierVec();
+  pto::TMAXS(dst, dst, -80.0f * kGateLn2);
+  PipeBarrierVec();
+  pto::TEXP(dst, dst);
+}
+
+template <typename Dst, typename Src, typename Narrow>
+AICORE inline void round_bf16(Dst& dst, Src& src, Narrow& narrow) {
+  pto::TCVT(narrow, src, pto::RoundMode::CAST_RINT);
+  PipeBarrierVec();
+  pto::TCVT(dst, narrow, pto::RoundMode::CAST_NONE);
+  PipeBarrierVec();
+}
+
 }  // namespace mega_kda_prefill_utils

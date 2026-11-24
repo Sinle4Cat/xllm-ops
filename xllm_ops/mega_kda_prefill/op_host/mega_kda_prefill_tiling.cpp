@@ -131,12 +131,9 @@ static ge::graphStatus mega_kda_prefill_tiling(gert::TilingContext* context) {
   }
   std::memcpy(raw->GetData(), &t, sizeof(t));
   raw->SetDataSize(sizeof(t));
-  // Preserve the original recurrence boundaries for 8-head GLM shards.
-  const bool use_128_token_chunk = !is_a5 && t.heads == 8;
-  const int64_t chunk_size =
-      is_a5 || use_128_token_chunk ? kChunkSize : kAscend910bSmallChunkSize;
+  const int64_t chunk_size = chunk_size_for_soc(is_a5);
   workspace[0] = Workspace(t, chunk_size).bytes + platform.GetLibApiWorkSpaceSize();
-  context->SetTilingKey(use_128_token_chunk ? 2 : 1);
+  context->SetTilingKey(is_a5 ? 1 : 2);
   context->SetBlockDim(t.blocks);
   return ge::GRAPH_SUCCESS;
 }

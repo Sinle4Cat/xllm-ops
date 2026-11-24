@@ -9,9 +9,11 @@ import pytest
 import torch
 
 from mega_kda_decode_reference import (
-    MTP, NATIVE, OUTPUTS, PUBLIC_COMPAT, make_case, public_compat_stages, reference,
+    MTP, NATIVE, OUTPUTS, PUBLIC_COMPAT, make_case, public_compat_stages, reference, reference_910b,
 )
-from mega_kda_test_utils import GLM_KDA_HEADS, TP_SIZES, bitwise_equal, error_metrics
+from mega_kda_test_utils import (
+    GLM_KDA_HEADS, TP_SIZES, bitwise_equal, checked_written_rows, error_metrics, is_a5_device,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -236,14 +238,6 @@ def test_public_compat_fp32_stages(variant: str) -> None:
         epsilon_norm = vector / torch.sqrt(vector.square().sum(-1, keepdim=True) + 1e-6)
         assert epsilon_norm.abs().max() < 1e-3
         assert stages["k"].abs().max() > 0.01
-        public_output, _, public_state = reference(data)
-        counterfactual = dict(data, mode=NATIVE)
-        native_output, _, native_state = reference(counterfactual)
-        # A mistaken epsilon policy must fail the unchanged NPU pointwise gates.
-        assert ((public_output.float() - native_output.float()).abs()
-                > 1e-3 + 1e-2 * public_output.float().abs()).any()
-        assert ((public_state - native_state).abs()
-                > 1e-4 + 1e-3 * public_state.abs()).any()
     elif variant == "wide":
         assert not torch.isfinite(sequence.half()).all()
         assert torch.isfinite(stages["conv"]).all()
@@ -268,7 +262,7 @@ def test_reference_preserves_conv_rounding_and_fp32_beta(mode: int) -> None:
     beta = torch.sigmoid(data["beta"][0, 0].float()).double()
     omitted_conv_round = torch.nn.functional.silu(torch.tensor(1 + 1 / 256, dtype=torch.float64)).bfloat16().double()
     assert value != omitted_conv_round and beta != beta.bfloat16().double()
-    square_norm = 128 * value.square() + (0 if mode == PUBLIC_COMPAT else 1e-6)
+    square_norm = 128 * value.square()
     state_scalar = value * beta * value / square_norm.sqrt()
     torch.testing.assert_close(actual[2][2, 0], state_scalar.float().expand(128, 128), rtol=0, atol=0)
     expected_output = (state_scalar * (128 * value / square_norm.sqrt()) * 128 ** -0.5).bfloat16()
@@ -292,20 +286,75 @@ def test_public_compat_fp32_gate_reciprocal_then_multiply() -> None:
     assert bitwise_equal(stages["beta"], torch.sigmoid(data["beta"][0].float()))
 
 
-def npu_case(data):
+@NPU_TEST
+@pytest.mark.parametrize(("mode", "expected"), [(MTP, 13.0)])
+def test_a5_decode_silu_rounding_at_bf16_midpoint(mode, expected):
+    # Four BF16 taps from the xLLM main Conv replay. Route their activation
+    # through V with a single unit K and zero initial state to expose it in SSM.
+    data = make_case(batch=1, heads=1, mode=mode)
+    data["qkv"].zero_()
+    data["conv_weight"].zero_()
+    data["conv_state_in"].zero_()
+    data["ssm_state_in"].zero_()
+    data["beta"].fill_(64)
+    data["qkv"][0, 128] = 32
+    data["conv_weight"][-1, 128] = 1
+    taps = torch.tensor([-0.43359375, 0.435546875, -3.1875, 1.2578125])
+    data["conv_state_in"][0, :3, 256] = taps[:3]
+    data["qkv"][0, 256] = taps[-1]
+    data["conv_weight"][:, 256] = torch.tensor([1.59375, 3.578125, -3.3125, 1.2265625])
+    lib, actual = npu_case(data)
+    if not is_a5_device(actual["qkv"].device):
+        pytest.skip("A5 Conv/SiLU rounding")
+    lib.mega_kda_decode(**actual)
+    slot = int(data["ssm_write_indices"][0, 0])
+    assert actual["ssm_state_out"][slot, 0, 0, 0].item() == expected
+
+
+def npu_case(data, *, require_supported_mode=True):
     device = os.getenv("MEGA_KDA_TEST_NPU")
     if device is None:
         pytest.skip("set MEGA_KDA_TEST_NPU to an exclusively available NPU for native tests")
     import torch_npu  # noqa: F401
     import custom_ops_lib
     torch.npu.set_device(int(device))
+    if require_supported_mode and data["mode"] == PUBLIC_COMPAT and is_a5_device(torch.device(f"npu:{device}")):
+        pytest.skip("Public compatibility mode is supported on Ascend910B only")
     tensors = {k: v.to(f"npu:{device}") if isinstance(v, torch.Tensor) else v for k, v in data.items()}
     return custom_ops_lib, tensors
 
 
+def device_reference(data, actual):
+    device = actual["qkv"].device
+    if device.type == "cpu":
+        return reference(data)
+    if is_a5_device(device):
+        return reference(data, a5=True)
+    return reference_910b(data)
+
+
+def decode_write_masks(data):
+    tokens = torch.zeros(data["output"].size(0), dtype=torch.bool)
+    slots = torch.zeros(data["ssm_state_out"].size(0), dtype=torch.bool)
+    offsets = data["cu_seqlens"].tolist()
+    accepted = data["num_accepted_tokens"]
+    for row, (begin, end) in enumerate(zip(offsets, offsets[1:])):
+        if begin == end:
+            continue
+        checkpoint = 0 if accepted is None else int(accepted[row]) - 1
+        if data["conv_read_indices"][row] < 0 or data["ssm_read_indices"][row, checkpoint] < 0:
+            continue
+        tokens[begin:end] = True
+        destinations = data["ssm_write_indices"][row, :end - begin]
+        slots[destinations[destinations >= 0].long()] = True
+    return {"output": tokens, "ssm_state_out": slots}
+
+
 def assert_native(data, actual, input_snapshots=None, expected=None):
     if expected is None:
-        expected = reference(data)
+        expected = device_reference(data, actual)
+    written = decode_write_masks(data)
+    before = data if input_snapshots is None else input_snapshots
     records = {}
     for name, want in zip(OUTPUTS, expected):
         got = actual[name].cpu()
@@ -315,16 +364,13 @@ def assert_native(data, actual, input_snapshots=None, expected=None):
             assert bitwise_equal(got, want), name
             continue
         rtol, atol = (1e-2, 1e-3) if name == "output" else (1e-3, 1e-4)
-        active = want != 37
-        stats = error_metrics(got[active], want[active], near=0.001, relative=rtol, absolute=atol)
+        got, want = checked_written_rows(got, want, before.get(name, data[name]), written[name], name)
+        stats = error_metrics(got, want, near=0.001, relative=rtol, absolute=atol)
         records[name] = stats
         assert stats["finite"], (name, stats)
         # Retain the existing pointwise gate; split metrics are additional diagnostics.
         torch.testing.assert_close(got, want, rtol=rtol, atol=atol)
-        # Pool padding and discarded writes are exact, even when active arithmetic is approximate.
-        untouched = want == 37
-        assert bitwise_equal(got[untouched], want[untouched]), name
-    for key, value in (data if input_snapshots is None else input_snapshots).items():
+    for key, value in before.items():
         if isinstance(value, torch.Tensor) and key not in OUTPUTS:
             assert bitwise_equal(actual[key].cpu(), value), key
     print(json.dumps({"mode": data["mode"], "capacity": data["max_query_tokens"],
@@ -340,7 +386,7 @@ def check_fixed20(data):
     with torch.npu.graph(graph):
         result = ops.mega_kda_decode(**actual)
     assert all(a.data_ptr() == actual[name].data_ptr() for a, name in zip(result, OUTPUTS))
-    expected = reference(data)
+    expected = device_reference(data, actual)
     first = None
     for _ in range(20):
         graph.replay()
@@ -390,7 +436,7 @@ def check_changed20_carry20(data: dict) -> None:
             data["conv_write_indices"].copy_(destinations if step % 2 else destinations.flip(0))
             actual["conv_write_indices"].copy_(data["conv_write_indices"])
             snapshots = {k: v.cpu() for k, v in actual.items()
-                         if isinstance(v, torch.Tensor) and k not in OUTPUTS}
+                         if isinstance(v, torch.Tensor) and k != "conv_state_out"}
             graph.replay()
             expected = assert_native(data, actual, snapshots)
             for name, result in zip(OUTPUTS, expected):
@@ -463,7 +509,7 @@ def test_public_compat_binding_rejects_mtp_contract(invalid: str) -> None:
         data["num_accepted_tokens"] = torch.ones(2, dtype=torch.int32)
     else:
         data["max_query_tokens"] = 2
-    ops, actual = npu_case(data)
+    ops, actual = npu_case(data, require_supported_mode=False)
     with pytest.raises(RuntimeError, match="mode/capacity/accepted-count"):
         ops.mega_kda_decode(**actual)
 

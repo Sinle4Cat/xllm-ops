@@ -145,6 +145,7 @@ class FrontScratch final {
   }
 };
 
+template <bool UseMainConvRounding>
 AICORE inline void conv(FrontScratch& s,
                         const Args& a,
                         const TilingData& t,
@@ -171,21 +172,30 @@ AICORE inline void conv(FrontScratch& s,
                     : a.qkv + pos * c + channel;
       s.bf_load(s.x, p);
     }
-    TCVT(s.fp16, s.x, RoundMode::CAST_RINT);
-    PipeBarrierVec();
-    TCVT(s.x, s.fp16, RoundMode::CAST_NONE);
-    PipeBarrierVec();
     s.bf_load(s.weight, a.weight + tap * c + channel);
-    TMUL(s.tmp, s.x, s.weight);
-    PipeBarrierVec();
-    TADD(s.acc, s.acc, s.tmp);
+    if constexpr (UseMainConvRounding) {
+      if (tap == 0 && !a.bias) {
+        TMUL(s.acc, s.x, s.weight);
+      } else {
+        TMULADDDST(s.acc, s.x, s.weight);
+      }
+    } else {
+      TCVT(s.fp16, s.x, RoundMode::CAST_RINT);
+      PipeBarrierVec();
+      TCVT(s.x, s.fp16, RoundMode::CAST_NONE);
+      PipeBarrierVec();
+      TMUL(s.tmp, s.x, s.weight);
+      PipeBarrierVec();
+      TADD(s.acc, s.acc, s.tmp);
+    }
     PipeBarrierVec();
   }
-  // Preserve the BF16 convolution output before SiLU.
-  TCVT(s.bf, s.acc, RoundMode::CAST_RINT);
-  PipeBarrierVec();
-  TCVT(s.acc, s.bf, RoundMode::CAST_NONE);
-  PipeBarrierVec();
+  if constexpr (!UseMainConvRounding) {
+    TCVT(s.bf, s.acc, RoundMode::CAST_RINT);
+    PipeBarrierVec();
+    TCVT(s.acc, s.bf, RoundMode::CAST_NONE);
+    PipeBarrierVec();
+  }
   TMULS(s.tmp, s.acc, -1.0f);
   PipeBarrierVec();
   TEXP(s.tmp, s.tmp);
@@ -200,30 +210,22 @@ AICORE inline void conv(FrontScratch& s,
   PipeBarrierVec();
 }
 
+constexpr float kQkNormEps = 1.0e-6f;
+
 AICORE inline void normalize(FrontScratch& s) {
   TMUL(s.tmp, s.acc, s.acc);
   PipeBarrierVec();
   sum_fp32_features(s.column, s.tmp, s.reduce);
   PipeBarrierVec();
-  TADDS(s.scalar, s.scalar, 1.0e-6f);
+  TADDS(s.scalar, s.scalar, kQkNormEps);
   PipeBarrierVec();
-  // Keep the single valid column on both sides of TSQRT.
-  ND<float, 1, 8, 1, 1> sqrt_input;
-  Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, 1, 1> sqrt_column;
-  TASSIGN(sqrt_input, 4096);
-  TASSIGN(sqrt_column, 4096);
-  // Keep variance in s.column for the rare midpoint correction path.
-  TSQRT(sqrt_input, s.scalar);
+  // Ascend910B lowers mainline rsqrt to sqrt followed by reciprocal division.
+  TRSQRT(s.scalar, s.scalar, s.reduce);
   PipeBarrierVec();
-  TROWEXPAND(s.norm_broadcast, sqrt_column);
+  TROWEXPAND(s.norm_broadcast, s.column);
   PipeBarrierVec();
-  TADDS(s.tmp, s.acc, 0.0f);
+  TMUL(s.acc, s.acc, s.norm_broadcast);
   PipeBarrierVec();
-  TDIV(s.acc, s.acc, s.norm_broadcast);
-  PipeBarrierVec();
-  round_bf16_midpoints(s.acc, s.tmp, sqrt_column, s.column);
-  PipeBarrierVec();
-  // The chunk stages consume BF16 normalized Q/K, not unrounded FP32 vectors.
   TCVT(s.bf, s.acc, RoundMode::CAST_RINT);
   PipeBarrierVec();
 }
@@ -231,7 +233,7 @@ AICORE inline void normalize(FrontScratch& s) {
 // Each row is independent in the conv and normalization front end. Keep the
 // original tap order, FP16 input boundary and BF16 conv/normalized boundary.
 // Only the first three sequence tokens require history-aware scalar rows.
-template <int R>
+template <int R, bool UseMainConvRounding>
 static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
                                                        const TilingData& t,
                                                        __gm__ uint8_t* ws,
@@ -255,7 +257,7 @@ static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
   ND<float, 1, D> weight;
   ND<bfloat16_t, 1, D> weight_bf;
   ND<float, R, 64> reduce;
-  ND<float, R, 8> scalar;
+  ND<float, 1, R> scalar;
   Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, R, 1> column;
   TASSIGN(acc, 0);
   TASSIGN(tmp, L::kTemporary);
@@ -303,11 +305,12 @@ static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
              channels);
         TCVT(window, raw_window, RoundMode::CAST_NONE);
         PipeBarrierVec();
-        // BF16 and FP16 share Narrow only after the prior conversion drains.
-        TCVT(narrow_window, window, RoundMode::CAST_RINT);
-        PipeBarrierVec();
-        TCVT(window, narrow_window, RoundMode::CAST_NONE);
-        PipeBarrierVec();
+        if constexpr (!UseMainConvRounding) {
+          TCVT(narrow_window, window, RoundMode::CAST_RINT);
+          PipeBarrierVec();
+          TCVT(window, narrow_window, RoundMode::CAST_NONE);
+          PipeBarrierVec();
+        }
       }
       TEXPANDS(acc, 0.0f);
       PipeBarrierVec();
@@ -332,22 +335,35 @@ static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
                channels);
           TCVT(input, bf, RoundMode::CAST_NONE);
           PipeBarrierVec();
-          TCVT(fp16, input, RoundMode::CAST_RINT);
-          PipeBarrierVec();
-          TCVT(input, fp16, RoundMode::CAST_NONE);
-          PipeBarrierVec();
+          if constexpr (!UseMainConvRounding) {
+            TCVT(fp16, input, RoundMode::CAST_RINT);
+            PipeBarrierVec();
+            TCVT(input, fp16, RoundMode::CAST_NONE);
+            PipeBarrierVec();
+          }
         }
         TASSIGN(tap_weight, L::kCachedWeights + tap * D * sizeof(float));
-        TCOLEXPANDMUL(tmp, input, tap_weight);
-        PipeBarrierVec();
-        TADD(acc, acc, tmp);
+        if constexpr (UseMainConvRounding) {
+          TCOLEXPAND(tmp, tap_weight);
+          PipeBarrierVec();
+          if (tap == 0 && !a.bias) {
+            TMUL(acc, input, tmp);
+          } else {
+            TMULADDDST(acc, input, tmp);
+          }
+        } else {
+          TCOLEXPANDMUL(tmp, input, tap_weight);
+          PipeBarrierVec();
+          TADD(acc, acc, tmp);
+        }
         PipeBarrierVec();
       }
-      // Preserve the same BF16 boundary in the batched front end.
-      TCVT(bf, acc, RoundMode::CAST_RINT);
-      PipeBarrierVec();
-      TCVT(acc, bf, RoundMode::CAST_NONE);
-      PipeBarrierVec();
+      if constexpr (!UseMainConvRounding) {
+        TCVT(bf, acc, RoundMode::CAST_RINT);
+        PipeBarrierVec();
+        TCVT(acc, bf, RoundMode::CAST_NONE);
+        PipeBarrierVec();
+      }
       TMULS(tmp, acc, -1.0f);
       PipeBarrierVec();
       TEXP(tmp, tmp);
@@ -365,22 +381,13 @@ static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
         PipeBarrierVec();
         sum_fp32_features(column, tmp, reduce);
         PipeBarrierVec();
-        TADDS(scalar, scalar, 1.0e-6f);
+        TADDS(scalar, scalar, kQkNormEps);
         PipeBarrierVec();
-        ND<float, R, 8> sqrt_input;
-        Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, R, 1> sqrt_column;
-        TASSIGN(sqrt_input, L::kReduce);
-        TASSIGN(sqrt_column, L::kReduce);
-        // Keep variance in column for the rare midpoint correction path.
-        TSQRT(sqrt_input, scalar);
+        TRSQRT(scalar, scalar, reduce);
         PipeBarrierVec();
-        TROWEXPAND(norm, sqrt_column);
+        TROWEXPAND(norm, column);
         PipeBarrierVec();
-        TADDS(tmp, acc, 0.0f);
-        PipeBarrierVec();
-        TDIV(acc, acc, norm);
-        PipeBarrierVec();
-        round_bf16_midpoints(acc, tmp, sqrt_column, column);
+        TMUL(acc, acc, norm);
         PipeBarrierVec();
         TCVT(bf, acc, RoundMode::CAST_RINT);
         PipeBarrierVec();
@@ -412,6 +419,21 @@ static AICORE __attribute__((noinline)) void conv_rows(const Args& a,
 
 // The per-token elementwise chain is independent; only its original FP32
 // cumulative addition is serial. Reuse the fully drained ConvRows UB arena.
+template <bool UseLog2Gate, typename Data, typename Scratch>
+AICORE inline void finish_gate(Data& denominator, Scratch& numerator) {
+  TEXPANDS(numerator, UseLog2Gate ? 1.0f : -5.0f);
+  PipeBarrierVec();
+  TDIV(denominator, numerator, denominator);
+  PipeBarrierVec();
+  if constexpr (UseLog2Gate) {
+    TMULS(denominator, denominator, -5.0f);
+    PipeBarrierVec();
+    TMULS(denominator, denominator, kGateInvLn2);
+    PipeBarrierVec();
+  }
+}
+
+template <bool UseLog2Gate>
 static AICORE __attribute__((noinline)) void gate_rows(const Args& a,
                                                        const TilingData& t,
                                                        __gm__ uint8_t* ws,
@@ -469,10 +491,7 @@ static AICORE __attribute__((noinline)) void gate_rows(const Args& a,
     PipeBarrierVec();
     TADDS(gate, gate, 1.0f);
     PipeBarrierVec();
-    TEXPANDS(temporary, -5.0f);
-    PipeBarrierVec();
-    TDIV(gate, temporary, gate);
-    PipeBarrierVec();
+    finish_gate<UseLog2Gate>(gate, temporary);
     for (int32_t row = 0; row < rows; ++row) {
       ND<float, 1, kColumns> current;
       TASSIGN(current, row * kColumns * sizeof(float));
@@ -508,7 +527,7 @@ static AICORE __attribute__((noinline)) void gate_rows(const Args& a,
 #endif
 }
 
-template <int ChunkSize>
+template <int ChunkSize, bool UseMainConvRounding, bool UseLog2Gate>
 AICORE inline void prepare(const Args& a,
                            const TilingData& t,
                            __gm__ uint8_t* ws,
@@ -551,7 +570,7 @@ AICORE inline void prepare(const Args& a,
         if (selected_part >= 0 && part != selected_part) {
           continue;
         }
-        conv(s, a, t, b, token, (part * t.heads + h) * 128);
+        conv<UseMainConvRounding>(s, a, t, b, token, (part * t.heads + h) * 128);
         if (part < 2) {
           normalize(s);
           store(reinterpret_cast<__gm__ bfloat16_t*>(ws +
@@ -574,18 +593,18 @@ AICORE inline void prepare(const Args& a,
     const int64_t bulk_start = start > history_end ? start : history_end;
     if (bulk_start < end) {
       if (end - bulk_start >= 64) {
-        conv_rows<64>(a, t, ws, w, bulk_start, end, h, selected_part);
+        conv_rows<64, UseMainConvRounding>(a, t, ws, w, bulk_start, end, h, selected_part);
       } else if (end - bulk_start >= 32) {
-        conv_rows<32>(a, t, ws, w, bulk_start, end, h, selected_part);
+        conv_rows<32, UseMainConvRounding>(a, t, ws, w, bulk_start, end, h, selected_part);
       } else {
-        conv_rows<16>(a, t, ws, w, bulk_start, end, h, selected_part);
+        conv_rows<16, UseMainConvRounding>(a, t, ws, w, bulk_start, end, h, selected_part);
       }
     } else {
       pipe_barrier(PIPE_ALL);
     }
     if (selected_part < 0 || selected_part == 2) {
       if (end - start >= 16) {
-        gate_rows(a, t, ws, w, start, end, h);
+        gate_rows<UseLog2Gate>(a, t, ws, w, start, end, h);
       } else {
         // ConvRows has drained the shared UB arena. Cache only this chunk/head's
         // immutable operands, retaining the device EXP and token arithmetic
@@ -609,10 +628,7 @@ AICORE inline void prepare(const Args& a,
           PipeBarrierVec();
           TADDS(s.gate, s.gate, 1.0f);
           PipeBarrierVec();
-          TEXPANDS(s.tmp, -5.0f);
-          PipeBarrierVec();
-          TDIV(s.gate, s.tmp, s.gate);
-          PipeBarrierVec();
+          finish_gate<UseLog2Gate>(s.gate, s.tmp);
           TADD(s.cumulative, s.cumulative, s.gate);
           PipeBarrierVec();
           store(reinterpret_cast<__gm__ float*>(ws + w.g) +

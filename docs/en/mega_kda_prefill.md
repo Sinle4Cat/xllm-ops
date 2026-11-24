@@ -1,24 +1,22 @@
 # MegaKdaPrefill
 
-Ascend910B and Ascend950 (A5) select separate kernels. The 910B backend retains the current FP32 reduction and state publication implementation. On A5, `ffts_addr` may be zero; 910B still requires a valid address.
+English | [简体中文](../zh/mega_kda_prefill.md)
 
-
-Ascend910B mixed AIC/AIV single-launch vector-gated KDA prefill. The native
-operator follows `mega_gdn_prefill_op` packaging and launch conventions, with
-FP32 KKT/inverse/WY/H/O numerical stages. It does not use the GDN
-scalar-gate recurrence and is not a decode/MTP implementation.
+Ascend910B and Ascend950 (A5) select separate kernels. Ascend910B requires a
+valid `ffts_addr`, and Ascend950 accepts zero. The native operator fuses
+width-four Conv/SiLU, Q/K L2 normalization, vector gating and KDA prefill.
+Its packaging and mixed AIC/AIV launch follow the `mega_gdn_prefill_op` conventions.
 
 The GLM model integration is environment-gated: the default uses the `fla_npu`
 composition. `XLLM_KDA_KERNEL=mega_kda` enables supported native prefill and
 ordinary decode, with `XLLM_KDA_PREFILL_BACKEND=native` as the default.
 Non-MTP engines may explicitly set `XLLM_KDA_PREFILL_BACKEND=fla` to retain FLA
-prefill and native decode. In that configuration the legacy option
+prefill and native decode. On Ascend910B, the legacy option
 `XLLM_KDA_DECODE_NORM=public` selects decode's complete mode 3 public compatibility
-contract; it changes Conv narrowing, epsilon, gate order and reduction grouping.
+contract for Conv input conversion and gate evaluation.
 The default `native` value selects mode 0. Public compatibility requires FLA
-prefill, and this compatibility route requires verify width 1. Model MTP verify
-keeps the FLA V3 path. Decode mode 1 is an operator-level interface, not evidence
-of model MTP integration. See [the decode contract](mega_kda_decode.md).
+prefill, and this compatibility route requires verify width 1. Model MTP verify uses decode mode 1 for supported layouts and falls back to FLA V3
+for other layouts. See [the decode contract](mega_kda_decode.md).
 Isolated operator checks do not establish full-model acceptance or performance.
 
 ## Interface
@@ -27,9 +25,9 @@ All tensors are contiguous ND on the same NPU. Select that NPU as the current
 device before calling the binding, as for the existing MegaGDN bindings.
 `T` is the total packed token
 count, `B` the number of sequences, `H` the head count, and `C = 384 * H`.
-K/V dimensions are 128 and Conv width is four. The internal chunk size is
-128 on Ascend950 and for eight heads on Ascend910B. Other Ascend910B head
-counts use 64.
+K/V dimensions are 128 and Conv width is four. Ascend910B uses 64-token
+chunks for every supported head count. Ascend950 uses 128-token chunks in
+its general path and a direct recurrence for B=1, H=8 and T=1–4.
 
 | Argument | Shape | Dtype | Meaning |
 |---|---|---|---|
@@ -51,9 +49,10 @@ counts use 64.
 | conv_state_out | `[Co,3,C]` | BF16 | Caller-allocated independent Conv pool |
 | ssm_state_out | `[So,H,128,128]` | FP32 | Caller-allocated independent **VK** pool |
 
-ACLNN attributes are `conv_output_slots`, `ssm_output_slots`, `ffts_addr`, in
-that order. The Python C++ binding derives capacities and obtains the FFTS
-address from the active runtime. It never copies Device metadata to CPU.
+ACLNN attributes are `conv_output_slots`, `ssm_output_slots` and `ffts_addr`
+in that order. The Python test binding derives capacities from the output
+pools. It queries the FFTS address on Ascend910B and passes zero on Ascend950.
+Offsets and slot mappings stay on the device.
 
 ```python
 output, conv_out, ssm_out = custom_ops_lib.mega_kda_prefill(
@@ -80,12 +79,17 @@ output, conv_out, ssm_out = custom_ops_lib.mega_kda_prefill(
 
 ## Numerical Contract
 
-Conv evaluates SiLU after four taps. It preserves the existing Ascend input/history
-FP16 cast, rounds accumulation to BF16 before SiLU, then rounds SiLU output to
-BF16. Q/K are L2-normalized with epsilon `1e-6` and
-rounded to BF16 before KDA. The fixed GLM safe gate is
-`g = -5 * sigmoid(exp(a_log) * (gate + gate_bias))` in FP32. Chunk-local gate
-cumsum is FP32; beta stays FP32. The recurrence oracle in VK layout is:
+Both platforms convert the BF16 Conv input and history directly to FP32,
+accumulate four taps and apply SiLU before rounding the activation to BF16.
+Ascend910B uses FP32 fused multiply-adds for tap accumulation where applicable.
+Both use a Q/K normalization epsilon of `1e-6` and publish normalized Q/K
+in BF16. Ascend910B multiplies by the FP32 reciprocal square root of the
+sum of squares plus epsilon. Ascend950 uses the r003 normalization path,
+with range scaling for large rows.
+
+The GLM safe gate is `g = -5 * sigmoid(exp(a_log) * (gate + gate_bias))`.
+Gate prefix sums and beta use FP32. The mathematical recurrence in VK layout
+is:
 
 ```text
 S = S * exp(g)[None, :]
@@ -94,11 +98,10 @@ S = S + delta[:, None] * k[None, :]
 o = (S @ q) / sqrt(128)
 ```
 
-The Device implements this with a chunk algorithm, including FP32
-A2, K_eff/W, inverse and state. It is not a tokenwise Device fallback. Internal
-states use KV; the frontend/epilogue transpose to/from the public VK pools.
-Reassociating Conv, normalization and cumsum can change rounding relative to
-the separate kernels, so historical results do not certify this integration.
+The general paths evaluate the recurrence through KKT, inverse, WY and chunk
+H/O stages. Ascend910B's C64 implementation uses FP32 state and explicit BF16
+stage boundaries. Ascend950 retains the r003 C128 stages. Both transpose the
+internal KV representation at the public VK state pools.
 
 Supported static bounds: `1 <= T <= 131072`, `1 <= B <= 1024`,
 `1 <= H <= 128`, positive pools up to 1048576 slots, and workspace <= 32GiB.
@@ -110,37 +113,50 @@ the caller retains any additional speculative history/checkpoint rows.
 
 ## Build And Validate
 
-Use the repository's normal isolated build/OPP flow with
-`--ops=mega_kda_prefill --soc=ascend910b`. The exported entry points are
-`aclnnMegaKdaPrefillGetWorkspaceSize` and `aclnnMegaKdaPrefill`.
-Compile `test/python_test/setup.py` against the same Torch/CANN environment.
+Use the private OPP build and installation commands for both KDA operators.
+For a Prefill-only package pass `--ops=mega_kda_prefill` to `xllm_ops/build.sh`
+and choose the target SoC. [Private OPP commands](mega_kda_decode.md#build-and-test)
+
+The exported entry points are `aclnnMegaKdaPrefillGetWorkspaceSize` and
+`aclnnMegaKdaPrefill`. Compile `test/python_test/setup.py` against the same
+Torch and CANN environment.
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q test/python_test/test_mega_kda_prefill.py
 MEGA_KDA_PREFILL_TEST_NPU=0 python -m pytest -x -s test/python_test/test_mega_kda_prefill.py
 ```
 
-The second command requires an exclusively available device and the new custom
-OPP on the loader path. Tests compare against an independent FP64 CPU oracle,
-separate normal relative errors from near-zero absolute errors, exclude
-untouched pool padding from error fractions, and check all 100 fixed/carry
-Graph replays. The provisional operator smoke gate splits at `abs(golden)=1e-3`:
-normal relative tolerance is 1%, near-zero absolute tolerance is `1e-5`, and
-each category's exceeding fraction must be <= 0.1%. This is not an all-elements
-1% guarantee or a production model accuracy criterion. Common 1k through 32k
-tests also check 20 fixed-input bitwise-identical Graph replays per shape;
-TP1 at 2k uses 1000 replays to cover delayed chunk-state buffer reuse failures.
-Every replay compares output, Conv state and SSM state separately.
-Bitwise checks compare raw bytes, including signed zero. Output and golden must
-have identical shapes/dtypes; nonfinite outputs, golden values or derived errors
-always fail. CPU regression coverage is in `test_mega_kda_accuracy_checks.py`.
+The second command requires an exclusively available device and the custom
+OPP on the loader path. The native test harness selects `reference_910b(data)`
+on Ascend910B, an independent CPU FP32 C64 reference with BF16 stage boundaries.
+On Ascend950 it selects `reference(data, a5=True)`, the r003 reference with FP64
+recurrence and the A5 Conv and normalization boundaries. Both references use
+the same Prefill checks. Those checks require matching shapes and dtypes, finite
+values, byte-identical Conv state and untouched slots, and the following error
+limits for attention and written SSM state.
 
-TP shape coverage uses the model's 64 KDA heads: TP1/2/4/8/16/32/64 map to
-local H=64/32/16/8/4/2/1. Each TP is crossed with all six common lengths,
-tail/empty-sequence cases with and without Conv bias, and fixed100/carry100
-Graph replay. CPU oracle and Host policy checks cover the same head counts.
-These are single-device per-rank shape tests, not distributed TP or HCCL tests.
-Select the TP matrix with `pytest -k tp` (or one size with `-k tp8`).
+| Reference magnitude | Error threshold | Maximum fraction above threshold |
+|---|---|---|
+| `abs(golden) >= 1e-3` | 1% relative | 0.1% |
+| `abs(golden) < 1e-3` | `1e-5` absolute | 0.1% |
+
+The shared KDA pytest collection has 805 nodes across Prefill, Prefill carry500,
+Decode, accuracy checks and BF16 rounding. The retained Prefill coverage
+includes the following cases.
+
+- TP1/2/4/8/16/32/64, representing local H=64/32/16/8/4/2/1 of the model's
+  64 heads, with tail and empty sequences, bias variants and state-pool checks.
+- Common lengths 1024, 2048, 4096, 8192, 16384 and 32768. The retained pairs
+  exclude 2048 at TP1 and 8192 at TP8/TP16. Each retained pair checks the
+  CPU reference once and compares all three output buffers byte-for-byte
+  across 20 fixed-input graph replays.
+- Fixed-input and independent-state 100-replay tests at TP1/2/4/16/32/64.
+  Fixed-input replay compares raw bytes, including signed zero.
+- The carry500 suite advances independent CPU and NPU states at H=1/8/64
+  with gate bias `-4.0`. Graph replay is the default.
+
+These cases exercise each local head shape on one device. Distributed TP,
+model accuracy and performance have separate evaluation requirements.
 
 One mixed Device entry does not imply one total runtime task. In torch_npu 2.9,
 NPUGraph replay updates the RNG seed and offset with two Fill kernels before
@@ -153,10 +169,8 @@ model accuracy require their own fresh measurements; no speedup is implied.
 
 ## Conv Frontend Tiling
 
-Conv and Q/K normalization process 16 independent token rows per tile. The
-first three sequence tokens retain the history-aware row path; subsequent
-chunks use the tiled path directly. Valid-row stores handle ragged tails.
-The tap addition order, FP16 Conv input conversion, BF16 Conv and normalized
-Q/K boundaries remain unchanged. Gate cumulative sums retain their sequential
-FP32 scan. The frontend uses 46,336bytes of UB and adds no GM workspace.
-MTE3 stores drain before the shared arena is reused by the gate scan.
+The Ascend910B frontend has 16-, 32- and 64-row Conv tiles. The first three
+sequence tokens use the history-aware row path. Later
+rows use the tiled path, with valid-row stores for ragged tails. Gate prefix
+sums use a sequential FP32 scan. MTE3 stores drain before the frontend arena
+is reused by the gate scan.

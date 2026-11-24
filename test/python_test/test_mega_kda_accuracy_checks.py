@@ -106,3 +106,96 @@ def test_native_gate_rejects_nonfinite(monkeypatch, operator, name, side, bad):
             module.check(data, actual, "nonfinite")
         else:
             module.assert_native(data, actual)
+
+
+@pytest.mark.parametrize("operator", ["prefill", "decode", "mtp", "public_compat"])
+@pytest.mark.parametrize("change", ["written", "unwritten", "replay"])
+def test_ssm_write_check_uses_slot_metadata(operator, change):
+    import test_mega_kda_decode as decode
+    import test_mega_kda_prefill as prefill
+
+    if operator == "prefill":
+        data = prefill.make_case((1, 0), heads=1)
+        reference = prefill.reference
+    else:
+        mode = {"decode": decode.NATIVE, "mtp": decode.MTP, "public_compat": decode.PUBLIC_COMPAT}[operator]
+        data = decode.make_case(batch=1, heads=1, mode=mode, capacity=2 if mode == decode.MTP else 1)
+        reference = decode.reference
+
+    data["ssm_read_indices"].zero_()
+    data["conv_read_indices"].zero_()
+    # Zero the Conv contribution and saturate the gate so a real write returns exactly 37.
+    data["conv_weight"].zero_()
+    data["gate_bias"].fill_(torch.finfo(data["gate_bias"].dtype).min)
+    data["ssm_state_in"].fill_(37)
+    data["ssm_state_out"].fill_(2)
+    output, conv, state = reference(data)
+    actual = dict(data, output=output, conv_state_out=conv, ssm_state_out=state)
+
+    def check(before=None):
+        if operator == "prefill":
+            prefill.check(data, actual, "write-slots", before)
+        else:
+            decode.assert_native(data, actual, before)
+
+    written = int(data["ssm_write_indices"].flatten()[0])
+    assert state[written, 0, 0, 0] == 37
+    # Row zero is unused by both fixtures. One ULP is within the arithmetic tolerance.
+    slot = written if change == "written" else 0
+    value = state[slot, 0, 0, 0]
+    value.copy_(torch.nextafter(value, torch.full_like(value, float("inf"))))
+    if change == "unwritten":
+        with pytest.raises(AssertionError, match="ssm_state_out"):
+            check()
+    elif change == "written":
+        check()
+    else:
+        before = data["ssm_state_out"].clone()
+        before[slot, 0, 0, 0] = value
+        check({"ssm_state_out": before})
+        value.copy_(data["ssm_state_out"][slot, 0, 0, 0])
+        with pytest.raises(AssertionError, match="ssm_state_out"):
+            check({"ssm_state_out": before})
+
+
+def test_mtp_write_masks_follow_packed_queries_and_selected_checkpoint():
+    import test_mega_kda_decode as decode
+
+    data = decode.make_case(batch=5, heads=1, capacity=3, mode=decode.MTP, ragged=True)
+    # Packed lengths are [1, 3, 3, 3, 0]. Accepted counts select reads, not write lengths.
+    data["num_accepted_tokens"].copy_(torch.tensor([3, 1, 2, 3, 0]))
+    data["ssm_read_indices"][0, 0] = -1  # An unselected checkpoint.
+    data["conv_write_indices"][0] = -1  # Only the Conv write is discarded.
+    data["ssm_write_indices"][1, 1] = -1
+    data["ssm_read_indices"][2, 1] = -1
+    data["conv_read_indices"][3] = -1
+
+    masks = decode.decode_write_masks(data)
+    assert masks["output"].nonzero().flatten().tolist() == [0, 1, 2, 3]
+    assert masks["ssm_state_out"].nonzero().flatten().tolist() == [2, 5, 7]
+
+    # An inactive output starts at +0. Flipping its sign violates byte preservation.
+    data["output"].zero_()
+    output, conv, state = decode.reference(data)
+    actual = dict(data, output=output, conv_state_out=conv, ssm_state_out=state)
+    decode.assert_native(data, actual)
+    output[4, 0, 0] = -0.0
+    with pytest.raises(AssertionError, match="output: modified an unwritten row"):
+        decode.assert_native(data, actual)
+
+
+def test_prefill_empty_sequence_does_not_write_ssm():
+    import test_mega_kda_prefill as prefill
+
+    data = prefill.make_case((1, 0, 1), heads=1)
+    data["ssm_write_indices"][2] = -1
+    data["ssm_state_out"].zero_()
+    output, conv, state = prefill.reference(data)
+    actual = dict(data, output=output, conv_state_out=conv, ssm_state_out=state)
+    # The first sequence starts from zero state but still writes slot 2.
+    state[2, 0, 0, 0] = torch.nextafter(state[2, 0, 0, 0], torch.tensor(float("inf")))
+    prefill.check(data, actual, "empty-sequence")
+    # Slot 3 belongs to the empty sequence, and the last sequence discards its write.
+    state[3, 0, 0, 0] = -0.0
+    with pytest.raises(AssertionError, match="ssm_state_out: modified an unwritten row"):
+        prefill.check(data, actual, "empty-sequence")

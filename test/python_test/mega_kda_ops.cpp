@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include <acl/acl_rt.h>
+#include <algorithm>
+#include <cctype>
 #include <string>
 
 #include "mega_kda_ops.h"
@@ -85,21 +87,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mega_kda_prefill(
               "[slots,H,V,K] outputs");
   const int64_t conv_output_slots = conv_state_out.size(0);
   const int64_t ssm_output_slots = ssm_state_out.size(0);
-  uint64_t ffts_addr = 0;
-  uint32_t ffts_len = 0;
-  using GetC2c = int32_t (*)(uint64_t*, uint32_t*);
-  static GetC2c get_c2c = [] {
-    void* handle = dlopen("libruntime.so", RTLD_LAZY | RTLD_LOCAL);
-    TORCH_CHECK(handle, "failed to load libruntime.so: ", dlerror());
-    void* symbol = dlsym(handle, "rtGetC2cCtrlAddr");
-    TORCH_CHECK(symbol, "failed to resolve rtGetC2cCtrlAddr: ", dlerror());
-    return reinterpret_cast<GetC2c>(symbol);
-  }();
   const char* soc = aclrtGetSocName();
-  const bool is_a5 = soc && std::string(soc).find("Ascend950") != std::string::npos;
+  std::string soc_name = soc ? soc : "";
+  std::transform(soc_name.begin(), soc_name.end(), soc_name.begin(),
+                 [](unsigned char ch) { return std::tolower(ch); });
+  const bool is_a5 = soc_name.rfind("ascend950", 0) == 0 ||
+                     soc_name.rfind("ascend910_95", 0) == 0;
+  uint64_t ffts_addr = 0;
+  // A5 uses GM-based synchronization and can run with a zero FFTS address.
   if (!is_a5) {
-  TORCH_CHECK(get_c2c(&ffts_addr, &ffts_len) == 0 && ffts_addr,
-              "MegaKdaPrefill requires the Ascend910B FFTS address");
+    using GetC2c = int32_t (*)(uint64_t*, uint32_t*);
+    static const GetC2c get_c2c = [] {
+      void* handle = dlopen("libruntime.so", RTLD_LAZY | RTLD_LOCAL);
+      TORCH_CHECK(handle, "failed to load libruntime.so: ", dlerror());
+      void* symbol = dlsym(handle, "rtGetC2cCtrlAddr");
+      TORCH_CHECK(symbol, "failed to resolve rtGetC2cCtrlAddr: ", dlerror());
+      return reinterpret_cast<GetC2c>(symbol);
+    }();
+    uint32_t ffts_len = 0;
+    TORCH_CHECK(get_c2c(&ffts_addr, &ffts_len) == 0 && ffts_addr,
+                "MegaKdaPrefill requires the Ascend910B FFTS address");
   }
   const int64_t ffts_attr = static_cast<int64_t>(ffts_addr);
   // No metadata D2H: replay reads current device tensors and caller-owned

@@ -67,6 +67,11 @@ struct Args {
 #if __CCE_AICORE__ == 310
 #include "mega_kda_decode_a5_dynamic.h"
 #else
+// FP32 rounding of 1 / sqrt(kHeadDim).
+constexpr float kQueryScale = 0.08838834764831845f;
+static_assert(kHeadDim == 128, "Update the query scale for the head dimension");
+constexpr int64_t kSsmHeadStride = kHeadDim * kHeadDim;
+
 // Byte offsets shared by scalar Conv, batched Conv and split reductions.
 // value aliases a subrow of v; column tiles alias their row-vector storage.
 template <int VRows>
@@ -481,7 +486,7 @@ AICORE inline void store_plain_conv(const Args& a,
   wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
 }
 
-template <int VRows, bool PublicCompat = false>
+template <int VRows>
 AICORE inline void normalize(Scratch<VRows>& s,
                              TileND<float, 1, 128>& x,
                              float scale) {
@@ -489,25 +494,14 @@ AICORE inline void normalize(Scratch<VRows>& s,
   v_barrier();
   TROWSUM(s.norm_col, s.tmp, s.reduce_work);
   v_barrier();
-  if constexpr (PublicCompat) {
-    // match the public recurrent normalization only for explicit plain key3.
-    TSQRT(s.norm, s.norm);
-    v_barrier();
-    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    const float norm = s.norm.GetValue(0);
-    if (norm > 0.0f) {
-      TMULS(x, x, 1.0f / norm);
-      v_barrier();
-    }
-  } else {
-    TADDS(s.norm, s.norm, 1.0e-6f);
-    v_barrier();
-    TSQRT(s.norm, s.norm);
-    v_barrier();
-    TROWEXPAND(s.tmp, s.norm_col);
-    v_barrier();
-    TDIV(x, x, s.tmp);
+  TSQRT(s.norm, s.norm);
+  v_barrier();
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  // Mainline recurrent KDA preserves zero Q/K rows.
+  const float norm = s.norm.GetValue(0);
+  if (norm > 0.0f) {
+    TMULS(x, x, 1.0f / norm);
     v_barrier();
   }
   TMULS(x, x, scale);
@@ -543,8 +537,8 @@ AICORE inline void recurrent(Scratch<VRows>& s,
                              const TilingData& t,
                              int64_t token,
                              int64_t head) {
-  normalize<VRows, PublicCompat>(s, s.q, 0.08838834764831845f);
-  normalize<VRows, PublicCompat>(s, s.k, 1.0f);
+  normalize(s, s.q, kQueryScale);
+  normalize(s, s.k, 1.0f);
   load_bf16(s, s.g, a.gate + (token * t.heads + head) * 128);
   load<float, 1, 128>(s.tmp, a.gate_bias + head * 128);
   TADD(s.g, s.g, s.tmp);
@@ -658,9 +652,10 @@ AICORE inline void run_tiled(const Args& a, const TilingData& t) {
     }
     Scratch<VRows> s;
     s.init(v_start);
-    load<float, kVRows, 128>(
+    load<float, kVRows, kHeadDim>(
         s.state,
-        a.ssm_in + (ssm_read * t.heads + head) * 16384 + v_start * 128);
+        a.ssm_in + (ssm_read * t.heads + head) * kSsmHeadStride +
+            v_start * kHeadDim);
     for (int64_t token = begin; token < end; ++token) {
       if constexpr (BatchConv) {
         if constexpr (Mtp) {
@@ -695,8 +690,9 @@ AICORE inline void run_tiled(const Args& a, const TilingData& t) {
       const int64_t slot =
           a.ssm_write[batch * t.max_query_tokens + token - begin];
       if (slot >= 0) {
-        store<float, kVRows, 128>(
-            a.ssm_out + (slot * t.heads + head) * 16384 + v_start * 128,
+        store<float, kVRows, kHeadDim>(
+            a.ssm_out + (slot * t.heads + head) * kSsmHeadStride +
+                v_start * kHeadDim,
             s.state);
       }
       store<bfloat16_t, 1, kVRows>(

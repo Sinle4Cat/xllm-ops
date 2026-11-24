@@ -90,7 +90,6 @@ AICORE inline void Rendezvous()
 struct FrontScratch {
     ND<float, 1, 128> acc, x, weight, tmp, norm_broadcast, gate, cumulative;
     ND<bfloat16_t, 1, 128> bf;
-    ND<half, 1, 128> fp16;
     ND<float, 1, 64> reduce;
     ND<float, 1, 8, 1, 1> scalar;
     Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, 1, 1> column;
@@ -98,7 +97,7 @@ struct FrontScratch {
     {
         TASSIGN(acc, 0); TASSIGN(x, 512); TASSIGN(weight, 1024); TASSIGN(tmp, 1536);
         TASSIGN(norm_broadcast, 2048); TASSIGN(gate, 2560); TASSIGN(cumulative, 3072);
-        TASSIGN(bf, 3584); TASSIGN(fp16, 3840); TASSIGN(reduce, 4096);
+        TASSIGN(bf, 3584); TASSIGN(reduce, 4096);
         TASSIGN(scalar, 4352); TASSIGN(column, 4352);
     }
     AICORE inline void BfLoad(ND<float, 1, 128>& dst, __gm__ bfloat16_t* src)
@@ -130,8 +129,6 @@ AICORE inline void Conv(FrontScratch& s, const Args& a, const TilingData& t,
                                  : a.qkv + pos * c + channel;
             s.BfLoad(s.x, p);
         }
-        TCVT(s.fp16, s.x, RoundMode::CAST_RINT); PipeBarrierVec();
-        TCVT(s.x, s.fp16, RoundMode::CAST_NONE); PipeBarrierVec();
 #if __CCE_AICORE__ == 310
         TASSIGN(cached, 8192 + (part * 4 + tap) * 512);
 #if defined(__DAV_C310_VEC__)
@@ -192,7 +189,7 @@ constexpr int kFrontendRowsA5 = 64;
 
 // Keep the conversion chain in VF registers and feed the existing
 // multiply/TwoSum sequence directly.  The three vcvt forms intentionally
-// mirror TCVT's A5 BF16->FP32->FP16->FP32 implementation; only the final
+// expand BF16 directly to FP32; only the final
 // FP32 sum/low parts are written to UB.
 template <typename Matrix, typename BfMatrix, typename Row>
 __tf__ PTO_INTERNAL void ConvertMulAddCompensatedRowsA5(
@@ -210,11 +207,9 @@ __tf__ PTO_INTERNAL void ConvertMulAddCompensatedRowsA5(
     auto* wp = (__ubuf__ float*)__cce_get_tile_ptr(weight);
     auto* so = (__ubuf__ float*)__cce_get_tile_ptr(sum_out);
     auto* lo = (__ubuf__ float*)__cce_get_tile_ptr(low_out);
-    pto::SaturationCtrlTraits<float, half, pto::SaturationMode::ON, true> ctrlGuard;
     __VEC_SCOPE__ {
         RegTensor<bfloat16_t> bf;
         RegTensor<float> x, product, a, s, v, e, tmp, l, w;
-        RegTensor<half> half_x;
         MaskReg bfMask = PSetWithType<half>(PAT_ALL);
         MaskReg fp32Mask = PSetWithType<float>(PAT_ALL);
         constexpr auto dist = std::integral_constant<::DistVST,
@@ -225,8 +220,6 @@ __tf__ PTO_INTERNAL void ConvertMulAddCompensatedRowsA5(
                 const uint32_t offset = row * 128 + half * 64;
                 vlds(bf, bp, offset, UNPK_B16);
                 vcvt(x, bf, bfMask, PART_EVEN);
-                vcvt(half_x, x, fp32Mask, ROUND_R, RS_DISABLE, PART_EVEN);
-                vcvt(x, half_x, bfMask, PART_EVEN);
                 vmul(product, x, w, fp32Mask, MODE_ZEROING);
                 vlds(a, sp, offset, NORM);
                 vlds(l, lp, offset, NORM);
@@ -267,11 +260,9 @@ __tf__ PTO_INTERNAL void ConvertConvRowsRegbaseA5(
     auto* wp = (__ubuf__ float*)__cce_get_tile_ptr(weights);
     auto* so = (__ubuf__ float*)__cce_get_tile_ptr(sum_out);
     auto* lo = (__ubuf__ float*)__cce_get_tile_ptr(low_out);
-    pto::SaturationCtrlTraits<float, half, pto::SaturationMode::ON, true> ctrlGuard;
     __VEC_SCOPE__ {
         RegTensor<bfloat16_t> bf;
         RegTensor<float> x, product, a, s, v, e, tmp, l, w;
-        RegTensor<half> half_x;
         MaskReg bfMask = PSetWithType<half>(PAT_ALL);
         MaskReg fp32Mask = PSetWithType<float>(PAT_ALL);
         constexpr auto dist = std::integral_constant<::DistVST,
@@ -284,11 +275,7 @@ __tf__ PTO_INTERNAL void ConvertConvRowsRegbaseA5(
                 for (uint16_t tap = 0; tap < 4; ++tap) {
                     const uint32_t inputOffset = (row + tap) * 128 + half * 64;
                     vlds(bf, bp, inputOffset, UNPK_B16);
-                    // Keep the three conversion instructions and their
-                    // rounding/saturation controls identical to C2.
                     vcvt(x, bf, bfMask, PART_EVEN);
-                    vcvt(half_x, x, fp32Mask, ROUND_R, RS_DISABLE, PART_EVEN);
-                    vcvt(x, half_x, bfMask, PART_EVEN);
                     vlds(w, wp, tap * 128 + half * 64, NORM);
                     vmul(product, x, w, fp32Mask, MODE_ZEROING);
 
@@ -318,7 +305,6 @@ AICORE inline void ConvRowsA5(const Args& a, const TilingData& t, __gm__ uint8_t
     constexpr int R = kFrontendRowsA5;
     ND<float, R, 128, DYNAMIC> acc(rows), x(rows), tmp(rows), norm(rows);
     ND<bfloat16_t, R, 128, DYNAMIC> bf(rows);
-    ND<half, R, 128, DYNAMIC> half_input(rows);
     ND<float, R, 64, DYNAMIC> reduce(rows);
     Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, DYNAMIC, 1> column(rows);
     ND<float, 1, R, 1, DYNAMIC> scalar(rows);
@@ -326,7 +312,6 @@ AICORE inline void ConvRowsA5(const Args& a, const TilingData& t, __gm__ uint8_t
     constexpr int Base = 24576, F = R * 128 * sizeof(float), B = F / 2;
     TASSIGN(acc, Base); TASSIGN(x, Base + F); TASSIGN(tmp, Base + 2 * F);
     TASSIGN(norm, Base + 3 * F); TASSIGN(bf, Base + 4 * F);
-    TASSIGN(half_input, Base + 4 * F + B);
     TASSIGN(reduce, Base + 5 * F);
     TASSIGN(column, Base + 5 * F + B); TASSIGN(scalar, Base + 5 * F + B);
     const int64_t channels = t.heads * 384;
@@ -344,8 +329,6 @@ AICORE inline void ConvRowsA5(const Args& a, const TilingData& t, __gm__ uint8_t
                 bf.data(), parameter.data(), rows);
 #else
             TCVT(x, bf, RoundMode::CAST_NONE); PipeBarrierVec();
-            TCVT(half_input, x, RoundMode::CAST_RINT); PipeBarrierVec();
-            TCVT(x, half_input, RoundMode::CAST_NONE); PipeBarrierVec();
             TCOLEXPANDMUL(tmp, x, parameter); PipeBarrierVec();
             TADD(acc, acc, tmp); PipeBarrierVec();
 #endif

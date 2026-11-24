@@ -117,8 +117,6 @@ AICORE KDA_ARCH_INLINE void ShortConv(ShortScratch& s, const Args& a, const Tili
                                        : a.qkv + position * channels + channel;
             s.f.BfLoad(s.f.x, input);
         }
-        TCVT(s.f.fp16, s.f.x, RoundMode::CAST_RINT); PipeBarrierVec();
-        TCVT(s.f.x, s.f.fp16, RoundMode::CAST_NONE); PipeBarrierVec();
         TASSIGN(parameter, 8192 + (part * 4 + tap) * 512);
         TMUL(s.f.tmp, s.f.x, parameter); PipeBarrierVec();
         TADD(s.f.acc, s.f.acc, s.f.tmp); PipeBarrierVec();

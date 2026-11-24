@@ -73,16 +73,17 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
     }
     set_ffts_base_addr(t.ffts_addr);
     auto* ws = AscendC::GetUserWorkspace(workspace);
-    constexpr int chunk_size =
-        TILING_KEY_IS(2) ? kChunkSize : kAscend910bSmallChunkSize;
+    constexpr int chunk_size = kAscend910bSmallChunkSize;
+    constexpr bool use_main_conv_rounding = TILING_KEY_IS(2);
+    constexpr bool use_log2_gate = TILING_KEY_IS(2);
     const Workspace w(t, chunk_size);
-    prepare<chunk_size>(a, t, ws, w);
+    prepare<chunk_size, use_main_conv_rounding, use_log2_gate>(a, t, ws, w);
     pipe_barrier(PIPE_ALL);
     state_io<false>(a, t, ws, w);
     rendezvous();
 #define KDA_F32(name) reinterpret_cast<__gm__ float*>(ws + w.name)
 #define KDA_BF16(name) reinterpret_cast<__gm__ bfloat16_t*>(ws + w.name)
-    mega_kda_prefill_kkt_rows::launch_kkt_rows<chunk_size>(KDA_BF16(k),
+    mega_kda_prefill_kkt_rows::launch_kkt_rows<chunk_size, use_log2_gate>(KDA_BF16(k),
                                                KDA_F32(g),
                                                KDA_F32(beta),
                                                KDA_F32(lower),
@@ -92,18 +93,22 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
                                                t.batch,
                                                t.tokens,
                                                t.tokens,
-                                               t.heads);
+                                               t.heads,
+                                               KDA_BF16(u),
+                                               KDA_BF16(corrected));
     rendezvous();
-    mega_kda_prefill_inverse_fp32::inverse_fp32<chunk_size>(KDA_F32(lower),
-                                                KDA_F32(inverse),
-                                                KDA_F32(eye),
-                                                nullptr,
-                                                a.cu,
-                                                t.batch,
-                                                t.tokens,
-                                                t.heads);
+    if constexpr (use_log2_gate) {
+      // These two buffers are overwritten by W/U and ChunkH after the solve.
+      mega_kda_prefill_kkt_rows::launch_full_akk(
+          KDA_BF16(u), KDA_BF16(corrected), KDA_F32(lower), a.cu, t.batch,
+          t.tokens, t.heads);
+      rendezvous();
+    }
+    mega_kda_prefill_inverse_fp32::inverse_fp32<chunk_size, use_log2_gate>(
+        KDA_F32(lower), KDA_F32(inverse), KDA_F32(eye), nullptr, a.cu,
+        t.batch, t.tokens, t.heads, KDA_F32(beta));
     rendezvous();
-    mega_kda_prefill_wy_kda::wy_kda_kernel<128, chunk_size>(KDA_BF16(k),
+    mega_kda_prefill_wy_kda::wy_kda_kernel<128, chunk_size, use_log2_gate>(KDA_BF16(k),
                                                      KDA_F32(value),
                                                      KDA_F32(beta),
                                                      KDA_F32(g),
@@ -118,7 +123,11 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
                                                      t.heads,
                                                      t.ffts_addr);
     rendezvous();
-    mega_kda_prefill_chunk_h_kda::chunk_h_kda_kernel<128, chunk_size>(
+    if constexpr (use_log2_gate) {
+      mega_kda_prefill_wy_kda::round_wu(KDA_F32(w), KDA_F32(u), t.tokens, t.heads);
+      rendezvous();
+    }
+    mega_kda_prefill_chunk_h_kda::chunk_h_kda_kernel<128, chunk_size, use_log2_gate>(
         KDA_BF16(k),
         KDA_F32(w),
         KDA_F32(u),
@@ -135,7 +144,7 @@ extern "C" __global__ __aicore__ void mega_kda_prefill(
         KDA_F32(initial),
         KDA_F32(final));
     rendezvous();
-    mega_kda_prefill_chunk_o_exact::chunk_o_kda_kernel<128, chunk_size>(
+    mega_kda_prefill_chunk_o_exact::chunk_o_kda_kernel<128, chunk_size, use_log2_gate>(
         KDA_BF16(q),
         KDA_BF16(k),
         KDA_F32(corrected),

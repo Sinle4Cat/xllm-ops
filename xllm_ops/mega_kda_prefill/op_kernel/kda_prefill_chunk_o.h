@@ -197,7 +197,7 @@ AICORE PTO_INLINE void gemm_oneshot(
 
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize, bool UseLog2Gate>
 AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
                                __gm__ bfloat16_t* K_handle,
                                __gm__ float* V_handle,
@@ -266,6 +266,7 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
   constexpr int32_t SLOT_B_ADDR = SLOT_A_ADDR + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_C_ADDR = SLOT_B_ADDR + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_D_ADDR = SLOT_C_ADDR + HalfC * K_DIM * sizeof(float);
+  constexpr float kScale = 0.08838834764831845f;
 #endif
 
   int64_t num_seqs = batch_size;
@@ -340,9 +341,10 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
       // On full chunks KKT writes the whole Gram, including its zero region.
       {
         GmShape2D qkm_shape(C, C);
-        GmStride2D qkm_stride(all_full_chunks ? H * C : C);
-        auto* gram = all_full_chunks ? Mask_handle + token_head * C
-                                     : workspace_handle + ws_base + WS_QK;
+        const bool direct_gram = all_full_chunks && !UseLog2Gate;
+        GmStride2D qkm_stride(direct_gram ? H * C : C);
+        auto* gram = direct_gram ? Mask_handle + token_head * C
+                                 : workspace_handle + ws_base + WS_QK;
         GmTensor2D<float> qkm_global(gram, qkm_shape, qkm_stride);
         DynMatL1<float, C, C> qkm_l1_load(C, C);
         TASSIGN(qkm_l1_load, (C * K_DIM + C * K_DIM + KV) * sizeof(float));
@@ -516,12 +518,24 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
       // ── (A.2) q_eff = Q * exp(g_cs) ──────────────────────────────────
       // exp(g_cs) ≤ 1 (g_cs ≤ 0) so q_eff is bounded; kept fp32 to match the
       // fp32 GEMM (k_eff below overflows fp16).
-      TEXP(exp_ub, g_ub);
+      if constexpr (UseLog2Gate) {
+        main_gate_exp(exp_ub, g_ub);
+      } else {
+        exp_gate<false>(exp_ub, g_ub);
+      }
       PipeBarrierVec();
       // q_eff into exp_ub (SLOT_C) so q_ub (SLOT_B) keeps the raw scaled Q,
       // which the Aqk element-wise pass below needs as its row factor.
       TMUL(exp_ub, q_ub, exp_ub);
       PipeBarrierVec();
+      if constexpr (UseLog2Gate) {
+        TileUbDataND<bfloat16_t, HalfC, K_DIM, HalfC, K_DIM> typed;
+        TASSIGN(typed, SLOT_D_ADDR);
+        round_bf16(exp_ub, exp_ub, typed);
+        TMULS(exp_ub, exp_ub, kScale);
+        PipeBarrierVec();
+        round_bf16(exp_ub, exp_ub, typed);
+      }
 
       // Store q_eff fp32 → WS_Q (full HalfC rows; padded zeros for invalid).
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -542,7 +556,7 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
       // KKT publishes only the rectangular blocks touching the causal
       // triangle. Pad the remaining rows and columns here instead of
       // clearing the whole GM tile in the front end.
-      if (!all_full_chunks) {
+      if (!all_full_chunks || UseLog2Gate) {
         pipe_barrier(PIPE_ALL);
         TileUbDataND<float, HalfC, C, HalfC, C, PadValue::Zero> gram;
         TASSIGN(gram, SLOT_C_ADDR);
@@ -565,6 +579,13 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
           TEXPANDS(gram, 0.0f);
         }
         PipeBarrierVec();
+        if constexpr (UseLog2Gate) {
+          TileUbDataND<bfloat16_t, HalfC, C, HalfC, C> typed;
+          TASSIGN(typed, SLOT_D_ADDR);
+          TMULS(gram, gram, kScale);
+          PipeBarrierVec();
+          round_bf16(gram, gram, typed);
+        }
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         GmTensor2D<float> destination(
@@ -669,7 +690,8 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        // O = QS + QKV  (both bounded; fp32).
+        // Match the main-path FP32 Cube outputs through the final sum.
+        // Only the final attention output is rounded to BF16.
         TADD(qs_ub, qs_ub, qkv_ub);
         PipeBarrierVec();
 
@@ -679,8 +701,10 @@ AICORE void chunk_o_kda_kernel(__gm__ bfloat16_t* Q_handle,
         TASSIGN(scaled, SLOT_A_ADDR);
         DynVecTile<bfloat16_t, HalfC, V_DIM> o_store(valid_rows, V_DIM);
         TASSIGN(o_store, SLOT_B_ADDR);
-        TMULS(scaled, scaled, 0.08838834764831845f);
-        PipeBarrierVec();
+        if constexpr (!UseLog2Gate) {
+          TMULS(scaled, scaled, kScale);
+          PipeBarrierVec();
+        }
         TCVT(o_store, scaled, pto::RoundMode::CAST_RINT);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

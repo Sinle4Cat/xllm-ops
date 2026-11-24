@@ -1,9 +1,5 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
-"""Independent FP64 formula oracle and FP32 activation-stage checks.
-
-The mathematical oracle preserves explicit FP16/BF16 activation boundaries, but
-does not emulate device FP32 accumulation or reduction trees bit for bit.
-"""
+"""FP64 recurrent oracle and the Ascend910B FP32 Decode reference."""
 from typing import Any
 
 import torch
@@ -14,12 +10,14 @@ OUTPUTS = ("output", "conv_state_out", "ssm_state_out")
 NATIVE, MTP, PUBLIC_COMPAT = 0, 1, 3
 
 
-def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def reference(data: dict[str, Any], *, a5: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return independent output pools, preserving padding and discarded writes."""
     if any(x.device.type != "cpu" for x in data.values() if isinstance(x, torch.Tensor)):
         raise ValueError("the oracle must run on CPU")
     mode, capacity = data["mode"], data["max_query_tokens"]
     accepted = data["num_accepted_tokens"]
+    if a5 and mode == PUBLIC_COMPAT:
+        raise ValueError("public compatibility mode is not supported on A5")
     if not ((mode in (NATIVE, PUBLIC_COMPAT) and capacity == 1 and accepted is None) or
             (mode == MTP and 1 <= capacity <= 17 and accepted is not None)):
         raise ValueError("invalid route")
@@ -69,25 +67,29 @@ def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.T
         state = ssm_in[sr].double().clone()
         for i, token in enumerate(range(begin, end)):
             x = sequence[i:i + 4]
-            x = (x if mode == PUBLIC_COMPAT else x.half()).double()
+            narrow_conv_input = mode == MTP or (not a5 and mode == NATIVE)
+            x = (x.half() if narrow_conv_input else x).double()
             acc = torch.zeros_like(x[0]) if data["conv_bias"] is None else data["conv_bias"].double().clone()
             for tap in range(4):
                 acc = acc + x[tap] * data["conv_weight"][tap].double()
-            # All modes round Conv accumulation before SiLU, and SiLU before KDA.
-            conv = silu_bf16(round_bf16(acc).double()).double().view(3, heads, 128)
+            silu_input = acc if a5 and mode == NATIVE else round_bf16(acc).double()
+            conv = silu_bf16(silu_input).double().view(3, heads, 128)
             q, k, v = conv.unbind(0)
-            if mode == PUBLIC_COMPAT:
-                # Replacing a zero denominator before division avoids masked 0/0.
-                q_norm = torch.sqrt((q * q).sum(-1, keepdim=True))
-                k_norm = torch.sqrt((k * k).sum(-1, keepdim=True))
-                q = q / torch.where(q_norm > 0, q_norm, torch.ones_like(q_norm)) * 128 ** -0.5
-                k = k / torch.where(k_norm > 0, k_norm, torch.ones_like(k_norm))
-            else:
+            if a5:
                 q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * 128 ** -0.5
                 k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+            else:
+                q_norm = torch.sqrt((q * q).sum(-1, keepdim=True))
+                k_norm = torch.sqrt((k * k).sum(-1, keepdim=True))
+                q = q * torch.where(q_norm > 0, q_norm, 1.0).reciprocal() * 128 ** -0.5
+                k = k * torch.where(k_norm > 0, k_norm, 1.0).reciprocal()
             raw_g = data["gate"][token].double() + data["gate_bias"].double()
             decay = (-5.0 * torch.sigmoid(raw_g * data["a_log"].double().exp()[:, None])).exp()
-            beta = torch.sigmoid(data["beta"][token].float()).double()
+            raw_beta = data["beta"][token]
+            if a5:
+                beta = torch.sigmoid(raw_beta.double()).float().double()
+            else:
+                beta = torch.sigmoid(raw_beta.float()).double()
             state = state * decay[:, None, :]
             delta = (v - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = state + delta[:, :, None] * k[:, None, :]
@@ -96,6 +98,56 @@ def reference(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.T
                 ssm_out[writes[i]] = state
         if cw >= 0:
             conv_out[cw, :count + 2] = sequence[1:]
+    return out, conv_out, ssm_out
+
+
+def reference_910b(data):
+    """CPU FP32 recurrence retaining every public FP16/BF16 cast boundary."""
+    assert all(v.device.type == "cpu" for v in data.values() if isinstance(v, torch.Tensor))
+    out, conv_out, ssm_out = (data[n].clone() for n in OUTPUTS)
+    heads = data["gate"].shape[1]
+    mode = data["mode"]
+    offsets = data["cu_seqlens"].tolist()
+    for row, (begin, end) in enumerate(zip(offsets, offsets[1:])):
+        if begin == end:
+            continue
+        count = end - begin
+        accepted = int(data["num_accepted_tokens"][row]) if mode == MTP else 1
+        cr, cw = int(data["conv_read_indices"][row]), int(data["conv_write_indices"][row])
+        sr = int(data["ssm_read_indices"][row, accepted - 1])
+        if cr < 0 or sr < 0:
+            continue
+        history = data["conv_state_in"][cr, accepted - 1:accepted + 2]
+        seq = torch.cat((history, data["qkv"][begin:end]))
+        state = data["ssm_state_in"][sr].float().clone()
+        x = (seq if mode == PUBLIC_COMPAT else seq.half()).float()
+        acc = torch.zeros((count, x.shape[1]), dtype=torch.float32)
+        if data["conv_bias"] is not None:
+            acc += data["conv_bias"].float()
+        for tap in range(4):
+            acc = acc + x[tap:tap + count] * data["conv_weight"][tap].float()
+        pre_silu = acc.bfloat16().float()
+        activation = (pre_silu / (1.0 + torch.exp(-pre_silu))).bfloat16().float()
+        q, k, v = activation.reshape(count, 3, heads, 128).unbind(1)
+        qn, kn = q.square().sum(-1, keepdim=True), k.square().sum(-1, keepdim=True)
+        q_norm, k_norm = qn.sqrt(), kn.sqrt()
+        q = q * torch.where(q_norm > 0, q_norm, 1.0).reciprocal()
+        k = k * torch.where(k_norm > 0, k_norm, 1.0).reciprocal()
+        q = q * 128 ** -0.5
+        g = (data["gate"][begin:end].float() + data["gate_bias"].float()) * data["a_log"].float().exp()[None, :, None]
+        decay = (-5.0 / (1.0 + torch.exp(-g))).exp()
+        beta = torch.sigmoid(data["beta"][begin:end].float())
+        for i, token in enumerate(range(begin, end)):
+            state = state * decay[i, :, None, :]
+            delta = (v[i] - (state * k[i, :, None, :]).sum(-1)) * beta[i, :, None]
+            state = state + delta[:, :, None] * k[i, :, None, :]
+            y = (state * q[i, :, None, :]).sum(-1)
+            out[token] = y.bfloat16()
+            sw = int(data["ssm_write_indices"][row, i])
+            if sw >= 0:
+                ssm_out[sw] = state
+        if cw >= 0:
+            conv_out[cw, :count + 2] = seq[1:]
     return out, conv_out, ssm_out
 
 

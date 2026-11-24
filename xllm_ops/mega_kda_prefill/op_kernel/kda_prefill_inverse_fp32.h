@@ -85,7 +85,7 @@ AICORE inline void subtract_pair_tree(__ubuf__ float* result,
 }
 #endif
 
-template <int C>
+template <int C, bool ScaleFullAkk = false>
 AICORE inline void inverse_fp32(__gm__ float* lower,
                                 __gm__ float* out,
                                 __gm__ float* identity,
@@ -93,7 +93,8 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
                                 __gm__ const int32_t* cu,
                                 int64_t batches,
                                 int64_t tokens,
-                                int32_t heads) {
+                                int32_t heads,
+                                __gm__ float* beta = nullptr) {
 #if defined(__DAV_VEC__)
   // One sub-block owns a 64-column inverse. A 128-column inverse uses
   // both sub-blocks of the same core.
@@ -144,7 +145,30 @@ AICORE inline void inverse_fp32(__gm__ float* lower,
            GS(1, 1, 1, valid, C),
            ST(heads * C));
     TLOAD(low, src);
-    SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+    if constexpr (ScaleFullAkk) {
+      if (valid == C) {
+        // Cube publishes the unscaled FP32 dot products for full chunks.
+        // Apply the same row beta as the vector path before solving.
+        static_assert(C == 64);
+        constexpr int kBetaAddr = 180224 + C * 8 * sizeof(float);
+        Vec<1, C> row_beta;
+        Vec<C, 8> beta_broadcast;
+        Tile<TileType::Vec, float, C, 1, BLayout::ColMajor> beta_column;
+        TASSIGN(row_beta, kBetaAddr);
+        TASSIGN(beta_column, kBetaAddr);
+        TASSIGN(beta_broadcast, 180224);
+        GM weights(beta + int64_t(head) * tokens + start,
+                   GS(1, 1, 1, 1, C), ST(C));
+        TLOAD(row_beta, weights);
+        SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+        TROWEXPANDMUL(low, low, beta_column, beta_broadcast);
+        PipeBarrierVec();
+      } else {
+        SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+      }
+    } else {
+      SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+    }
     TMOV(x, eye);
     PipeBarrierVec();
     // X[i,:] = I[i,:] - sum_{j<i} L[i,j] X[j,:]. Each AIV owns its RHS.

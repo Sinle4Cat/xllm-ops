@@ -1,11 +1,14 @@
 # MegaKdaDecode
 
-Ascend910B and Ascend950 (A5) select separate kernels. The 910B backend retains the current FP32 reduction and state publication implementation. A5 supports native mode=0 and MTP mode=1. Public compatibility mode=3 remains 910B-only and is rejected by host tiling on A5.
+English | [简体中文](../zh/mega_kda_decode.md)
 
+This operator fuses GLM-5.3-Flash vector KDA Conv and recurrent decode.
+Ascend910B supports ordinary decode (mode 0), MTP verify (mode 1) and public
+compatibility (mode 3). Ascend950 (A5) supports modes 0 and 1. The platform
+selects its own kernel. The operator follows the `mega_gdn_prefill_op`
+conventions for OpDef, shape inference, Host tiling, the PTO Device entry,
+CMake and ACLNN.
 
-Experimental GLM-5.3-Flash vector KDA Conv + recurrent decode operator for
-Ascend 910B. It follows `mega_gdn_prefill_op`'s OpDef, separate shape inference,
-Host tiling, PTO Device entry, CMake discovery and generated ACLNN integration.
 The GLM model has an environment-gated integration through
 `KdaLinearAttentionMixin`; the default remains the `fla_npu` composition.
 `XLLM_KDA_KERNEL=mega_kda` selects supported native prefill/ordinary decode and MTP verify.
@@ -13,9 +16,9 @@ Unsupported routes are selected before computation; execution errors propagate.
 Operator validation does not establish model accuracy or performance acceptance.
 
 For non-MTP engines, `XLLM_KDA_PREFILL_BACKEND=fla` retains FLA prefill while
-using native ordinary decode. With this configuration,
-`XLLM_KDA_DECODE_NORM=public` selects full public compatibility (mode 3); the
-legacy environment name is retained, although it controls more than normalization.
+using native ordinary decode. On Ascend910B with this configuration,
+`XLLM_KDA_DECODE_NORM=public` selects full public compatibility (mode 3).
+The legacy option controls Conv input conversion and gate evaluation.
 `native` remains the default value and selects mode 0. The FLA-prefill compatibility
 configuration requires `XLLM_KDA_KERNEL=mega_kda` and verify width 1. Public
 compatibility requires that explicit FLA-prefill configuration. The MTP mode=1
@@ -31,9 +34,9 @@ There is one global Device entry, `mega_kda_decode`:
 
 | mode | tilingKey | Semantics |
 | --- | --- | --- |
-| 0 | 1 | Dense ordinary decode, one token per request |
+| 0 | 1 | Ordinary decode, one token per request |
 | 1 | 2 | MTP verify, restore accepted checkpoint, publish every query checkpoint |
-| 3 | 3 | Public compatibility ordinary decode, one token per request |
+| 3 | 3 | Ascend910B public compatibility decode, one token per request |
 
 A one-token MTP call still uses key 2. Host selects the key from the explicit
 mode and static capacity, not from accepted-count values. Token offsets,
@@ -98,12 +101,10 @@ Callers must honor each operator's contract when switching between phases.
 - MTP accepted counts are in `[1,M]`, using the upstream convention: initial
   SSM comes from `ssm_read_indices[b, accepted-1]`; Conv starts at history offset
   `accepted-1`. The scheduler must provide valid previous checkpoints/history.
-- Width-four Conv accumulates in FP32, rounds the accumulation to BF16 before
-  SiLU, then rounds SiLU to BF16 before recurrence. Beta sigmoid and its result
-  stay in FP32 through recurrence. Q scale is `128**-0.5`; state is FP32 `[V,K]`.
-  Decay is mathematically `exp(-5 * sigmoid(exp(a_log) * (gate + gate_bias)))`.
-  This is KDA vector decay, not GDN scalar decay. The mode differences below
-  are floating-point contracts, including operation order.
+- Both platforms store SSM in FP32 `[V,K]`. The scale on Q is `128**-0.5`.
+  Beta sigmoid and its result in the recurrence are FP32. Vector decay is
+  mathematically `exp(-5 * sigmoid(exp(a_log) * (gate + gate_bias)))`.
+  The table below gives the numerical boundaries for each platform and mode.
 - For a query of length Q, Conv writes `[old[accepted:accepted+2], raw_qkv]`
   into the first `Q+2` positions. The remaining capacity tail is untouched.
   SSM publishes the state after each query token into its own write slot.
@@ -119,39 +120,58 @@ Callers must honor each operator's contract when switching between phases.
   state slots and Conv tails are not initialized by the kernel. Preservation
   through the actual ACLNN/Graph call remains a required native test.
 
-| Numerical stage | Native/MTP (modes 0/1) | Public compatibility (mode 3) |
+Width-four Conv accumulates and applies SiLU in FP32. Every path rounds the
+SiLU result to BF16 before recurrence.
+
+| Platform and mode | Conv input and history | Accumulator before SiLU |
 | --- | --- | --- |
-| Conv input/history | BF16→FP16→FP32 narrowing | BF16→FP32 directly |
-| Q/K normalization | `sqrt(sum(x*x)+1e-6)` | No epsilon; zero vectors remain zero, without `0/0` |
-| Gate | Divide `-5` by the sigmoid denominator | Compute sigmoid as a reciprocal, then multiply by `-5` |
-| 64-row recurrence reduction | One 64-row group | Two independent 32-row groups |
+| Ascend910B modes 0 and 1 | BF16 → FP16 → FP32 | Round to BF16 and convert back to FP32 |
+| Ascend910B mode 3 | BF16 → FP32 | Round to BF16 and convert back to FP32 |
+| Ascend950 mode 0 | BF16 → FP32 | Keep FP32 |
+| Ascend950 mode 1 | BF16 → FP16 → FP32 | Round to BF16 and convert back to FP32 |
 
-The FP16 omission permits finite BF16 inputs outside the FP16 range. No epsilon
-changes the treatment of very small nonzero vectors as well as exact zeros.
-These four differences are selected together by mode 3/key 3; they are not four
-independent switches. Shared BF16 Conv and SiLU boundaries still apply.
+Ascend910B modes 0, 1 and 3 compute the FP32 row norm `sqrt(sum(x*x))`.
+A positive norm supplies the reciprocal multiplier. A zero norm leaves the
+row unchanged before the Q scale. Ascend950 modes 0 and 1 use the r003
+normalization, dividing by `sqrt(sum(x*x) + 1e-6)` in FP32 before scaling Q.
 
-The Device uses only AIV and zero user workspace. Each task owns 32 or 64 V
-rows and processes a request serially, with 62,368 or 120,032bytes of explicitly
+Modes 0 and 1 evaluate the gate by dividing `-5` by the sigmoid denominator.
+Ascend910B mode 3 computes the reciprocal first, then multiplies by `-5`.
+With a 64-V-row task on Ascend910B, ordinary modes 0 and 3 reduce in two
+32-row groups and MTP mode 1 uses one 64-row group. The direct BF16-to-FP32
+conversion in mode 3 supports finite BF16 Conv inputs beyond the FP16 range.
+
+The Ascend910B device path uses AIV and zero user workspace. Each task
+owns 32 or 64 V rows and processes a request serially, with 62,368 or 120,032bytes of explicitly
 assigned UB respectively. The 64-row variant is selected when its total shard
 count, `2 * B * H`, covers every launched AIV block; smaller workloads keep the
 32-row variant. Wider tiles halve duplicated Conv/Q/K/gate work per request/head.
 Only the first V shard writes Conv state, and state input/output ownership remains
 unchanged. FP32 reduction grouping can differ between variants, so numerical
-equivalence uses the same Golden tolerances; fixed-input Graph replay remains
-byte-identical within each variant. This does not imply a speedup for every batch,
+equivalence uses the same reference tolerances. Fixed-input graph replay
+checks byte equality within each variant. This does not imply a speedup for every batch,
 head count, active-row distribution or MTP capacity.
 
 ## Build And Test
 
-```bash
-# From the xllm-ops checkout, after sourcing CANN:
-bash build.sh --op-name mega_kda_decode
+After sourcing the target device's CANN environment, package the KDA operators
+from the checkout and install them in a private OPP. Set `SOC=ascend950` for A5.
+The exports select this package for the current shell. Build the Python test
+extension against the same Torch and CANN environment.
 
-# Isolated package build, avoiding existing output directories:
-bash xllm_ops/build.sh --pkg --ops=mega_kda_decode --soc=ascend910b -j4 \
+```bash
+BUILD_ROOT=$(mktemp -d)
+SOC=ascend910b
+bash xllm_ops/build.sh --pkg --ops=mega_kda_prefill,mega_kda_decode --soc="$SOC" -j4 \
   --build-dir="$BUILD_ROOT/build" --output-dir="$BUILD_ROOT/output" \
   --build-out-dir="$BUILD_ROOT/build_out"
+
+OPP_ROOT="$BUILD_ROOT/opp"
+mkdir -p "$OPP_ROOT"
+bash "$BUILD_ROOT"/build/cann-ops-xllm-custom_linux-*.run --install-path="$OPP_ROOT"
+KDA_VENDOR="$OPP_ROOT/vendors/custom_xllm_math"
+export ASCEND_CUSTOM_OPP_PATH="$KDA_VENDOR"
+export LD_LIBRARY_PATH="$KDA_VENDOR/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # CPU-only contract and Host policy checks:
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 python -m pytest -q \
@@ -161,29 +181,32 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 python -m pytest -q \
 MEGA_KDA_TEST_NPU=0 python -m pytest -q test/python_test/test_mega_kda_decode.py
 ```
 
-The native tests are opt-in so CPU collection does not initialize an NPU or
-consume a busy device. They include fixed20 byte-identical Graph replay, independent
-CPU/NPU state carry20, changed-metadata Graph replay, padding, different pool
-capacities, accepted-prefix restoration and alias rejection. Conv copies and
-untouched values require byte equality, including signed zero. The independent
-CPU oracle accumulates Conv, normalization, gate and recurrence in FP64, retaining
-the mode-specific FP16 boundary and common BF16 Conv and SiLU boundaries.
-It evaluates beta sigmoid in FP32. Independent FP32 stage checks cover
-reciprocal-then-multiply gate order, FP32 beta, zero/near-zero norms
-and finite BF16 inputs above the FP16 range. Shape/dtype mismatch
-or nonfinite outputs, golden values or derived errors fail closed.
-Normal relative errors and near-zero absolute errors (split at `1e-3`) and their
-exceeding fractions are reported as diagnostics. The existing pointwise smoke
-gate is unchanged: output
-`rtol=1e-2, atol=1e-3`, and FP32 state `rtol=1e-3, atol=1e-4`.
-These smoke thresholds are not a formal model-accuracy or Triton-equivalence
-acceptance report. Fresh native-versus-frozen-Triton validation and baseline
-warmup-convergence qualification are still required before performance claims.
+The native tests are opt-in through `MEGA_KDA_TEST_NPU`. They exercise fixed20
+byte-identical graph replay, independent CPU/NPU state carry20, changed-metadata
+graph replay, padding, independent pool capacities, accepted-prefix restoration
+and alias rejection. The tests require matching shapes and dtypes, finite
+values, byte-identical Conv copies and byte-identical untouched slots.
+
+The harness uses `reference_910b(data)` on Ascend910B, an independent CPU FP32
+recurrence with the mode-specific cast boundaries. On Ascend950 it uses
+`reference(data, a5=True)`, the r003 CPU reference with FP64 recurrence and the
+A5 Conv and normalization behavior. The pointwise thresholds are
+`rtol=1e-2, atol=1e-3` for attention and `rtol=1e-3, atol=1e-4` for FP32 state.
+The report also splits normal relative errors and near-zero absolute errors
+at `abs(golden)=1e-3`. Byte comparisons distinguish positive and negative
+zero. Independent stage tests exercise gate operation order, FP32 beta,
+zero rows and finite BF16 inputs above the FP16 range on supported paths.
+
+The shared KDA pytest collection contains 805 nodes, of which 523 belong to
+the Decode module. Ascend950 skips native positive mode 3 cases. The binding
+tests for invalid mode 3 accepted counts and capacity still run on Ascend950.
+The retained A5 SiLU midpoint test covers mode 1.
 
 The explicit TP matrix maps GLM's 64 KDA heads to local H=64/32/16/8/4/2/1
 for TP1/2/4/8/16/32/64. Every size covers ordinary decode and every integer
-MTP query capacity from 1 through 17 (model MTP1 through MTP16), plus mode 3,
-with CPU oracle checks, dense fixed20 Graph replay, changed-metadata replay20
+MTP query capacity from 1 through 17 (model MTP1 through MTP16). Ascend910B
+also covers mode 3. The matrix includes CPU oracle checks, dense fixed20
+graph replay, changed-metadata replay20
 and independent state carry20. Existing batch/ragged/padding cases remain.
 Host policy checks also cover all seven head counts. Select these cases with
 `pytest -k tp`, or a single size with `-k tp8`. They execute one rank's shape
@@ -195,9 +218,7 @@ B=5 and H=3 use the general path. To qualify both V-row variants, set
 and run `-k public_compat_row_dispatch`; it records launched blocks and derives
 the selected 32/64 rows from that count. Shapes alone do not prove this coverage.
 
-Only Ascend 910B is registered. No A3/A5 support or speedup is claimed.
-
-For local H=8 and batch B<=4, the kernel batches Q/K/V Conv preprocessing.
+On Ascend910B, local H=8 and batch B<=4 select batched Q/K/V Conv preprocessing.
 Ordinary one-token decode also batches the four-tap input/weight loads and raw
 Conv-state publication. The 32/64-row state task map and floating-point
 conversion boundaries remain unchanged. Explicit UB is 83,872/141,536bytes

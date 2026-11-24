@@ -334,7 +334,37 @@ AICORE PTO_INLINE void gemm_v0(
 
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+AICORE inline void round_wu(__gm__ float* w, __gm__ float* u,
+                            int64_t tokens, int32_t heads) {
+#if defined(__DAV_VEC__)
+  constexpr int32_t kTile = 1024;
+  const int32_t core = get_block_idx() * 2 + get_subblockid();
+  const int32_t cores = get_block_num() * 2;
+  const int64_t count = tokens * heads * 128;
+  for (int64_t start = int64_t(core) * kTile; start < count;
+       start += int64_t(cores) * kTile) {
+    const int32_t n = count - start < kTile ? count - start : kTile;
+    GmTensor2D<float> w_gm(w + start, GmShape2D(1, n), GmStride2D(kTile));
+    GmTensor2D<float> u_gm(u + start, GmShape2D(1, n), GmStride2D(kTile));
+    DynVecTile<float, 1, kTile> w_tile(1, n), u_tile(1, n);
+    DynVecTile<bfloat16_t, 1, kTile> typed(1, n);
+    TASSIGN(w_tile, 0);
+    TASSIGN(u_tile, kTile * sizeof(float));
+    TASSIGN(typed, 2 * kTile * sizeof(float));
+    TLOAD(w_tile, w_gm);
+    TLOAD(u_tile, u_gm);
+    SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+    round_bf16(w_tile, w_tile, typed);
+    round_bf16(u_tile, u_tile, typed);
+    SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
+    TSTORE(w_gm, w_tile);
+    TSTORE(u_gm, u_tile);
+    SetWaitFlag<PIPE_MTE3, PIPE_MTE2>(0);
+  }
+#endif
+}
+
+template <int32_t HiddenSize, int32_t ChunkSize, bool UseLog2Gate>
 AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
                           __gm__ float* V_handle,
                           __gm__ float* Beta_handle,
@@ -385,8 +415,11 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
   constexpr int32_t GcsUbAddr = KUbAddr + HalfChunk * HiddenSize * 4;
   constexpr int32_t KeffUbAddr = GcsUbAddr + HalfChunk * HiddenSize * 4;
   constexpr int32_t KeffHalfUbAddr = KeffUbAddr + HalfChunk * HiddenSize * 4;
+  constexpr int32_t VRoundUbAddr = KeffHalfUbAddr + HalfChunk * HiddenSize * sizeof(bfloat16_t);
+  constexpr int32_t SeedBetaUbAddr = VRoundUbAddr + HalfChunk * HiddenSize * sizeof(bfloat16_t);
 
   // Workspace element counts (FP32).
+  using Operand = std::conditional_t<UseLog2Gate, bfloat16_t, float>;
   constexpr int32_t WsA2Size = ChunkSize * ChunkSize;
   constexpr int32_t WsKeffSize = ChunkSize * HiddenSize;
 
@@ -436,11 +469,11 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
 
   // ── L1 tiles (Cube only) ──────────────────────────────────────────────────
   // FP32: v_l1 at 0, keff_l1 at 64 KiB, a2_w_l1 at 128 KiB.
-  TileMatL1<float, ChunkSize, HiddenSize, ChunkSize, HiddenSize> v_l1;
+  TileMatL1<Operand, ChunkSize, HiddenSize, ChunkSize, HiddenSize> v_l1;
   TASSIGN(v_l1, 0);
-  TileMatL1<float, ChunkSize, HiddenSize, ChunkSize, HiddenSize> keff_l1;
+  TileMatL1<Operand, ChunkSize, HiddenSize, ChunkSize, HiddenSize> keff_l1;
   TASSIGN(keff_l1, 65536);
-  TileMatL1<float, ChunkSize, ChunkSize, ChunkSize, ChunkSize> a2_w_l1;
+  TileMatL1<Operand, ChunkSize, ChunkSize, ChunkSize, ChunkSize> a2_w_l1;
   TASSIGN(a2_w_l1, 131072);
   TileAcc<float, ChunkSize, HiddenSize, ChunkSize, HiddenSize> u_l0;
   TASSIGN(u_l0, 0);
@@ -536,10 +569,22 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             if (local_rows > 0) {
-              TMOV(beta_r_ub, beta_ub);
-              PipeBarrierVec();
-              TCOLEXPAND(beta_2d_ub, beta_r_ub);
-              TMUL(a2_ub, inv_ub, beta_2d_ub);
+              if constexpr (!UseLog2Gate) {
+                TMOV(beta_r_ub, beta_ub);
+                PipeBarrierVec();
+                TCOLEXPAND(beta_2d_ub, beta_r_ub);
+                TMUL(a2_ub, inv_ub, beta_2d_ub);
+              }
+            }
+            TileUbDataND<bfloat16_t, HalfChunk, ChunkSize, HalfChunk, ChunkSize>
+                inverse_bf16;
+            if constexpr (UseLog2Gate) {
+              TASSIGN(inverse_bf16, A2UbAddr);
+              if (local_rows > 0) {
+                TCVT(inverse_bf16, inv_ub, pto::RoundMode::CAST_RINT);
+              } else {
+                TEXPANDS(inverse_bf16, bfloat16_t(0.0f));
+              }
             }
 
             // Keep A2's FP32 product for both GEMMs.
@@ -560,12 +605,16 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
             {
               GmShape2D a2_shape(HalfChunk, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<float> workspace_a2_w_global(
-                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size +
+              GmTensor2D<Operand> workspace_a2_w_global(
+                  reinterpret_cast<__gm__ Operand*>(workspace_a2_handle) +
+                      static_cast<int64_t>(cid) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
-                  a2_shape,
-                  a2_stride);
-              TSTORE(workspace_a2_w_global, a2_ub);
+                  a2_shape, a2_stride);
+              if constexpr (UseLog2Gate) {
+                TSTORE(workspace_a2_w_global, inverse_bf16);
+              } else {
+                TSTORE(workspace_a2_w_global, a2_ub);
+              }
             }
             pipe_barrier(PIPE_ALL);
             // Signal Cube: ws_a2 ready (flag 10)
@@ -642,12 +691,73 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
               }
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-              TEXP(gcs_ub, gcs_ub);
+              if constexpr (UseLog2Gate) {
+                main_gate_exp(gcs_ub, gcs_ub);
+              } else {
+                exp_gate<false>(gcs_ub, gcs_ub);
+              }
               PipeBarrierVec();
               TMUL(keff_ub, k_ub, gcs_ub);
               PipeBarrierVec();
             } else {
               TEXPANDS(keff_ub, 0.0f);
+              PipeBarrierVec();
+            }
+
+            TileUbDataND<bfloat16_t, HalfChunk, HiddenSize, HalfChunk, HiddenSize> w_seed, v_seed;
+            if constexpr (UseLog2Gate) {
+              static_assert(ChunkSize == 64 && HiddenSize == 128);
+              TASSIGN(w_seed, KeffHalfUbAddr);
+              TASSIGN(v_seed, VRoundUbAddr);
+              if (local_rows > 0) {
+                // The main path rounds gated K before beta. V is already
+                // BF16 when beta is applied. Both seeds are BF16 MMAD inputs.
+                TCVT(w_seed, keff_ub, pto::RoundMode::CAST_RINT);
+                PipeBarrierVec();
+                TCVT(keff_ub, w_seed, pto::RoundMode::CAST_NONE);
+                PipeBarrierVec();
+                DynVecTile<float, HalfChunk, HiddenSize, pto::PadValue::Zero>
+                    v_load(local_rows, HiddenSize);
+                TASSIGN(v_load, KUbAddr);
+                const int64_t start = chunk_token_start + static_cast<int64_t>(vid) * HalfChunk;
+                GmTensor2D<float> value(
+                    V_handle + (start * H + head_idx) * HiddenSize,
+                    GmShape2D(local_rows, HiddenSize), GmStride2D(BSND_STRIDE));
+                TileUbDataND<float, 1, ChunkSize, 1, ChunkSize, pto::PadValue::Zero>
+                    seed_beta;
+                TASSIGN(seed_beta, SeedBetaUbAddr);
+                DynVecTile<float, 1, ChunkSize, pto::PadValue::Zero>
+                    seed_beta_load(1, valid_rows);
+                TASSIGN(seed_beta_load, SeedBetaUbAddr);
+                GmTensor2D<float> beta_src(
+                    Beta_handle + int64_t(head_idx) * total_tokens + chunk_token_start,
+                    GmShape2D(1, valid_rows), GmStride2D(1));
+                set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                TLOAD(v_load, value);
+                TLOAD(seed_beta_load, beta_src);
+                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                if (local_rows < HalfChunk) {
+                  TFILLPAD_INPLACE(k_ub, v_load);
+                }
+                set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                for (int row = 0; row < local_rows; ++row) {
+                  TileUbDataND<float, 1, HiddenSize, 1, HiddenSize> w_row, v_row;
+                  TASSIGN(w_row, KeffUbAddr + row * HiddenSize * sizeof(float));
+                  TASSIGN(v_row, KUbAddr + row * HiddenSize * sizeof(float));
+                  const float b = seed_beta.data()[static_cast<int>(vid) * HalfChunk + row];
+                  TMULS(w_row, w_row, b);
+                  TMULS(v_row, v_row, b);
+                }
+                PipeBarrierVec();
+                TCVT(w_seed, keff_ub, pto::RoundMode::CAST_RINT);
+                TCVT(v_seed, k_ub, pto::RoundMode::CAST_RINT);
+              } else {
+                TEXPANDS(w_seed, bfloat16_t(0.0f));
+                TEXPANDS(v_seed, bfloat16_t(0.0f));
+              }
               PipeBarrierVec();
             }
 
@@ -665,13 +775,22 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
             {
               GmShape2D keff_shape(HalfChunk, HiddenSize);
               GmStride2D keff_stride(HiddenSize);
-              GmTensor2D<float> workspace_keff_global(
-                  workspace_keff_handle +
-                      static_cast<int64_t>(cid) * WsKeffSize +
-                      static_cast<int64_t>(vid) * HalfChunk * HiddenSize,
-                  keff_shape,
-                  keff_stride);
-              TSTORE(workspace_keff_global, keff_ub);
+              if constexpr (UseLog2Gate) {
+                auto* seeds = reinterpret_cast<__gm__ bfloat16_t*>(workspace_keff_handle) +
+                              (2 * static_cast<int64_t>(cid) * WsKeffSize) +
+                              static_cast<int64_t>(vid) * HalfChunk * HiddenSize;
+                GmTensor2D<bfloat16_t> w_global(seeds, keff_shape, keff_stride);
+                GmTensor2D<bfloat16_t> v_global(seeds + WsKeffSize, keff_shape, keff_stride);
+                TSTORE(w_global, w_seed);
+                TSTORE(v_global, v_seed);
+              } else {
+                GmTensor2D<float> workspace_keff_global(
+                    workspace_keff_handle +
+                        static_cast<int64_t>(cid) * WsKeffSize +
+                        static_cast<int64_t>(vid) * HalfChunk * HiddenSize,
+                    keff_shape, keff_stride);
+                TSTORE(workspace_keff_global, keff_ub);
+              }
             }
             pipe_barrier(PIPE_ALL);
             // Signal Cube: ws_keff ready (flag 11)
@@ -730,7 +849,7 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
                              static_cast<int64_t>(head_idx)) *
                             static_cast<int64_t>(HiddenSize);
 
-            {
+            if constexpr (!UseLog2Gate) {
               GmShape2D v_shape(valid_rows, HiddenSize);
               GmStride2D v_stride(BSND_STRIDE);
               GmTensor2D<float> v_global(V_handle + v_off, v_shape, v_stride);
@@ -754,16 +873,27 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
-              GmTensor2D<float> workspace_a2_w_global(
-                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size,
-                  a2_shape,
-                  a2_stride);
+              GmTensor2D<Operand> workspace_a2_w_global(
+                  reinterpret_cast<__gm__ Operand*>(workspace_a2_handle) +
+                      static_cast<int64_t>(cid) * WsA2Size,
+                  a2_shape, a2_stride);
               TLOAD(a2_w_l1, workspace_a2_w_global);
+            }
+            if constexpr (UseLog2Gate) {
+              wait_flag_dev(kKeffReady);
+              auto* seeds = reinterpret_cast<__gm__ bfloat16_t*>(workspace_keff_handle) +
+                            2 * static_cast<int64_t>(cid) * WsKeffSize;
+              const GmShape2D shape(ChunkSize, HiddenSize);
+              const GmStride2D stride(HiddenSize);
+              GmTensor2D<bfloat16_t> w_global(seeds, shape, stride);
+              GmTensor2D<bfloat16_t> v_global(seeds + WsKeffSize, shape, stride);
+              TLOAD(v_l1, v_global);
+              TLOAD(keff_l1, w_global);
             }
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            gemm_v0<float,
+            gemm_v0<Operand,
                     float,
                     ChunkSize,
                     HiddenSize,
@@ -792,6 +922,7 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
             SignalBothVecOnA5<PIPE_FIX>(kA2Free);
 #endif
 
+            if constexpr (!UseLog2Gate) {
             // Cube waits Vec: ws_keff ready (flag 11).
             // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
 #if __CCE_AICORE__ == 220
@@ -810,10 +941,11 @@ AICORE void wy_kda_kernel(__gm__ bfloat16_t* K_handle,
                   keff_stride);
               TLOAD(keff_l1, workspace_keff_global);
             }
+            }
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            gemm_v0<float,
+            gemm_v0<Operand,
                     float,
                     ChunkSize,
                     HiddenSize,

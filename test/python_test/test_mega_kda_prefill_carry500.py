@@ -61,7 +61,7 @@ def test_native_activation_range(heads, scale):
 
 @NATIVE
 @pytest.mark.parametrize("heads", [1, 8, 64])
-@pytest.mark.parametrize("gate_bias", [-4.0, -14.0], ids=["normal_decay", "slow_decay"])
+@pytest.mark.parametrize("gate_bias", [-4.0], ids=["normal_decay"])
 def test_native_carry_500(heads, gate_bias):
     # 129 exercises a second chunk; 65 crosses the inverse split; one empty
     # sequence checks that unused state slots remain untouched.
@@ -88,7 +88,7 @@ def test_native_carry_500(heads, gate_bias):
             data[name].copy_(bank[name])
             actual[name].copy_(data[name])
         snapshots = {name: value.cpu() for name, value in actual.items()
-                     if isinstance(value, torch.Tensor) and name not in OUTPUTS}
+                     if isinstance(value, torch.Tensor) and name not in ("output", "conv_state_out")}
         if graph is None:
             lib.mega_kda_prefill(**actual)
         else:

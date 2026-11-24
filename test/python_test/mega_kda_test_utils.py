@@ -10,6 +10,15 @@ GLM_KDA_HEADS = 64
 TP_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 
+def is_a5_device(device):
+    name = torch.npu.get_device_name(device.index).lower()
+    if name.startswith(("ascend950", "ascend910_95")):
+        return True
+    if name.startswith("ascend910b"):
+        return False
+    raise ValueError(f"No KDA accuracy reference for {name}")
+
+
 def round_bf16(value):
     """Round FP64 directly to the BF16 grid, avoiding CPU double rounding."""
     if value.dtype != torch.float64:
@@ -28,6 +37,15 @@ def bitwise_equal(actual, expected):
     return (actual.shape == expected.shape and actual.dtype == expected.dtype
             and torch.equal(actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
                             expected.detach().cpu().contiguous().reshape(-1).view(torch.uint8)))
+
+
+def checked_written_rows(actual, expected, before, written, name):
+    """Verify preserved rows byte for byte and return the rows subject to arithmetic checks."""
+    if written.all():
+        return actual, expected
+    untouched = ~written
+    assert bitwise_equal(actual[untouched], before[untouched]), f"{name}: modified an unwritten row"
+    return actual[written], expected[written]
 
 
 def error_metrics(actual, expected, *, near=0.01, relative=0.01, absolute=0.0005):

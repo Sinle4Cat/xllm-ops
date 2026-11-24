@@ -18,6 +18,7 @@ limitations under the License.
 #include <pto/pto-inst.hpp>
 
 #include "kda_kernel_utils.h"
+#include "kda_prefill_chunk_o.h"
 
 namespace mega_kda_prefill_kkt_rows {
 using namespace pto;
@@ -55,7 +56,22 @@ AICORE inline void sum_pair64(__ubuf__ float* dst,
 }
 #endif
 
-template <int C>
+// Match the main-path score operands on 910B. The two BF16 casts are
+// performed independently on q/k and on the transposed key before the dot.
+template <typename Tile>
+AICORE inline void score_exp2(Tile& value) {
+  constexpr float kLn2 = 0.6931471805599453f;
+  TMULS(value, value, kLn2);
+  PipeBarrierVec();
+  TMINS(value, value, 120.0f * kLn2);
+  PipeBarrierVec();
+  TMAXS(value, value, -126.0f * kLn2);
+  PipeBarrierVec();
+  TEXP(value, value);
+  PipeBarrierVec();
+}
+
+template <int C, bool UseLog2Gate>
 AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
                                    __gm__ float* gates,
                                    __gm__ float* beta,
@@ -66,7 +82,9 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
                                    int64_t batches,
                                    int64_t length,
                                    int64_t tokens,
-                                   int32_t heads) {
+                                   int32_t heads,
+                                   __gm__ bfloat16_t* akk_left,
+                                   __gm__ bfloat16_t* akk_right) {
 #if defined(__DAV_VEC__)
   constexpr int D = 128;
   constexpr int N = 64;
@@ -76,6 +94,8 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
   constexpr int kRowQueryBf16 = 159744;
   constexpr int kRowKey = 163840;
   constexpr int kRowQuery = 172032;
+  constexpr int kReferenceGate = 180224;
+  constexpr int kNegReferenceGate = kReferenceGate + D * sizeof(float);
   const int core = get_block_idx();
   const int cores = get_block_num();
   const int vid = get_subblockid();
@@ -111,12 +131,28 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
     }
     int64_t first = bos + chunk * C;
     int64_t hbase = int64_t(head) * tokens * D + first * D;
+    const bool cube_akk = UseLog2Gate && valid == C;
+    const int64_t right_base = 2 * hbase + row_group * C * D;
     ND<float, 1, C, 1, DYNAMIC> beta_f(valid);
     TASSIGN(beta_f, 189440);
     GM<float> beta_gm(
         beta + int64_t(head) * tokens + first, GS(1, 1, 1, 1, valid), ST(C));
     TLOAD(beta_f, beta_gm);
     SetWaitFlag<PIPE_MTE2, PIPE_S>(0);
+    ND<float, 1, D> ref, neg_ref;
+    if constexpr (UseLog2Gate) {
+      static_assert(C == 64 && ROWS == 32);
+      const int band_start = row_group * ROWS;
+      const int band_rows = valid - band_start < ROWS ? valid - band_start : ROWS;
+      TASSIGN(ref, kReferenceGate);
+      TASSIGN(neg_ref, kNegReferenceGate);
+      GM<float> reference(gates + hbase + (band_start + band_rows / 2) * D,
+                          GS(1, 1, 1, 1, D), ST(D));
+      TLOAD(ref, reference);
+      SetWaitFlag<PIPE_MTE2, PIPE_V>(0);
+      TMULS(neg_ref, ref, -1.0f);
+      PipeBarrierVec();
+    }
     for (int col0 = 0; col0 < valid && col0 < (row_group + 1) * ROWS;
          col0 += N) {
       int block_n = valid - col0 < N ? valid - col0 : N;
@@ -136,6 +172,24 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
       TCVT(columns_k, columns_kh, RoundMode::CAST_NONE);
       TMULS(columns_g, columns_g, -1.0f);
       PipeBarrierVec();
+      if constexpr (UseLog2Gate) {
+        TCOLEXPANDADD(columns_g, columns_g, ref);
+        PipeBarrierVec();
+        score_exp2(columns_g);
+        TMUL(columns_k, columns_k, columns_g);
+        PipeBarrierVec();
+        TCVT(columns_kh, columns_k, RoundMode::CAST_RINT);
+        PipeBarrierVec();
+        if (cube_akk && vid == 0) {
+          GM<bfloat16_t> right(akk_right + right_base,
+                               GS(1, 1, 1, load_n, D), ST(D));
+          SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
+          TSTORE(right, columns_kh);
+          SetWaitFlag<PIPE_MTE3, PIPE_V>(0);
+        }
+        TCVT(columns_k, columns_kh, RoundMode::CAST_NONE);
+        PipeBarrierVec();
+      }
       for (int row0 = row_group * ROWS;
            row0 < valid && row0 < (row_group + 1) * ROWS;
            row0 += ROWS) {
@@ -168,6 +222,27 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
         TCVT(row_k, row_kh, RoundMode::CAST_NONE);
         TCVT(row_q, row_qh, RoundMode::CAST_NONE);
         PipeBarrierVec();
+        if constexpr (UseLog2Gate) {
+          TCOLEXPANDADD(row_g, row_g, neg_ref);
+          PipeBarrierVec();
+          score_exp2(row_g);
+          TMUL(row_q, row_q, row_g);
+          TMUL(row_k, row_k, row_g);
+          PipeBarrierVec();
+          TCVT(row_qh, row_q, RoundMode::CAST_RINT);
+          TCVT(row_kh, row_k, RoundMode::CAST_RINT);
+          PipeBarrierVec();
+          if (cube_akk) {
+            GM<bfloat16_t> left(akk_left + row_base, row_shape, row_stride);
+            SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
+            TSTORE(left, row_kh);
+            SetWaitFlag<PIPE_MTE3, PIPE_V>(0);
+          } else {
+            TCVT(row_k, row_kh, RoundMode::CAST_NONE);
+          }
+          TCVT(row_q, row_qh, RoundMode::CAST_NONE);
+          PipeBarrierVec();
+        }
         for (int local = 0; local < owned_rows; ++local) {
           int r = row0 + vid + 2 * local;
           int n = r - col0 + 1 < block_n ? r - col0 + 1 : block_n;
@@ -188,30 +263,44 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
           TASSIGN(cached_aqk, kRowGate + local * D * sizeof(float));
           TASSIGN(cached_kk,
                   kRowGate + local * D * sizeof(float) + N * sizeof(float));
-          TCOLEXPANDADD(diff, gc, gr);
-          PipeBarrierVec();
-          TMINS(diff, diff, 0.0f);
-          PipeBarrierVec();
-          TEXP(diff, diff);
-          PipeBarrierVec();
+          if constexpr (!UseLog2Gate) {
+            TCOLEXPANDADD(diff, gc, gr);
+            PipeBarrierVec();
+            TMINS(diff, diff, 0.0f);
+            PipeBarrierVec();
+            exp_gate<false>(diff, diff);
+            PipeBarrierVec();
+          }
           if (n < block_n) {
             // A row's gate is dead after the subtraction. Use its two
             // halves as the reductions' final destinations.
             TEXPANDS(cached_aqk, 0.0f);
-            TEXPANDS(cached_kk, 0.0f);
+            if (!cube_akk) {
+              TEXPANDS(cached_kk, 0.0f);
+            }
           }
-          TCOLEXPANDMUL(tmp, diff, qr);
-          PipeBarrierVec();
-          TMUL(tmp, tmp, kc);
+          if constexpr (UseLog2Gate) {
+            TCOLEXPANDMUL(tmp, kc, qr);
+          } else {
+            TCOLEXPANDMUL(tmp, diff, qr);
+            PipeBarrierVec();
+            TMUL(tmp, tmp, kc);
+          }
           PipeBarrierVec();
           sum_pair64(cached_aqk.data(), tmp.data(), scratch.data(), n);
-          TCOLEXPANDMUL(tmp, diff, kr);
-          PipeBarrierVec();
-          TMUL(tmp, tmp, kc);
-          PipeBarrierVec();
-          sum_pair64(cached_kk.data(), tmp.data(), scratch.data(), n);
-          TMULS(cached_kk, cached_kk, beta_f.data()[r]);
-          PipeBarrierVec();
+          if (!cube_akk) {
+            if constexpr (UseLog2Gate) {
+              TCOLEXPANDMUL(tmp, kc, kr);
+            } else {
+              TCOLEXPANDMUL(tmp, diff, kr);
+              PipeBarrierVec();
+              TMUL(tmp, tmp, kc);
+            }
+            PipeBarrierVec();
+            sum_pair64(cached_kk.data(), tmp.data(), scratch.data(), n);
+            TMULS(cached_kk, cached_kk, beta_f.data()[r]);
+            PipeBarrierVec();
+          }
         }
         {
           // Gate inputs are dead. Each dense row now holds AQK followed by KK.
@@ -229,7 +318,9 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
                         ST(2 * heads * C));
           SetWaitFlag<PIPE_V, PIPE_MTE3>(0);
           TSTORE(qdst, cached_aqk);
-          TSTORE(dst, cached_kk);
+          if (!cube_akk) {
+            TSTORE(dst, cached_kk);
+          }
           if (C > N && all_full_chunks && col0 == 0 && row0 < N) {
             // Complete the zero-only upper right quadrant for the direct
             // Cube load. Wait for the preceding store before reusing its UB.
@@ -244,6 +335,66 @@ AICORE inline void launch_kkt_rows(__gm__ bfloat16_t* keys,
         }
       }
       pipe_barrier(PIPE_ALL);
+    }
+  }
+#endif
+}
+
+#if defined(__DAV_CUBE__)
+template <int N>
+AICORE inline void akk_cube_band(__gm__ bfloat16_t* left,
+                                 __gm__ bfloat16_t* right,
+                                 __gm__ float* dst,
+                                 int row_stride) {
+  constexpr int R = 32;
+  constexpr int D = 128;
+  using namespace mega_kda_prefill_chunk_o_exact;
+  TileMatL1<bfloat16_t, R, D> lhs;
+  TileMatL1<bfloat16_t, N, D> rhs;
+  pto::TileAcc<float, R, N> accum;
+  TASSIGN(lhs, 0);
+  TASSIGN(rhs, R * D * sizeof(bfloat16_t));
+  TASSIGN(accum, 0);
+  GM<bfloat16_t> a(left, GS(1, 1, 1, R, D), ST(D));
+  GM<bfloat16_t> b(right, GS(1, 1, 1, N, D), ST(D));
+  TLOAD(lhs, a);
+  TLOAD(rhs, b);
+  gemm_oneshot<bfloat16_t, float, R, N, D, true>(lhs, rhs, accum);
+  GM<float> out(dst, GS(1, 1, 1, R, N), ST(row_stride));
+  TSTORE(out, accum);
+  pipe_barrier(PIPE_ALL);
+}
+#endif
+
+// Each full chunk owns two 32-row bands. The right operand starts at
+// the chunk boundary for each band and uses that band's gate reference.
+AICORE inline void launch_full_akk(__gm__ bfloat16_t* left,
+                                   __gm__ bfloat16_t* right,
+                                   __gm__ float* lower,
+                                   __gm__ const int32_t* cu,
+                                   int64_t batches,
+                                   int64_t tokens,
+                                   int32_t heads) {
+#if defined(__DAV_CUBE__)
+  constexpr int C = 64;
+  constexpr int Band = 32;
+  constexpr int D = 128;
+  int64_t work = get_block_idx();
+  int64_t end = 0;
+  for (int64_t seq = 0; seq < batches; ++seq) {
+    const int64_t begin = end;
+    end += ((cu[seq + 1] - cu[seq]) / C) * heads;
+    for (; work < end; work += get_block_num()) {
+      const int64_t task = work - begin;
+      const int head = task % heads;
+      const int64_t first = cu[seq] + (task / heads) * C;
+      const int64_t token_base = int64_t(head) * tokens + first;
+      auto* out = lower + (first * heads + head) * C;
+      auto* lhs = left + token_base * D;
+      auto* rhs = right + 2 * token_base * D;
+      akk_cube_band<Band>(lhs, rhs, out, heads * C);
+      akk_cube_band<C>(lhs + Band * D, rhs + C * D,
+                       out + Band * heads * C, heads * C);
     }
   }
 #endif
